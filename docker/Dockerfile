@@ -1,0 +1,97 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# OpenClaw Docker Image — with Cloudflare Tunnel support
+# Based on coollabsio/openclaw, with OPENCLAW_STRIP_PROXY_HEADERS fix
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Stage 1: Build OpenClaw from source ──────────────────────────────────────
+FROM node:22-bookworm AS openclaw-build
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git \
+    ca-certificates \
+    curl \
+    python3 \
+    make \
+    g++ \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+
+RUN corepack enable
+
+WORKDIR /openclaw
+
+ARG OPENCLAW_GIT_REF=main
+RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+
+# Patch: relax version requirements for packages using workspace protocol.
+RUN set -eux; \
+  find ./extensions -name 'package.json' -type f | while read -r f; do \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
+    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
+  done
+
+RUN pnpm install --no-frozen-lockfile
+RUN pnpm build
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:install && pnpm ui:build
+
+
+# ── Stage 2: Runtime image ───────────────────────────────────────────────────
+FROM node:22-bookworm
+
+ENV NODE_ENV=production
+
+RUN apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    build-essential \
+    file \
+    procps \
+    nginx \
+    apache2-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+# Remove default nginx site
+RUN rm -f /etc/nginx/sites-enabled/default
+
+# Install Go (used by many skills)
+RUN curl -fsSL https://go.dev/dl/go1.24.1.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+# Install uv (fast Python package manager, used by Python-based skills)
+RUN curl -fsSL https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# Ensure tool paths survive login-shell PATH reset (/etc/profile overwrites PATH)
+RUN printf '%s\n' \
+  'export PATH="/usr/local/go/bin:/root/.local/bin:$PATH"' \
+  > /etc/profile.d/custom-tools.sh \
+  && chmod +x /etc/profile.d/custom-tools.sh
+
+# Install under /opt/openclaw/app so that ../../ from dist/ lands at /opt/openclaw
+COPY --from=openclaw-build /openclaw /opt/openclaw/app
+
+RUN printf '%s\n' '#!/usr/bin/env bash' 'exec node /opt/openclaw/app/openclaw.mjs "$@"' > /usr/local/bin/openclaw \
+  && chmod +x /usr/local/bin/openclaw
+
+# Compiled JS in dist/ resolves ../../ relative to import.meta.url.
+RUN ln -s /opt/openclaw/app/docs /opt/openclaw/docs \
+  && ln -s /opt/openclaw/app/assets /opt/openclaw/assets \
+  && ln -s /opt/openclaw/app/package.json /opt/openclaw/package.json
+
+# Copy our scripts (entrypoint + configure)
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
+
+ENV PORT=8080
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:${PORT:-8080}/healthz || exit 1
+
+ENTRYPOINT ["/app/scripts/entrypoint.sh"]

@@ -1,0 +1,324 @@
+name: Rebuild All Versions
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_count:
+        description: 'Number of recent versions to rebuild'
+        type: number
+        default: 10
+      specific_version:
+        description: 'Or rebuild a specific version (e.g., 2026.1.29)'
+        type: string
+        required: false
+      force_rebuild:
+        description: 'Force rebuild base images even if they already exist'
+        type: boolean
+        default: false
+
+env:
+  GITHUB_REGISTRY: ghcr.io
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: coollabsio/openclaw
+  BASE_IMAGE_NAME: coollabsio/openclaw-base
+
+jobs:
+  get-versions:
+    runs-on: ubuntu-24.04
+    outputs:
+      versions: ${{ steps.fetch.outputs.versions }}
+      latest_version: ${{ steps.fetch.outputs.latest_version }}
+    steps:
+      - name: Fetch OpenClaw versions
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ github.event.inputs.specific_version }}" ]; then
+            VERSION="${{ github.event.inputs.specific_version }}"
+            echo "versions=[\"$VERSION\"]" >> $GITHUB_OUTPUT
+            echo "latest_version=$VERSION" >> $GITHUB_OUTPUT
+            echo "Building specific version: $VERSION"
+          else
+            COUNT="${{ github.event.inputs.version_count || '10' }}"
+            VERSIONS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/openclaw/openclaw/releases?per_page=$COUNT" \
+              | jq -c '[.[].tag_name | ltrimstr("v")]')
+            LATEST=$(echo "$VERSIONS" | jq -r '.[0]')
+            echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+            echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+            echo "Building versions: $VERSIONS"
+          fi
+
+  check-base:
+    runs-on: ubuntu-24.04
+    needs: get-versions
+    outputs:
+      missing_versions: ${{ steps.check.outputs.missing_versions }}
+    steps:
+      - name: Check which base images exist
+        id: check
+        run: |
+          VERSIONS='${{ needs.get-versions.outputs.versions }}'
+          FORCE_REBUILD="${{ github.event.inputs.force_rebuild }}"
+
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            echo "Force rebuild enabled, marking all base images as missing"
+            echo "missing_versions=$VERSIONS" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MISSING="[]"
+
+          for VERSION in $(echo "$VERSIONS" | jq -r '.[]'); do
+            BASE_IMAGE="${{ env.GITHUB_REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:${VERSION}-amd64"
+            if ! docker manifest inspect "$BASE_IMAGE" > /dev/null 2>&1; then
+              echo "Base image missing for $VERSION"
+              MISSING=$(echo "$MISSING" | jq -c --arg v "$VERSION" '. + [$v]')
+            else
+              echo "Base image exists for $VERSION"
+            fi
+          done
+
+          echo "missing_versions=$MISSING" >> $GITHUB_OUTPUT
+          echo "Missing base images: $MISSING"
+
+  build-base:
+    needs: [get-versions, check-base]
+    if: needs.check-base.outputs.missing_versions != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.check-base.outputs.missing_versions) }}
+        arch:
+          - amd64
+          - arm64
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Base Image (${{ matrix.version }}-${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.base
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          build-args: |
+            OPENCLAW_GIT_REF=v${{ matrix.version }}
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:${{ matrix.version }}-${{ matrix.arch }}
+            ${{ env.GITHUB_REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:${{ matrix.version }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=base-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=base-${{ matrix.arch }}
+
+  merge-base-manifest:
+    needs: [get-versions, check-base, build-base]
+    if: always() && needs.check-base.outputs.missing_versions != '[]' && needs.build-base.result == 'success'
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.check-base.outputs.missing_versions) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create base manifest on ${{ env.GITHUB_REGISTRY }}
+        run: |
+          VERSION="${{ matrix.version }}"
+          BASE="${{ env.GITHUB_REGISTRY }}/${{ env.BASE_IMAGE_NAME }}"
+          docker buildx imagetools create \
+            -t "${BASE}:${VERSION}" \
+            "${BASE}:${VERSION}-amd64" \
+            "${BASE}:${VERSION}-arm64"
+
+      - name: Create base manifest on ${{ env.DOCKER_REGISTRY }}
+        run: |
+          VERSION="${{ matrix.version }}"
+          BASE="${{ env.DOCKER_REGISTRY }}/${{ env.BASE_IMAGE_NAME }}"
+          docker buildx imagetools create \
+            -t "${BASE}:${VERSION}" \
+            "${BASE}:${VERSION}-amd64" \
+            "${BASE}:${VERSION}-arm64"
+
+  build-final:
+    needs: [get-versions, check-base, merge-base-manifest]
+    if: always() && (needs.merge-base-manifest.result == 'success' || needs.merge-base-manifest.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJson(needs.get-versions.outputs.versions) }}
+        arch:
+          - amd64
+          - arm64
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push Final Image (${{ matrix.version }}-${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ env.GITHUB_REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:${{ matrix.version }}-${{ matrix.arch }}
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}-${{ matrix.arch }}
+            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.version }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=final-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=final-${{ matrix.arch }}
+
+  merge-final-manifest:
+    needs: [get-versions, build-final]
+    if: always() && needs.build-final.result == 'success'
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.get-versions.outputs.versions) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create final manifest on ${{ env.GITHUB_REGISTRY }}
+        run: |
+          VERSION="${{ matrix.version }}"
+          LATEST="${{ needs.get-versions.outputs.latest_version }}"
+          IMAGE="${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          TAGS="-t ${IMAGE}:${VERSION}"
+          if [ "$VERSION" = "$LATEST" ]; then
+            TAGS="$TAGS -t ${IMAGE}:latest"
+          fi
+
+          docker buildx imagetools create \
+            $TAGS \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+      - name: Create final manifest on ${{ env.DOCKER_REGISTRY }}
+        run: |
+          VERSION="${{ matrix.version }}"
+          LATEST="${{ needs.get-versions.outputs.latest_version }}"
+          IMAGE="${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          TAGS="-t ${IMAGE}:${VERSION}"
+          if [ "$VERSION" = "$LATEST" ]; then
+            TAGS="$TAGS -t ${IMAGE}:latest"
+          fi
+
+          docker buildx imagetools create \
+            $TAGS \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+  summary:
+    needs: [get-versions, merge-final-manifest]
+    if: always() && needs.merge-final-manifest.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Generate summary
+        run: |
+          VERSIONS='${{ needs.get-versions.outputs.versions }}'
+          LATEST="${{ needs.get-versions.outputs.latest_version }}"
+
+          echo "## Rebuild Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Successfully rebuilt the following versions:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          for VERSION in $(echo "$VERSIONS" | jq -r '.[]'); do
+            if [ "$VERSION" = "$LATEST" ]; then
+              echo "- \`$VERSION\` (latest)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- \`$VERSION\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Images available at:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,131 @@
+name: Build Browser Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., 1.0.0)'
+        type: string
+        required: true
+      tag_latest:
+        description: 'Also tag as latest'
+        type: boolean
+        default: true
+
+env:
+  GITHUB_REGISTRY: ghcr.io
+  DOCKER_REGISTRY: docker.io
+  IMAGE_NAME: coollabsio/openclaw-browser
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.browser
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}-${{ matrix.arch }}
+            ${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}-${{ matrix.arch }}
+          cache-from: type=gha,scope=browser-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=browser-${{ matrix.arch }}
+
+  merge-manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to ${{ env.GITHUB_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITHUB_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to ${{ env.DOCKER_REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create manifest on ${{ env.GITHUB_REGISTRY }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          IMAGE="${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          TAGS="-t ${IMAGE}:${VERSION}"
+          if [ "${{ inputs.tag_latest }}" = "true" ]; then
+            TAGS="$TAGS -t ${IMAGE}:latest"
+          fi
+
+          docker buildx imagetools create \
+            $TAGS \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+      - name: Create manifest on ${{ env.DOCKER_REGISTRY }}
+        run: |
+          VERSION="${{ inputs.version }}"
+          IMAGE="${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          TAGS="-t ${IMAGE}:${VERSION}"
+          if [ "${{ inputs.tag_latest }}" = "true" ]; then
+            TAGS="$TAGS -t ${IMAGE}:latest"
+          fi
+
+          docker buildx imagetools create \
+            $TAGS \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+      - name: Summary
+        run: |
+          echo "## Browser Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Version: \`${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.tag_latest }}" = "true" ]; then
+            echo "Also tagged as: \`latest\`" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Images available at:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.GITHUB_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}\`" >> $GITHUB_STEP_SUMMARY

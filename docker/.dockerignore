@@ -1,0 +1,9 @@
+# Ignore everything not needed for Docker build
+.git
+.github
+.vscode
+coollabsio
+docs
+test
+*.md
+!README.md

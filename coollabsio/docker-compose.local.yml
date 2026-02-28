@@ -1,0 +1,38 @@
+services:
+  openclaw:
+    image: openclaw:local
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    environment:
+      # Provider (at least one required)
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY}
+      - OPENCLAW_PRIMARY_MODEL=opencode/kimi-k2.5
+      # Auth
+      - AUTH_USERNAME=${AUTH_USERNAME:-admin}
+      - AUTH_PASSWORD=${AUTH_PASSWORD}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      # Browser sidecar
+      - BROWSER_CDP_URL=http://browser:9223
+      - BROWSER_DEFAULT_PROFILE=openclaw
+      - BROWSER_EVALUATE_ENABLED=true
+    volumes:
+      - openclaw-data:/data
+    depends_on:
+      - browser
+    restart: unless-stopped
+
+  browser:
+    image: openclaw-browser:local
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - CHROME_CLI=--remote-debugging-port=9222
+    volumes:
+      - browser-data:/config
+    shm_size: 2g
+    restart: unless-stopped
+
+volumes:
+  openclaw-data:
+  browser-data:

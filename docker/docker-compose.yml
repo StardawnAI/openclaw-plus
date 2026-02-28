@@ -1,0 +1,77 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# OpenClaw Docker Compose — Cloudflare Tunnel Ready
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your values
+#   2. docker compose up -d
+#   3. Open https://your-domain.com/?token=YOUR_GATEWAY_TOKEN
+#
+# For Coolify: just set the env vars in the Coolify UI, no .env file needed.
+# ══════════════════════════════════════════════════════════════════════════════
+
+services:
+  openclaw:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Pin to a specific OpenClaw release (default: main)
+        OPENCLAW_GIT_REF: ${OPENCLAW_GIT_REF:-main}
+    # Or use a pre-built image:
+    # image: your-registry/openclaw:latest
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    environment:
+      # ── AI Provider (at least one required) ──────────────────────────────
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+      - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-}
+
+      # ── Auth ─────────────────────────────────────────────────────────────
+      - AUTH_USERNAME=${AUTH_USERNAME:-admin}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+
+      # ── Model selection ──────────────────────────────────────────────────
+      - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-}
+
+      # ── Cloudflare Tunnel Fix ────────────────────────────────────────────
+      # Set to "true" when running behind Cloudflare Tunnel, Coolify proxy,
+      # or any reverse proxy that adds X-Forwarded-* headers.
+      - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-true}
+      - OPENCLAW_ALLOWED_ORIGINS=${OPENCLAW_ALLOWED_ORIGINS:-}
+
+      # ── Browser sidecar ──────────────────────────────────────────────────
+      - BROWSER_CDP_URL=http://browser:9223
+      - BROWSER_DEFAULT_PROFILE=openclaw
+      - BROWSER_EVALUATE_ENABLED=true
+
+      # ── Port ─────────────────────────────────────────────────────────────
+      - PORT=${PORT:-8080}
+    volumes:
+      - openclaw-data:/data
+      # Optional: mount a custom openclaw.json for complex settings
+      # - ./openclaw.json:/app/config/openclaw.json
+    depends_on:
+      - browser
+    restart: unless-stopped
+
+  browser:
+    image: coollabsio/openclaw-browser:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+      - CHROME_CLI=--remote-debugging-port=9222
+    volumes:
+      - browser-data:/config
+    shm_size: 2g
+    restart: unless-stopped
+
+volumes:
+  openclaw-data:
+  browser-data:
