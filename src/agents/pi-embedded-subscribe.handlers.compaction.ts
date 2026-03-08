@@ -2,6 +2,7 @@ import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import type { EmbeddedPiSubscribeContext } from "./pi-embedded-subscribe.handlers.types.js";
+import { makeZeroUsageSnapshot } from "./usage.js";
 
 export function handleAutoCompactionStart(ctx: EmbeddedPiSubscribeContext) {
   ctx.state.compactionInFlight = true;
@@ -39,11 +40,17 @@ export function handleAutoCompactionStart(ctx: EmbeddedPiSubscribeContext) {
 
 export function handleAutoCompactionEnd(
   ctx: EmbeddedPiSubscribeContext,
-  evt: AgentEvent & { willRetry?: unknown },
+  evt: AgentEvent & { willRetry?: unknown; result?: unknown; aborted?: unknown },
 ) {
   ctx.state.compactionInFlight = false;
   const willRetry = Boolean(evt.willRetry);
-  if (!willRetry) {
+  // Increment counter whenever compaction actually produced a result,
+  // regardless of willRetry.  Overflow-triggered compaction sets willRetry=true
+  // (the framework retries the LLM request), but the compaction itself succeeded
+  // and context was trimmed — the counter must reflect that.  (#38905)
+  const hasResult = evt.result != null;
+  const wasAborted = Boolean(evt.aborted);
+  if (hasResult && !wasAborted) {
     ctx.incrementCompactionCount?.();
   }
   if (willRetry) {
@@ -96,9 +103,8 @@ function clearStaleAssistantUsageOnSessionMessages(ctx: EmbeddedPiSubscribeConte
     if (candidate.role !== "assistant") {
       continue;
     }
-    if (!("usage" in candidate)) {
-      continue;
-    }
-    delete (candidate as { usage?: unknown }).usage;
+    // pi-coding-agent expects assistant usage to exist when computing context usage.
+    // Reset stale snapshots to zeros instead of deleting the field.
+    candidate.usage = makeZeroUsageSnapshot();
   }
 }
