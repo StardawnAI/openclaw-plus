@@ -1,8 +1,9 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# OpenClaw Docker Compose — Standard (mit Ports)
+# OpenClaw Docker Compose — Cloudflare / Coolify (Traefik)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Für Cloudflare/Coolify: docker-compose-cloudflare.yml verwenden.
+# Nutzt `expose` statt `ports` — Traefik routet über Domain.
+# Für Coolify: Docker Compose Location → /docker-compose-cloudflare.yml
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
@@ -12,42 +13,27 @@ services:
       dockerfile: Dockerfile
       args:
         OPENCLAW_GIT_REF: ${OPENCLAW_GIT_REF:-main}
-    ports:
-      - "${PORT:-8080}:${PORT:-8080}"
+    expose:
+      - "${PORT:-8080}"
     environment:
-      # ── AI Provider (at least one required) ──────────────────────────────
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
       - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-}
-
-      # ── Auth ─────────────────────────────────────────────────────────────
       - AUTH_USERNAME=${AUTH_USERNAME:-admin}
       - AUTH_PASSWORD=${AUTH_PASSWORD:-}
       - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
-
-      # ── Model selection ──────────────────────────────────────────────────
       - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-}
-
-      # ── Cloudflare Tunnel Fix ────────────────────────────────────────────
-      # Set to "true" when running behind Cloudflare Tunnel, Coolify proxy,
-      # or any reverse proxy that adds X-Forwarded-* headers.
       - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-true}
       - OPENCLAW_ALLOWED_ORIGINS=${OPENCLAW_ALLOWED_ORIGINS:-}
-
-      # ── Browser sidecar ──────────────────────────────────────────────────
       - BROWSER_CDP_URL=http://browser:9223
       - BROWSER_DEFAULT_PROFILE=openclaw
       - BROWSER_EVALUATE_ENABLED=true
-
-      # ── Port ─────────────────────────────────────────────────────────────
       - PORT=${PORT:-8080}
     volumes:
       - openclaw-data:/data
-      # Optional: mount a custom openclaw.json for complex settings
-      # - ./openclaw.json:/app/config/openclaw.json
     depends_on:
       - browser
     restart: unless-stopped
