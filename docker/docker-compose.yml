@@ -1,8 +1,8 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# OpenClaw Docker Compose — Standard (mit Ports)
+# OpenClaw Docker Compose — Standard (with ports)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Für Cloudflare/Coolify: docker-compose-cloudflare.yml verwenden.
+# For Cloudflare/Coolify: use docker-compose-cloudflare.yml instead.
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
@@ -46,8 +46,6 @@ services:
       - PORT=${PORT:-8080}
     volumes:
       - openclaw-data:/data
-      # Optional: mount a custom openclaw.json for complex settings
-      # - ./openclaw.json:/app/config/openclaw.json
     depends_on:
       - browser
     restart: unless-stopped
