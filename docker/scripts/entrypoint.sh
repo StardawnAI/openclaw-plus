@@ -18,12 +18,30 @@ if [ -n "${OPENCLAW_DOCKER_APT_PACKAGES:-}" ]; then
 fi
 
 # ── Require OPENCLAW_GATEWAY_TOKEN ───────────────────────────────────────────
+TOKEN_FILE="${STATE_DIR}/.auto_generated_gateway_token"
+
 if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
-  echo "[entrypoint] ERROR: OPENCLAW_GATEWAY_TOKEN is required."
-  echo "[entrypoint] Generate one with: openssl rand -hex 32"
-  exit 1
+  if [ -f "$TOKEN_FILE" ]; then
+    GATEWAY_TOKEN=$(cat "$TOKEN_FILE")
+    echo "[entrypoint] Using existing auto-generated OPENCLAW_GATEWAY_TOKEN from $TOKEN_FILE"
+  else
+    GATEWAY_TOKEN=$(openssl rand -hex 32)
+    mkdir -p "$STATE_DIR"
+    echo "$GATEWAY_TOKEN" > "$TOKEN_FILE"
+    echo "================================================================================"
+    echo "[entrypoint] ⚠️  OPENCLAW_GATEWAY_TOKEN was not set in your environment variables!"
+    echo "[entrypoint] ⚠️  An auto-generated token has been created for you:"
+    echo "[entrypoint] "
+    echo "[entrypoint] 🔑 Token: $GATEWAY_TOKEN"
+    echo "[entrypoint] "
+    echo "[entrypoint] ⚠️  Please save this token. It is stored in $TOKEN_FILE"
+    echo "================================================================================"
+  fi
+else
+  GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN"
 fi
-GATEWAY_TOKEN="$OPENCLAW_GATEWAY_TOKEN"
+
+export OPENCLAW_GATEWAY_TOKEN="$GATEWAY_TOKEN"
 
 # ── Require at least one AI provider API key env var ─────────────────────────
 HAS_PROVIDER=0
