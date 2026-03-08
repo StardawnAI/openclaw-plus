@@ -1,0 +1,139 @@
+name: Auto Sync with Upstream OpenClaw
+
+on:
+  schedule:
+    # Check every hour for new upstream releases
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: openclaw-plus-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure Git
+        run: |
+          set -euo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Check if sync needed
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+
+          # Get latest upstream release tag
+          LATEST_RELEASE="$(gh release view --repo openclaw/openclaw --json tagName --jq .tagName)"
+          [ -n "${LATEST_RELEASE:-}" ] || { echo "CRITICAL: Could not find upstream release tag"; exit 1; }
+          echo "version=$LATEST_RELEASE" >> "$GITHUB_OUTPUT"
+
+          # Check our latest release
+          OUR_LATEST_TAG="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || true)"
+          OUR_LATEST_TAG="${OUR_LATEST_TAG:-}"
+
+          if [ -z "$OUR_LATEST_TAG" ] || [ "$LATEST_RELEASE" != "$OUR_LATEST_TAG" ]; then
+            echo "skip_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # If HEAD equals release commit -> skip
+          TAG_COMMIT="$(git rev-parse "refs/tags/$OUR_LATEST_TAG^{}" 2>/dev/null || echo "")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ -n "$TAG_COMMIT" ] && [ "$TAG_COMMIT" = "$HEAD_COMMIT" ]; then
+            echo "skip_sync=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_sync=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync upstream code (vendor drop)
+        if: steps.check.outputs.skip_sync != 'true'
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.check.outputs.version }}"
+
+          git remote add upstream https://github.com/openclaw/openclaw.git 2>/dev/null || true
+          git fetch upstream --tags --force
+
+          # Sync source directories from upstream tag
+          # Remove old dirs first to catch deletions
+          for dir in src apps extensions packages scripts ui; do
+            if [ -d "$dir" ]; then
+              rm -rf "$dir"
+              git checkout "$TAG" -- "$dir" 2>/dev/null || true
+            fi
+          done
+
+          # Sync root config files
+          git checkout "$TAG" -- \
+            package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json .npmrc \
+            openclaw.mjs CHANGELOG.md \
+            Dockerfile Dockerfile.sandbox Dockerfile.sandbox-browser Dockerfile.sandbox-common \
+            2>/dev/null || true
+
+      - name: Preserve our custom files
+        if: steps.check.outputs.skip_sync != 'true'
+        run: |
+          set -euo pipefail
+          # Restore our custom docker/ directory (never overwritten by upstream)
+          git checkout HEAD -- docker/ 2>/dev/null || true
+          # Restore our workflows
+          git checkout HEAD -- .github/workflows/sync.yml 2>/dev/null || true
+          git checkout HEAD -- .github/workflows/docker-publish.yml 2>/dev/null || true
+          # Restore coollabsio reference (if still needed)
+          git checkout HEAD -- coollabsio/ 2>/dev/null || true
+
+      - name: Commit and Push
+        if: steps.check.outputs.skip_sync != 'true'
+        run: |
+          set -euo pipefail
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: sync openclaw ${{ steps.check.outputs.version }}"
+          git remote set-url origin https://${{ secrets.GH_PAT }}@github.com/${{ github.repository }}.git
+          git push origin main
+
+      - name: Create Release
+        if: steps.check.outputs.skip_sync != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.check.outputs.version }}"
+
+          # Delete existing release + tag if exists
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+
+          git tag -f "$TAG"
+          git push origin "$TAG" -f
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "openclaw-plus $TAG" \
+            --notes "Synced from upstream openclaw $TAG with Cloudflare Tunnel Docker support" \
+            --latest
+
+      - name: Trigger Docker publish
+        if: steps.check.outputs.skip_sync != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          gh workflow run docker-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
