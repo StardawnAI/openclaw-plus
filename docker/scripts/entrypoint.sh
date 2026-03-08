@@ -55,9 +55,12 @@ done
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] && HAS_PROVIDER=1
 [ -n "${OLLAMA_BASE_URL:-}" ] && HAS_PROVIDER=1
 if [ "$HAS_PROVIDER" -eq 0 ]; then
-  echo "[entrypoint] ERROR: At least one AI provider API key env var is required."
-  echo "[entrypoint] Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, etc."
-  exit 1
+  echo "================================================================================"
+  echo "[entrypoint] ⚠️  WARNING: No AI provider API key found!"
+  echo "[entrypoint] ⚠️  The gateway will start, but you won't be able to use AI features."
+  echo "[entrypoint] ⚠️  Set at least one of: ANTHROPIC_API_KEY, OPENAI_API_KEY,"
+  echo "[entrypoint]     OPENROUTER_API_KEY, GEMINI_API_KEY, etc."
+  echo "================================================================================"
 fi
 
 mkdir -p "$STATE_DIR" "$WORKSPACE_DIR"
