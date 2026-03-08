@@ -587,8 +587,7 @@ const hasProvider =
   !!process.env.SYNTHETIC_API_KEY || !!process.env.XIAOMI_API_KEY;
 
 if (!hasProvider) {
-  console.error("[configure] ERROR: No AI provider API key set.");
-  process.exit(1);
+  console.warn("[configure] ⚠️  WARNING: No AI provider API key set. AI features won't work until you add one.");
 }
 
 // ── Write config ────────────────────────────────────────────────────────────
