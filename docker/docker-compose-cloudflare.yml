@@ -19,21 +19,21 @@ services:
     expose:
       - "${PORT:-8080}"
     environment:
-      # ── AI Provider (at least one required) ──────────────────────────────
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
-      - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-}
+      # ── AI Provider (set at least one) ──────────────────────────────────
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-sk-ant-xxx...}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-proj-xxx...}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-sk-or-v1-xxx...}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSy-xxx...}
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-sk-opencode-xxx...}
+      - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-gho_xxx...}
 
       # ── Auth ─────────────────────────────────────────────────────────────
       - AUTH_USERNAME=${AUTH_USERNAME:-admin}
-      - AUTH_PASSWORD=${AUTH_PASSWORD:-}
-      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-test}
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-sk-gateway-xxx...}
 
       # ── Model selection ──────────────────────────────────────────────────
-      - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-}
+      - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-claude-3-5-sonnet-latest}
 
       # ── Cloudflare Tunnel Fix ────────────────────────────────────────────
       # Enabled by default: strips proxy headers for Cloudflare Tunnel.
