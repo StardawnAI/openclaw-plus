@@ -2,7 +2,7 @@
 # OpenClaw Docker Compose — Standard (with ports)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# For Cloudflare/Coolify: use docker-compose-cloudflare.yml instead.
+# For Cloudflare/Coolify: use docker-compose.cloudflare.yml instead.
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
