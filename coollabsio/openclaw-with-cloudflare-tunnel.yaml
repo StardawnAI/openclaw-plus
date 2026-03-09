@@ -1,0 +1,67 @@
+# documentation: https://github.com/StardawnAI/openclaw-plus
+# slogan: OpenClaw Fork that works behind a Cloudflare Tunnel Deployment for increased security
+# category: ai
+# tags: ai,gateway,llm,cloudflare,tunnel,security
+# logo: svgs/openclaw.svg
+# port: 8080
+
+services:
+  openclaw:
+    image: ghcr.io/stardawnai/openclaw-plus:latest
+    expose:
+      - "${PORT:-8080}"
+    environment:
+      # ── AI Provider (set at least one) ──────────────────────────────────
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-}
+      - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-}
+
+      # ── Auth ─────────────────────────────────────────────────────────────
+      - AUTH_USERNAME=${AUTH_USERNAME:-admin}
+      - AUTH_PASSWORD=${SERVICE_PASSWORD_64_AUTH}
+      - OPENCLAW_GATEWAY_TOKEN=${SERVICE_PASSWORD_64_GATEWAY}
+
+      # ── Model selection ──────────────────────────────────────────────────
+      - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-}
+
+      # ── Proxy / Tunnel ─────────────────────────────────────────────────
+      - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-true}
+      - OPENCLAW_ALLOWED_ORIGINS=${OPENCLAW_ALLOWED_ORIGINS:-}
+
+      # ── Browser sidecar ──────────────────────────────────────────────────
+      - BROWSER_CDP_URL=http://browser:9223
+      - BROWSER_DEFAULT_PROFILE=openclaw
+      - BROWSER_EVALUATE_ENABLED=true
+
+      # ── Port ─────────────────────────────────────────────────────────────
+      - PORT=${PORT:-8080}
+    volumes:
+      - openclaw-data:/data
+    depends_on:
+      - browser
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:${PORT:-8080}/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  browser:
+    image: coollabsio/openclaw-browser:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=${TZ:-Etc/UTC}
+      - CHROME_CLI=--remote-debugging-port=9222
+    volumes:
+      - browser-data:/config
+    shm_size: 2g
+    restart: unless-stopped
+
+volumes:
+  openclaw-data:
+  browser-data:
