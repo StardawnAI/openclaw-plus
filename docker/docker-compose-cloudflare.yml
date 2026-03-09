@@ -1,8 +1,12 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# OpenClaw Docker Compose — Standard (with ports)
+# OpenClaw Docker Compose — Cloudflare / Coolify (Traefik)
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# For Cloudflare/Coolify: use docker-compose-cloudflare.yml instead.
+# Uses `expose` instead of `ports` — Traefik routes via domain name.
+# Server IP stays hidden behind Cloudflare.
+#
+# In Coolify: set Docker Compose Location to /docker-compose-cloudflare.yml
+# IMPORTANT: this must be set at resource creation time (cannot be changed later).
 # ══════════════════════════════════════════════════════════════════════════════
 
 services:
@@ -12,8 +16,8 @@ services:
       dockerfile: Dockerfile
       args:
         OPENCLAW_GIT_REF: ${OPENCLAW_GIT_REF:-main}
-    ports:
-      - "${PORT:-8080}:${PORT:-8080}"
+    expose:
+      - "${PORT:-8080}"
     environment:
       # ── AI Provider (at least one required) ──────────────────────────────
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -32,9 +36,8 @@ services:
       - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-}
 
       # ── Cloudflare Tunnel Fix ────────────────────────────────────────────
-      # Set to "true" when running behind Cloudflare Tunnel or reverse proxy.
-      # The cloudflare compose file already sets this to true.
-      - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-false}
+      # Enabled by default: strips proxy headers for Cloudflare Tunnel.
+      - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-true}
       - OPENCLAW_ALLOWED_ORIGINS=${OPENCLAW_ALLOWED_ORIGINS:-}
 
       # ── Browser sidecar ──────────────────────────────────────────────────
