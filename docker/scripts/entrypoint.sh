@@ -127,17 +127,23 @@ if [ "${OPENCLAW_STRIP_PROXY_HEADERS:-}" = "true" ]; then
   PROXY_REAL_IP='""'
   PROXY_FORWARDED_FOR='""'
   PROXY_FORWARDED_PROTO='""'
+  PROXY_ORIGIN="\"http://localhost:${GATEWAY_PORT}\""
 else
   PROXY_HOST='\\$host'
   PROXY_REAL_IP='\\$remote_addr'
   PROXY_FORWARDED_FOR='\\$proxy_add_x_forwarded_for'
   PROXY_FORWARDED_PROTO='\\$scheme'
+  PROXY_ORIGIN='\\$http_origin'
 fi
 
 # ── Generate nginx config ────────────────────────────────────────────────────
 AUTH_USERNAME="${AUTH_USERNAME:-admin}"
+# Fix for Coolify/Windows carriage returns making the password invalid
+AUTH_USERNAME="$(echo "${AUTH_USERNAME}" | tr -d '\r\n ')"
+
 AUTH_PASSWORD_FILE="${STATE_DIR}/.auto_generated_auth_password"
 AUTH_PASSWORD="${AUTH_PASSWORD:-}"
+AUTH_PASSWORD="$(echo "${AUTH_PASSWORD}" | tr -d '\r\n')"
 
 if [ -z "$AUTH_PASSWORD" ]; then
   if [ -f "$AUTH_PASSWORD_FILE" ]; then
@@ -180,6 +186,7 @@ if [ -n "$HOOKS_PATH" ]; then
         proxy_set_header X-Real-IP ${PROXY_REAL_IP};
         proxy_set_header X-Forwarded-For ${PROXY_FORWARDED_FOR};
         proxy_set_header X-Forwarded-Proto ${PROXY_FORWARDED_PROTO};
+        proxy_set_header Origin ${PROXY_ORIGIN};
 
         proxy_http_version 1.1;
 
@@ -270,6 +277,7 @@ server {
         proxy_set_header X-Real-IP ${PROXY_REAL_IP};
         proxy_set_header X-Forwarded-For ${PROXY_FORWARDED_FOR};
         proxy_set_header X-Forwarded-Proto ${PROXY_FORWARDED_PROTO};
+        proxy_set_header Origin ${PROXY_ORIGIN};
 
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;

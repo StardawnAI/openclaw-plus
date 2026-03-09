@@ -119,13 +119,25 @@ if (process.env.OPENCLAW_STRIP_PROXY_HEADERS === "true") {
 }
 
 // Allowed origins for control UI (important for Cloudflare tunnels)
+let origins = [];
 if (process.env.OPENCLAW_ALLOWED_ORIGINS) {
-  const origins = process.env.OPENCLAW_ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
-  if (origins.length > 0) {
-    ensure(config, "gateway", "controlUi");
-    config.gateway.controlUi.allowedOrigins = origins;
-    console.log("[configure] allowed origins:", origins.join(", "));
-  }
+  origins = process.env.OPENCLAW_ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+}
+// Auto-allow Coolify domains
+if (process.env.SERVICE_URL_OPENCLAW && !origins.includes(process.env.SERVICE_URL_OPENCLAW)) {
+  origins.push(process.env.SERVICE_URL_OPENCLAW);
+}
+if (process.env.SERVICE_FQDN_OPENCLAW) {
+  if (!origins.includes(`https://${process.env.SERVICE_FQDN_OPENCLAW}`)) origins.push(`https://${process.env.SERVICE_FQDN_OPENCLAW}`);
+  if (!origins.includes(`http://${process.env.SERVICE_FQDN_OPENCLAW}`)) origins.push(`http://${process.env.SERVICE_FQDN_OPENCLAW}`);
+}
+if (origins.length === 0 && process.env.OPENCLAW_STRIP_PROXY_HEADERS === "true") {
+  origins.push("*");
+}
+if (origins.length > 0) {
+  ensure(config, "gateway", "controlUi");
+  config.gateway.controlUi.allowedOrigins = origins;
+  console.log("[configure] allowed origins:", origins.join(", "));
 }
 // ══════════════════════════════════════════════════════════════════════════════
 
