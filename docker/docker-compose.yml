@@ -32,9 +32,9 @@ services:
       - OPENCLAW_PRIMARY_MODEL=${OPENCLAW_PRIMARY_MODEL:-}
 
       # ── Cloudflare Tunnel Fix ────────────────────────────────────────────
-      # Set to "true" when running behind Cloudflare Tunnel, Coolify proxy,
-      # or any reverse proxy that adds X-Forwarded-* headers.
-      - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-true}
+      # Set to "true" when running behind Cloudflare Tunnel or reverse proxy.
+      # The cloudflare compose file already sets this to true.
+      - OPENCLAW_STRIP_PROXY_HEADERS=${OPENCLAW_STRIP_PROXY_HEADERS:-false}
       - OPENCLAW_ALLOWED_ORIGINS=${OPENCLAW_ALLOWED_ORIGINS:-}
 
       # ── Browser sidecar ──────────────────────────────────────────────────
