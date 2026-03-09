@@ -20,12 +20,12 @@ services:
       - "${PORT:-8080}"
     environment:
       # ── AI Provider (set at least one) ──────────────────────────────────
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-sk-ant-xxx...}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-sk-proj-xxx...}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-sk-or-v1-xxx...}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSy-xxx...}
-      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-sk-opencode-xxx...}
-      - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-gho_xxx...}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-YOUR_ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-YOUR_OPENAI_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-YOUR_OPENROUTER_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-YOUR_GEMINI_API_KEY}
+      - OPENCODE_API_KEY=${OPENCODE_API_KEY:-YOUR_OPENCODE_API_KEY}
+      - COPILOT_GITHUB_TOKEN=${COPILOT_GITHUB_TOKEN:-YOUR_COPILOT_GITHUB_TOKEN}
 
       # ── Auth ─────────────────────────────────────────────────────────────
       - AUTH_USERNAME=${AUTH_USERNAME:-admin}
