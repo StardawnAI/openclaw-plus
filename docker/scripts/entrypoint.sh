@@ -135,8 +135,30 @@ else
 fi
 
 # ── Generate nginx config ────────────────────────────────────────────────────
-AUTH_PASSWORD="${AUTH_PASSWORD:-}"
 AUTH_USERNAME="${AUTH_USERNAME:-admin}"
+AUTH_PASSWORD_FILE="${STATE_DIR}/.auto_generated_auth_password"
+AUTH_PASSWORD="${AUTH_PASSWORD:-}"
+
+if [ -z "$AUTH_PASSWORD" ]; then
+  if [ -f "$AUTH_PASSWORD_FILE" ]; then
+    AUTH_PASSWORD=$(cat "$AUTH_PASSWORD_FILE")
+    echo "[entrypoint] Using existing auto-generated AUTH_PASSWORD from $AUTH_PASSWORD_FILE"
+  else
+    AUTH_PASSWORD=$(openssl rand -hex 16)
+    mkdir -p "$STATE_DIR"
+    echo "$AUTH_PASSWORD" > "$AUTH_PASSWORD_FILE"
+    echo "================================================================================"
+    echo "[entrypoint] ⚠️  AUTH_PASSWORD was not set in your environment variables!"
+    echo "[entrypoint] ⚠️  An auto-generated password has been created for the Web UI:"
+    echo "[entrypoint] "
+    echo "[entrypoint] 👤 Username: $AUTH_USERNAME"
+    echo "[entrypoint] 🔑 Password: $AUTH_PASSWORD"
+    echo "[entrypoint] "
+    echo "[entrypoint] ⚠️  It is stored persistently in $AUTH_PASSWORD_FILE"
+    echo "================================================================================"
+  fi
+fi
+
 NGINX_CONF="/etc/nginx/conf.d/openclaw.conf"
 
 AUTH_BLOCK=""
@@ -145,8 +167,6 @@ if [ -n "$AUTH_PASSWORD" ]; then
   htpasswd -bc /etc/nginx/.htpasswd "$AUTH_USERNAME" "$AUTH_PASSWORD" 2>/dev/null
   AUTH_BLOCK='auth_basic "Openclaw";
         auth_basic_user_file /etc/nginx/.htpasswd;'
-else
-  echo "[entrypoint] no AUTH_PASSWORD set, nginx will not require authentication"
 fi
 
 # Build hooks location block (skips HTTP basic auth, openclaw validates hook token)
