@@ -818,7 +818,7 @@ describe("update-cli", () => {
       );
 
     expect(installCall).toBeDefined();
-    const installCommand = String(installCall?.[0][0] ?? "");
+    const installCommand = installCall?.[0][0] ?? "";
     expect(installCommand).not.toBe("npm");
     expect(path.isAbsolute(installCommand)).toBe(true);
     expect(path.normalize(installCommand)).toContain(path.normalize(brewPrefix));
@@ -1021,7 +1021,7 @@ describe("update-cli", () => {
       makeOkUpdateResult({
         mode: "git",
         root: path.join(tempDir, "..", "openclaw"),
-        after: { version: "2026.4.9" },
+        after: { version: "2026.4.10" },
       }),
     );
     serviceLoaded.mockResolvedValue(true);
