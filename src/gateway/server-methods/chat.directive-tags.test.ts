@@ -307,6 +307,7 @@ function createChatContext(): Pick<
   | "chatDeltaSentAt"
   | "chatDeltaLastBroadcastLen"
   | "chatAbortedRuns"
+  | "addChatRun"
   | "removeChatRun"
   | "dedupe"
   | "loadGatewayModelCatalog"
@@ -322,6 +323,7 @@ function createChatContext(): Pick<
     chatDeltaSentAt: new Map(),
     chatDeltaLastBroadcastLen: new Map(),
     chatAbortedRuns: new Map(),
+    addChatRun: vi.fn(),
     removeChatRun: vi.fn(),
     dedupe: new Map(),
     loadGatewayModelCatalog: async () =>
@@ -1674,6 +1676,10 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
         timestamp: expect.any(Number),
       },
     });
+    const finalBroadcast = (
+      context.broadcast as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.find((call) => call[0] === "chat" && call[1]?.state === "final")?.[1];
+    expect(finalBroadcast).toBeUndefined();
   });
 
   it("adds persisted media paths to the user transcript update", async () => {
@@ -2071,7 +2077,7 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
     expect(JSON.stringify(transcriptUpdate)).not.toContain("[[audio_as_voice]]");
   });
 
-  it("drops image attachments for text-only session models", async () => {
+  it("offloads image attachments for text-only session models", async () => {
     createTranscriptFixture("openclaw-chat-send-text-only-attachments-");
     mockState.finalText = "ok";
     mockState.sessionEntry = {
@@ -2107,7 +2113,13 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
     });
 
     expect(mockState.lastDispatchImages).toBeUndefined();
-    expect(mockState.lastDispatchImageOrder).toBeUndefined();
+    expect(mockState.lastDispatchImageOrder).toEqual(["offloaded"]);
+    expect(mockState.lastDispatchCtx?.Body).toMatch(
+      /^describe image\n\[media attached: media:\/\/inbound\//,
+    );
+    expect(mockState.savedMediaCalls).toEqual([
+      expect.objectContaining({ contentType: "image/png", subdir: "inbound" }),
+    ]);
   });
 
   it("keeps image attachments for text-only sessions bound to ACP", async () => {
@@ -2215,7 +2227,13 @@ describe("chat directive tag stripping for non-streaming final payloads", () => 
     });
 
     expect(mockState.lastDispatchImages).toBeUndefined();
-    expect(mockState.lastDispatchImageOrder).toBeUndefined();
+    expect(mockState.lastDispatchImageOrder).toEqual(["offloaded"]);
+    expect(mockState.lastDispatchCtx?.Body).toMatch(
+      /^describe image\n\[media attached: media:\/\/inbound\//,
+    );
+    expect(mockState.savedMediaCalls).toEqual([
+      expect.objectContaining({ contentType: "image/png", subdir: "inbound" }),
+    ]);
   });
 
   it("passes imageOrder for mixed inline and offloaded chat.send attachments", async () => {

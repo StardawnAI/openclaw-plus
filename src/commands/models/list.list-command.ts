@@ -4,13 +4,13 @@ import type { RuntimeEnv } from "../../runtime.js";
 import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
 import { resolveConfiguredEntries } from "./list.configured.js";
 import { formatErrorWithStack } from "./list.errors.js";
+import { hasProviderStaticCatalogForFilter } from "./list.provider-catalog.js";
+import { loadConfiguredListModelRegistry, loadListModelRegistry } from "./list.registry-load.js";
 import {
-  appendCatalogSupplementRows,
-  appendConfiguredRows,
-  appendDiscoveredRows,
-  appendProviderCatalogRows,
-  loadListModelRegistry,
-} from "./list.rows.js";
+  appendAllModelRowSources,
+  appendConfiguredModelRowSources,
+  modelRowSourcesRequireRegistry,
+} from "./list.row-sources.js";
 import { printModelTable } from "./list.table.js";
 import type { ModelRow } from "./list.types.js";
 import { loadModelsConfigWithSource } from "./load-config.js";
@@ -47,13 +47,8 @@ export async function modelsListCommand(
   if (providerFilter === null) {
     return;
   }
-  const {
-    ensureAuthProfileStore,
-    ensureOpenClawModelsJson,
-    hasProviderStaticCatalogForFilter,
-    resolveOpenClawAgentDir,
-  } = await import("./list.runtime.js");
-  const { sourceConfig, resolvedConfig: cfg } = await loadModelsConfigWithSource({
+  const { ensureAuthProfileStore, resolveOpenClawAgentDir } = await import("./list.runtime.js");
+  const { resolvedConfig: cfg } = await loadModelsConfigWithSource({
     commandName: "models list",
     runtime,
   });
@@ -70,19 +65,26 @@ export async function modelsListCommand(
     opts.all && providerFilter
       ? await hasProviderStaticCatalogForFilter({ cfg, providerFilter })
       : false;
+  const shouldLoadRegistry = modelRowSourcesRequireRegistry({
+    all: opts.all,
+    providerFilter,
+    useProviderCatalogFastPath,
+  });
   const loadRegistryState = async () => {
-    // Keep command behavior explicit: sync models.json from the source config
-    // before building the read-only model registry view.
-    await ensureOpenClawModelsJson(sourceConfig ?? cfg);
-    const loaded = await loadListModelRegistry(cfg, { sourceConfig, providerFilter });
+    const loaded = await loadListModelRegistry(cfg, { providerFilter });
     modelRegistry = loaded.registry;
     discoveredKeys = loaded.discoveredKeys;
     availableKeys = loaded.availableKeys;
     availabilityErrorMessage = loaded.availabilityErrorMessage;
   };
   try {
-    if (!useProviderCatalogFastPath) {
+    if (shouldLoadRegistry) {
       await loadRegistryState();
+    } else if (!opts.all) {
+      const loaded = loadConfiguredListModelRegistry(cfg, entries, { providerFilter });
+      modelRegistry = loaded.registry;
+      discoveredKeys = loaded.discoveredKeys;
+      availableKeys = loaded.availableKeys;
     }
   } catch (err) {
     runtime.error(`Model registry unavailable:\n${formatErrorWithStack(err)}`);
@@ -106,51 +108,28 @@ export async function modelsListCommand(
 
   if (opts.all) {
     let rowContext = buildRowContext(useProviderCatalogFastPath);
-    let seenKeys = appendDiscoveredRows({
+    const initialAppend = await appendAllModelRowSources({
       rows,
-      models: modelRegistry?.getAll() ?? [],
       context: rowContext,
+      modelRegistry,
+      useProviderCatalogFastPath,
     });
-
-    if (modelRegistry) {
-      await appendCatalogSupplementRows({
-        rows,
-        modelRegistry,
-        context: rowContext,
-        seenKeys,
-      });
-    } else if (useProviderCatalogFastPath) {
-      await appendProviderCatalogRows({
-        rows,
-        context: rowContext,
-        seenKeys,
-        staticOnly: true,
-      });
-      if (rows.length === 0) {
-        try {
-          await loadRegistryState();
-        } catch (err) {
-          runtime.error(`Model registry unavailable:\n${formatErrorWithStack(err)}`);
-          process.exitCode = 1;
-          return;
-        }
-        rows.length = 0;
-        const fallbackRegistry = modelRegistry as ModelRegistry | undefined;
-        rowContext = buildRowContext(false);
-        seenKeys = appendDiscoveredRows({
-          rows,
-          models: fallbackRegistry?.getAll() ?? [],
-          context: rowContext,
-        });
-        if (fallbackRegistry) {
-          await appendCatalogSupplementRows({
-            rows,
-            modelRegistry: fallbackRegistry,
-            context: rowContext,
-            seenKeys,
-          });
-        }
+    if (initialAppend.requiresRegistryFallback) {
+      try {
+        await loadRegistryState();
+      } catch (err) {
+        runtime.error(`Model registry unavailable:\n${formatErrorWithStack(err)}`);
+        process.exitCode = 1;
+        return;
       }
+      rows.length = 0;
+      rowContext = buildRowContext(false);
+      await appendAllModelRowSources({
+        rows,
+        context: rowContext,
+        modelRegistry,
+        useProviderCatalogFastPath: false,
+      });
     }
   } else {
     const registry = modelRegistry;
@@ -159,7 +138,7 @@ export async function modelsListCommand(
       process.exitCode = 1;
       return;
     }
-    appendConfiguredRows({
+    appendConfiguredModelRowSources({
       rows,
       entries,
       modelRegistry: registry,
