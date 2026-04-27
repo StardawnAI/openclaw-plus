@@ -11,39 +11,101 @@ const DEFAULT_TAIL_PARALLELISM = 10;
 const DEFAULT_FAILURE_TAIL_LINES = 80;
 const DEFAULT_LANE_TIMEOUT_MS = 120 * 60 * 1000;
 const DEFAULT_LANE_START_STAGGER_MS = 2_000;
+const DEFAULT_LIVE_RETRIES = 1;
 const DEFAULT_STATUS_INTERVAL_MS = 30_000;
 const DEFAULT_PREFLIGHT_RUN_TIMEOUT_MS = 60_000;
 const DEFAULT_TIMINGS_FILE = path.join(ROOT_DIR, ".artifacts/docker-tests/lane-timings.json");
+const DEFAULT_PROFILE = "all";
+const RELEASE_PATH_PROFILE = "release-path";
+const IS_MAIN = process.argv[1]
+  ? path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  : false;
 const LIVE_PROFILE_TIMEOUT_MS = 20 * 60 * 1000;
-const LIVE_CLI_TIMEOUT_MS = 12 * 60 * 1000;
+const LIVE_CLI_TIMEOUT_MS = 20 * 60 * 1000;
 const LIVE_ACP_TIMEOUT_MS = 20 * 60 * 1000;
 const OPENWEBUI_TIMEOUT_MS = 20 * 60 * 1000;
 const BUNDLED_UPDATE_TIMEOUT_MS = 20 * 60 * 1000;
 const DEFAULT_RESOURCE_LIMITS = {
   docker: DEFAULT_PARALLELISM,
-  live: 6,
-  npm: 8,
+  live: 9,
+  "live:claude": 4,
+  "live:codex": 4,
+  "live:droid": 4,
+  "live:gemini": 4,
+  "live:opencode": 4,
+  npm: 10,
   service: 7,
 };
+const LIVE_RETRY_PATTERNS = [
+  /529\b/i,
+  /overloaded/i,
+  /capacity/i,
+  /rate.?limit/i,
+  /gateway closed \(1000 normal closure\)/i,
+  /ECONNRESET|ETIMEDOUT|ENOTFOUND/i,
+];
+const LOAD_SENSITIVE_DOCKER_RETRY_PATTERNS = [
+  /gateway closed \(1000 normal closure\)/i,
+  /gateway exited before listening/i,
+  /WebSocket.*(?:closed|close|timeout|error)/i,
+  /ECONNRESET|ETIMEDOUT|EPIPE|socket hang up/i,
+];
 
 const bundledChannelLaneCommand =
   "OPENCLAW_SKIP_DOCKER_BUILD=1 OPENCLAW_BUNDLED_CHANNEL_UPDATE_SCENARIO=0 OPENCLAW_BUNDLED_CHANNEL_ROOT_OWNED_SCENARIO=0 OPENCLAW_BUNDLED_CHANNEL_SETUP_ENTRY_SCENARIO=0 OPENCLAW_BUNDLED_CHANNEL_LOAD_FAILURE_SCENARIO=0 OPENCLAW_BUNDLED_CHANNEL_DISABLED_CONFIG_SCENARIO=0 pnpm test:docker:bundled-channel-deps";
 
 function lane(name, command, options = {}) {
   return {
+    cacheKey: options.cacheKey,
     command,
     estimateSeconds: options.estimateSeconds,
+    live: options.live === true,
     name,
+    retryPatterns: options.retryPatterns ?? [],
+    retries: options.retries ?? 0,
     resources: options.resources ?? [],
     timeoutMs: options.timeoutMs,
     weight: options.weight ?? 1,
   };
 }
 
+function liveProviderResource(provider) {
+  if (!provider) {
+    return undefined;
+  }
+  if (provider === "claude-cli" || provider === "claude") {
+    return "live:claude";
+  }
+  if (provider === "codex-cli" || provider === "codex") {
+    return "live:codex";
+  }
+  if (provider === "droid") {
+    return "live:droid";
+  }
+  if (provider === "google-gemini-cli" || provider === "gemini") {
+    return "live:gemini";
+  }
+  if (provider === "opencode") {
+    return "live:opencode";
+  }
+  if (provider === "openai") {
+    return "live:openai";
+  }
+  return `live:${provider}`;
+}
+
+function liveProviderResources(options) {
+  const providers = options.providers ?? (options.provider ? [options.provider] : []);
+  return providers.map(liveProviderResource).filter(Boolean);
+}
+
 function liveLane(name, command, options = {}) {
   return lane(name, command, {
     ...options,
-    resources: ["live", ...(options.resources ?? [])],
+    live: true,
+    resources: ["live", ...liveProviderResources(options), ...(options.resources ?? [])],
+    retryPatterns: options.retryPatterns ?? LIVE_RETRY_PATTERNS,
+    retries: options.retries ?? DEFAULT_LIVE_RETRIES,
     weight: options.weight ?? 3,
   });
 }
@@ -62,6 +124,19 @@ function serviceLane(name, command, options = {}) {
     resources: ["service", ...(options.resources ?? [])],
     weight: options.weight ?? 2,
   });
+}
+
+function openAiWebSearchMinimalLane() {
+  return serviceLane(
+    "openai-web-search-minimal",
+    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:openai-web-search-minimal",
+    {
+      retryPatterns: LOAD_SENSITIVE_DOCKER_RETRY_PATTERNS,
+      retries: 1,
+      timeoutMs: 10 * 60 * 1000,
+      weight: 4,
+    },
+  );
 }
 
 const bundledScenarioLanes = [
@@ -132,22 +207,36 @@ const bundledScenarioLanes = [
 
 const lanes = [
   liveLane("live-models", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-models", {
+    providers: ["claude-cli", "codex-cli", "google-gemini-cli"],
     timeoutMs: LIVE_PROFILE_TIMEOUT_MS,
     weight: 4,
   }),
   liveLane("live-gateway", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-gateway", {
+    providers: ["claude-cli", "codex-cli", "google-gemini-cli"],
     timeoutMs: LIVE_PROFILE_TIMEOUT_MS,
     weight: 4,
   }),
   liveLane(
     "live-cli-backend-claude",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-cli-backend:claude",
-    { resources: ["npm"], timeoutMs: LIVE_CLI_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "cli-backend-claude",
+      provider: "claude-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_CLI_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
   liveLane(
     "live-cli-backend-gemini",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-cli-backend:gemini",
-    { resources: ["npm"], timeoutMs: LIVE_CLI_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "cli-backend-gemini",
+      provider: "google-gemini-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_CLI_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
   serviceLane("openwebui", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:openwebui", {
     timeoutMs: OPENWEBUI_TIMEOUT_MS,
@@ -171,6 +260,8 @@ const lanes = [
     weight: 3,
   }),
   lane("pi-bundle-mcp-tools", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:pi-bundle-mcp-tools"),
+  lane("crestodian-rescue", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:crestodian-rescue"),
+  lane("crestodian-planner", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:crestodian-planner"),
   serviceLane(
     "cron-mcp-cleanup",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:cron-mcp-cleanup",
@@ -179,26 +270,49 @@ const lanes = [
   npmLane("doctor-switch", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:doctor-switch", {
     weight: 3,
   }),
-  npmLane("plugins", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:plugins", { weight: 2 }),
+  npmLane(
+    "update-channel-switch",
+    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:update-channel-switch",
+    {
+      timeoutMs: 30 * 60 * 1000,
+      weight: 3,
+    },
+  ),
+  lane("plugins", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:plugins", {
+    resources: ["npm", "service"],
+    weight: 6,
+  }),
   npmLane("plugin-update", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:plugin-update"),
   serviceLane("config-reload", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:config-reload"),
   ...bundledScenarioLanes,
   lane("openai-image-auth", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:openai-image-auth"),
+  lane(
+    "crestodian-first-run",
+    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:crestodian-first-run",
+  ),
+  lane(
+    "session-runtime-context",
+    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:session-runtime-context",
+  ),
   lane("qr", "pnpm test:docker:qr"),
 ];
 
 const exclusiveLanes = [
-  serviceLane(
-    "openai-web-search-minimal",
-    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:openai-web-search-minimal",
-    { timeoutMs: 8 * 60 * 1000 },
-  ),
+  openAiWebSearchMinimalLane(),
   liveLane(
     "live-codex-harness",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-codex-harness",
-    { resources: ["npm"], timeoutMs: LIVE_ACP_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "codex-harness",
+      provider: "codex-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_ACP_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
   liveLane("live-codex-bind", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-codex-bind", {
+    cacheKey: "codex-harness",
+    provider: "codex-cli",
     resources: ["npm"],
     timeoutMs: LIVE_ACP_TIMEOUT_MS,
     weight: 3,
@@ -206,26 +320,206 @@ const exclusiveLanes = [
   liveLane(
     "live-cli-backend-codex",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-cli-backend:codex",
-    { resources: ["npm"], timeoutMs: LIVE_CLI_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "cli-backend-codex",
+      provider: "codex-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_CLI_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
   liveLane(
     "live-acp-bind-claude",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-acp-bind:claude",
-    { resources: ["npm"], timeoutMs: LIVE_ACP_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "acp-bind-claude",
+      provider: "claude-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_ACP_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
   liveLane(
     "live-acp-bind-codex",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-acp-bind:codex",
-    { resources: ["npm"], timeoutMs: LIVE_ACP_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "acp-bind-codex",
+      provider: "codex-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_ACP_TIMEOUT_MS,
+      weight: 3,
+    },
+  ),
+  liveLane(
+    "live-acp-bind-droid",
+    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-acp-bind:droid",
+    {
+      cacheKey: "acp-bind-droid",
+      provider: "droid",
+      resources: ["npm"],
+      timeoutMs: LIVE_ACP_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
   liveLane(
     "live-acp-bind-gemini",
     "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-acp-bind:gemini",
-    { resources: ["npm"], timeoutMs: LIVE_ACP_TIMEOUT_MS, weight: 3 },
+    {
+      cacheKey: "acp-bind-gemini",
+      provider: "google-gemini-cli",
+      resources: ["npm"],
+      timeoutMs: LIVE_ACP_TIMEOUT_MS,
+      weight: 3,
+    },
+  ),
+  liveLane(
+    "live-acp-bind-opencode",
+    "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:live-acp-bind:opencode",
+    {
+      cacheKey: "acp-bind-opencode",
+      provider: "opencode",
+      resources: ["npm"],
+      timeoutMs: LIVE_ACP_TIMEOUT_MS,
+      weight: 3,
+    },
   ),
 ];
 
 const tailLanes = exclusiveLanes;
+
+const releasePathChunks = {
+  core: [
+    lane("qr", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:qr"),
+    serviceLane("onboard", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:onboard", {
+      weight: 2,
+    }),
+    serviceLane("gateway-network", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:gateway-network"),
+    serviceLane("config-reload", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:config-reload"),
+    lane(
+      "session-runtime-context",
+      "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:session-runtime-context",
+    ),
+    lane(
+      "pi-bundle-mcp-tools",
+      "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:pi-bundle-mcp-tools",
+    ),
+    serviceLane("mcp-channels", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:mcp-channels", {
+      resources: ["npm"],
+      weight: 3,
+    }),
+  ],
+  "package-update": [
+    npmLane(
+      "install-e2e",
+      'OPENCLAW_INSTALL_TAG="${OPENCLAW_RELEASE_INSTALL_TAG:-beta}" OPENCLAW_INSTALL_PACKAGE_TGZ="${OPENCLAW_RELEASE_PACKAGE_TGZ:-}" OPENCLAW_E2E_MODELS=both pnpm test:install:e2e',
+      {
+        resources: ["service"],
+        weight: 4,
+      },
+    ),
+    npmLane(
+      "npm-onboard-channel-agent",
+      "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:npm-onboard-channel-agent",
+      { resources: ["service"], weight: 3 },
+    ),
+    npmLane("doctor-switch", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:doctor-switch", {
+      weight: 3,
+    }),
+    npmLane(
+      "update-channel-switch",
+      "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:update-channel-switch",
+      {
+        timeoutMs: 30 * 60 * 1000,
+        weight: 3,
+      },
+    ),
+  ],
+  "plugins-integrations": [
+    lane("plugins", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:plugins", {
+      resources: ["npm", "service"],
+      weight: 6,
+    }),
+    npmLane("plugin-update", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:plugin-update"),
+    npmLane(
+      "bundled-channel-deps",
+      "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:bundled-channel-deps",
+      { resources: ["service"], weight: 3 },
+    ),
+    serviceLane(
+      "cron-mcp-cleanup",
+      "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:cron-mcp-cleanup",
+      {
+        resources: ["npm"],
+        weight: 3,
+      },
+    ),
+    openAiWebSearchMinimalLane(),
+  ],
+};
+
+function releasePathChunkLanes(chunk, options = {}) {
+  const base = releasePathChunks[chunk];
+  if (!base) {
+    throw new Error(
+      `OPENCLAW_DOCKER_ALL_CHUNK must be one of: ${Object.keys(releasePathChunks).join(", ")}. Got: ${JSON.stringify(chunk)}`,
+    );
+  }
+  if (chunk !== "plugins-integrations" || !options.includeOpenWebUI) {
+    return base;
+  }
+  return [
+    ...base,
+    serviceLane("openwebui", "OPENCLAW_SKIP_DOCKER_BUILD=1 pnpm test:docker:openwebui", {
+      timeoutMs: OPENWEBUI_TIMEOUT_MS,
+      weight: 5,
+    }),
+  ];
+}
+
+function allReleasePathLanes(options = {}) {
+  return Object.keys(releasePathChunks).flatMap((chunk) =>
+    releasePathChunkLanes(chunk, {
+      includeOpenWebUI: chunk === "plugins-integrations" && options.includeOpenWebUI,
+    }),
+  );
+}
+
+function parseLaneSelection(raw) {
+  if (!raw) {
+    return [];
+  }
+  return [
+    ...new Set(
+      String(raw)
+        .split(/[,\s]+/u)
+        .map((token) => token.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function dedupeLanes(poolLanes) {
+  const byName = new Map();
+  for (const poolLane of poolLanes) {
+    if (!byName.has(poolLane.name)) {
+      byName.set(poolLane.name, poolLane);
+    }
+  }
+  return [...byName.values()];
+}
+
+function selectNamedLanes(poolLanes, selectedNames, label) {
+  const byName = new Map(poolLanes.map((poolLane) => [poolLane.name, poolLane]));
+  const missing = selectedNames.filter((name) => !byName.has(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `${label} unknown lane(s): ${missing.join(", ")}. Available lanes: ${[...byName.keys()]
+        .toSorted((a, b) => a.localeCompare(b))
+        .join(", ")}`,
+    );
+  }
+  return selectedNames.map((name) => byName.get(name));
+}
 
 function parsePositiveInt(raw, fallback, label) {
   if (!raw) {
@@ -256,8 +550,49 @@ function parseBool(raw, fallback) {
   return !/^(?:0|false|no)$/i.test(raw);
 }
 
+function parseLiveMode(raw) {
+  const mode = raw || "all";
+  if (mode === "all" || mode === "skip" || mode === "only") {
+    return mode;
+  }
+  throw new Error(
+    `OPENCLAW_DOCKER_ALL_LIVE_MODE must be one of: all, skip, only. Got: ${JSON.stringify(raw)}`,
+  );
+}
+
+function parseProfile(raw) {
+  const profile = raw || DEFAULT_PROFILE;
+  if (profile === DEFAULT_PROFILE || profile === RELEASE_PATH_PROFILE) {
+    return profile;
+  }
+  throw new Error(
+    `OPENCLAW_DOCKER_ALL_PROFILE must be one of: ${DEFAULT_PROFILE}, ${RELEASE_PATH_PROFILE}. Got: ${JSON.stringify(raw)}`,
+  );
+}
+
+function applyLiveMode(poolLanes, mode) {
+  if (mode === "all") {
+    return poolLanes;
+  }
+  return poolLanes.filter((poolLane) => (mode === "only" ? poolLane.live : !poolLane.live));
+}
+
+function applyLiveRetries(poolLanes, retries) {
+  return poolLanes.map((poolLane) => (poolLane.live ? { ...poolLane, retries } : poolLane));
+}
+
+function resourceLimitsSummary(resourceLimits) {
+  return Object.entries(resourceLimits)
+    .map(([resource, limit]) => `${resource}=${String(limit)}`)
+    .join(" ");
+}
+
+function resourceLimitEnvName(resource) {
+  return `OPENCLAW_DOCKER_ALL_${resource.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_LIMIT`;
+}
+
 function parseResourceLimit(env, resource, parallelism, fallback) {
-  const envName = `OPENCLAW_DOCKER_ALL_${resource.toUpperCase()}_LIMIT`;
+  const envName = resourceLimitEnvName(resource);
   return parsePositiveInt(env[envName], Math.min(parallelism, fallback), envName);
 }
 
@@ -267,13 +602,12 @@ function parseSchedulerOptions(env, parallelism) {
     parallelism,
     "OPENCLAW_DOCKER_ALL_WEIGHT_LIMIT",
   );
+  const resourceLimits = {};
+  for (const [resource, fallback] of Object.entries(DEFAULT_RESOURCE_LIMITS)) {
+    resourceLimits[resource] = parseResourceLimit(env, resource, parallelism, fallback);
+  }
   return {
-    resourceLimits: {
-      docker: parseResourceLimit(env, "docker", parallelism, parallelism),
-      live: parseResourceLimit(env, "live", parallelism, DEFAULT_RESOURCE_LIMITS.live),
-      npm: parseResourceLimit(env, "npm", parallelism, DEFAULT_RESOURCE_LIMITS.npm),
-      service: parseResourceLimit(env, "service", parallelism, DEFAULT_RESOURCE_LIMITS.service),
-    },
+    resourceLimits,
     weightLimit,
   };
 }
@@ -286,10 +620,38 @@ function laneResources(poolLane) {
   return ["docker", ...(poolLane.resources ?? [])];
 }
 
+export function describeDockerSchedulerLimits(parallelism, options) {
+  return `parallelism=${parallelism} weightLimit=${options.weightLimit} resources=${resourceLimitsSummary(
+    options.resourceLimits,
+  )}`;
+}
+
+export function canStartSchedulerLane(candidate, active, parallelism, options) {
+  const weight = laneWeight(candidate);
+  if (active.count >= parallelism) {
+    return false;
+  }
+
+  const exceedsWeightLimit = active.weight + weight > options.weightLimit;
+  const exceedsResourceLimit = laneResources(candidate).some((resource) => {
+    const limit = options.resourceLimits[resource] ?? options.weightLimit;
+    const current = active.resources.get(resource) ?? 0;
+    return current + weight > limit;
+  });
+
+  if (!exceedsWeightLimit && !exceedsResourceLimit) {
+    return true;
+  }
+
+  return active.count === 0;
+}
+
 function laneSummary(poolLane) {
   const resources = laneResources(poolLane).join(",");
   const timeout = poolLane.timeoutMs ? ` timeout=${Math.round(poolLane.timeoutMs / 1000)}s` : "";
-  return `${poolLane.name}(w=${laneWeight(poolLane)} r=${resources}${timeout})`;
+  const retries = poolLane.retries > 0 ? ` retries=${poolLane.retries}` : "";
+  const cache = poolLane.cacheKey ? ` cache=${poolLane.cacheKey}` : "";
+  return `${poolLane.name}(w=${laneWeight(poolLane)} r=${resources}${timeout}${retries}${cache})`;
 }
 
 function sleep(ms) {
@@ -316,14 +678,47 @@ function appendExtension(env, extension) {
 }
 
 function commandEnv(extra = {}) {
-  return {
+  const env = {
     ...process.env,
     ...extra,
   };
+  const pathEntries = [
+    env.PATH,
+    env.PNPM_HOME,
+    env.npm_execpath ? path.dirname(env.npm_execpath) : undefined,
+    path.dirname(process.execPath),
+  ]
+    .flatMap((entry) => (entry ? String(entry).split(path.delimiter) : []))
+    .filter(Boolean);
+  env.PATH = [...new Set(pathEntries)].join(path.delimiter);
+  return env;
 }
 
 function shellQuote(value) {
   return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function buildLaneRerunCommand(name, baseEnv) {
+  const build = name.startsWith("live-") ? "1" : "0";
+  const env = [
+    ["OPENCLAW_DOCKER_ALL_LANES", name],
+    ["OPENCLAW_DOCKER_ALL_BUILD", build],
+    ["OPENCLAW_DOCKER_ALL_PREFLIGHT", "0"],
+    ["OPENCLAW_SKIP_DOCKER_BUILD", "1"],
+    ["OPENCLAW_DOCKER_E2E_IMAGE", baseEnv.OPENCLAW_DOCKER_E2E_IMAGE || DEFAULT_E2E_IMAGE],
+  ];
+  if (baseEnv.OPENCLAW_DOCKER_ALL_PNPM_COMMAND) {
+    env.push(["OPENCLAW_DOCKER_ALL_PNPM_COMMAND", baseEnv.OPENCLAW_DOCKER_ALL_PNPM_COMMAND]);
+  }
+  return `${env.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} pnpm test:docker:all`;
+}
+
+function withResolvedPnpmCommand(command, env) {
+  const pnpmCommand = env.OPENCLAW_DOCKER_ALL_PNPM_COMMAND?.trim();
+  if (!pnpmCommand) {
+    return command;
+  }
+  return command.replace(/(^|\s)pnpm(?=\s)/g, `$1${shellQuote(pnpmCommand)}`);
 }
 
 function timingSeconds(timingStore, poolLane) {
@@ -393,6 +788,17 @@ async function writeTimingStore(timingStore, results) {
   console.log(`==> Docker lane timings: ${timingStore.file}`);
 }
 
+async function writeRunSummary(logDir, summary) {
+  const file = path.join(logDir, "summary.json");
+  const payload = {
+    ...summary,
+    finishedAt: new Date().toISOString(),
+    version: 1,
+  };
+  await fs.promises.writeFile(file, `${JSON.stringify(payload, null, 2)}\n`);
+  console.log(`==> Docker run summary: ${file}`);
+}
+
 function printLaneManifest(label, poolLanes, timingStore) {
   console.log(`==> ${label} lanes (${poolLanes.length})`);
   for (const [index, poolLane] of poolLanes.entries()) {
@@ -400,6 +806,13 @@ function printLaneManifest(label, poolLanes, timingStore) {
     const estimate = seconds > 0 ? ` last=${Math.round(seconds)}s` : "";
     console.log(`  ${index + 1}. ${laneSummary(poolLane)}${estimate}`);
   }
+}
+
+function lanesNeedBundledPackage(poolLanes) {
+  return poolLanes.some(
+    (poolLane) =>
+      poolLane.name === "npm-onboard-channel-agent" || poolLane.name.startsWith("bundled-channel"),
+  );
 }
 
 function dockerPreflightContainerNames(raw) {
@@ -630,24 +1043,26 @@ async function prepareBundledChannelPackage(baseEnv, logDir) {
   console.log(`==> Bundled channel package: ${baseEnv.OPENCLAW_BUNDLED_CHANNEL_PACKAGE_TGZ}`);
 }
 
-function laneEnv(name, baseEnv, logDir) {
+function laneEnv(name, baseEnv, logDir, cacheKey) {
   const env = {
     ...baseEnv,
   };
+  const cacheName = cacheKey || name;
   if (!process.env.OPENCLAW_DOCKER_CLI_TOOLS_DIR) {
-    env.OPENCLAW_DOCKER_CLI_TOOLS_DIR = path.join(logDir, `${name}-cli-tools`);
+    env.OPENCLAW_DOCKER_CLI_TOOLS_DIR = path.join(logDir, `${cacheName}-cli-tools`);
   }
   if (!process.env.OPENCLAW_DOCKER_CACHE_HOME_DIR) {
-    env.OPENCLAW_DOCKER_CACHE_HOME_DIR = path.join(logDir, `${name}-cache`);
+    env.OPENCLAW_DOCKER_CACHE_HOME_DIR = path.join(logDir, `${cacheName}-cache`);
   }
   return env;
 }
 
 async function runLane(lane, baseEnv, logDir, fallbackTimeoutMs) {
-  const { command, name } = lane;
+  const { name } = lane;
   const timeoutMs = lane.timeoutMs ?? fallbackTimeoutMs;
   const logFile = path.join(logDir, `${name}.log`);
-  const env = laneEnv(name, baseEnv, logDir);
+  const env = laneEnv(name, baseEnv, logDir, lane.cacheKey);
+  const command = withResolvedPnpmCommand(lane.command, env);
   await mkdir(env.OPENCLAW_DOCKER_CLI_TOOLS_DIR, { recursive: true });
   await mkdir(env.OPENCLAW_DOCKER_CACHE_HOME_DIR, { recursive: true });
   await fs.promises.writeFile(
@@ -656,12 +1071,29 @@ async function runLane(lane, baseEnv, logDir, fallbackTimeoutMs) {
       `==> [${name}] cli tools dir: ${env.OPENCLAW_DOCKER_CLI_TOOLS_DIR}`,
       `==> [${name}] cache dir: ${env.OPENCLAW_DOCKER_CACHE_HOME_DIR}`,
       `==> [${name}] timeout: ${timeoutMs}ms`,
+      `==> [${name}] retries: ${lane.retries ?? 0}`,
       "",
     ].join("\n"),
   );
   console.log(`==> [${name}] start`);
   const startedAt = Date.now();
-  const result = await runShellCommand({ command, env, label: name, logFile, timeoutMs });
+  let result;
+  const maxAttempts = 1 + Math.max(0, lane.retries ?? 0);
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (attempt > 1) {
+      await fs.promises.appendFile(logFile, `\n==> [${name}] retry attempt ${attempt}\n`);
+      console.log(`==> [${name}] retry ${attempt}/${maxAttempts}`);
+    }
+    result = await runShellCommand({ command, env, label: name, logFile, timeoutMs });
+    if (result.status === 0 || attempt >= maxAttempts) {
+      break;
+    }
+    const retryable =
+      result.timedOut || (await laneLogMatchesRetryPattern(logFile, lane.retryPatterns));
+    if (!retryable) {
+      break;
+    }
+  }
   const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000);
   if (result.status === 0) {
     console.log(`==> [${name}] pass ${elapsedSeconds}s`);
@@ -676,6 +1108,7 @@ async function runLane(lane, baseEnv, logDir, fallbackTimeoutMs) {
     logFile,
     name,
     elapsedSeconds,
+    rerunCommand: buildLaneRerunCommand(name, baseEnv),
     status: result.status,
     timedOut: result.timedOut,
   };
@@ -731,18 +1164,7 @@ async function runLanePool(poolLanes, baseEnv, logDir, parallelism, options) {
   }
 
   function canStartLane(candidate) {
-    const weight = laneWeight(candidate);
-    if (active.count >= parallelism || active.weight + weight > options.weightLimit) {
-      return false;
-    }
-    for (const resource of laneResources(candidate)) {
-      const limit = options.resourceLimits[resource] ?? options.weightLimit;
-      const current = active.resources.get(resource) ?? 0;
-      if (current + weight > limit) {
-        return false;
-      }
-    }
-    return true;
+    return canStartSchedulerLane(candidate, active, parallelism, options);
   }
 
   function reserve(candidate) {
@@ -803,7 +1225,12 @@ async function runLanePool(poolLanes, baseEnv, logDir, parallelism, options) {
       }
       if (running.size === 0) {
         const blocked = pending.map(laneSummary).join(", ");
-        throw new Error(`No Docker lanes fit scheduler limits: ${blocked}`);
+        throw new Error(
+          `No Docker lanes fit scheduler limits (${describeDockerSchedulerLimits(
+            parallelism,
+            options,
+          )}): ${blocked}. Tune OPENCLAW_DOCKER_ALL_PARALLELISM, OPENCLAW_DOCKER_ALL_WEIGHT_LIMIT, or OPENCLAW_DOCKER_ALL_<RESOURCE>_LIMIT.`,
+        );
       }
 
       const { promise, result } = await Promise.race(running);
@@ -837,6 +1264,14 @@ async function tailFile(file, lines) {
   const content = await readFile(file, "utf8").catch(() => "");
   const tail = content.split(/\r?\n/).slice(-lines).join("\n");
   return tail.trimEnd();
+}
+
+async function laneLogMatchesRetryPattern(logFile, patterns) {
+  if (!patterns || patterns.length === 0) {
+    return false;
+  }
+  const tail = await tailFile(logFile, 160);
+  return patterns.some((pattern) => pattern.test(tail));
 }
 
 async function printFailureSummary(failures, tailLines) {
@@ -879,6 +1314,7 @@ process.on("SIGTERM", () => {
 });
 
 async function main() {
+  const runStartedAt = new Date().toISOString();
   const parallelism = parsePositiveInt(
     process.env.OPENCLAW_DOCKER_ALL_PARALLELISM,
     DEFAULT_PARALLELISM,
@@ -919,6 +1355,25 @@ async function main() {
   const preflightEnabled = parseBool(process.env.OPENCLAW_DOCKER_ALL_PREFLIGHT, true);
   const preflightCleanup = parseBool(process.env.OPENCLAW_DOCKER_ALL_PREFLIGHT_CLEANUP, true);
   const timingsEnabled = parseBool(process.env.OPENCLAW_DOCKER_ALL_TIMINGS, true);
+  const buildEnabled = parseBool(process.env.OPENCLAW_DOCKER_ALL_BUILD, true);
+  const profile = parseProfile(process.env.OPENCLAW_DOCKER_ALL_PROFILE);
+  const releaseChunk = process.env.OPENCLAW_DOCKER_ALL_CHUNK || process.env.DOCKER_E2E_CHUNK || "";
+  const includeOpenWebUI = parseBool(
+    process.env.OPENCLAW_DOCKER_ALL_INCLUDE_OPENWEBUI ?? process.env.INCLUDE_OPENWEBUI,
+    true,
+  );
+  const selectedLaneNamesRaw =
+    process.env.OPENCLAW_DOCKER_ALL_LANES || process.env.DOCKER_E2E_LANES || "";
+  const selectedLaneNames = parseLaneSelection(selectedLaneNamesRaw);
+  if (selectedLaneNamesRaw && selectedLaneNames.length === 0) {
+    throw new Error("OPENCLAW_DOCKER_ALL_LANES must include at least one lane name");
+  }
+  const liveMode = parseLiveMode(process.env.OPENCLAW_DOCKER_ALL_LIVE_MODE);
+  const liveRetries = parseNonNegativeInt(
+    process.env.OPENCLAW_DOCKER_ALL_LIVE_RETRIES,
+    DEFAULT_LIVE_RETRIES,
+    "OPENCLAW_DOCKER_ALL_LIVE_RETRIES",
+  );
   const timingsFile = path.resolve(
     process.env.OPENCLAW_DOCKER_ALL_TIMINGS_FILE || DEFAULT_TIMINGS_FILE,
   );
@@ -937,13 +1392,47 @@ async function main() {
   appendExtension(baseEnv, "codex");
 
   const timingStore = await loadTimingStore(timingsFile, timingsEnabled);
-  const orderedLanes = orderLanes(lanes, timingStore);
-  const orderedTailLanes = orderLanes(tailLanes, timingStore);
+  const retriedMainLanes = applyLiveRetries(lanes, liveRetries);
+  const retriedTailLanes = applyLiveRetries(tailLanes, liveRetries);
+  const releaseLanes =
+    selectedLaneNames.length === 0 && profile === RELEASE_PATH_PROFILE
+      ? releasePathChunkLanes(releaseChunk, { includeOpenWebUI })
+      : undefined;
+  const selectedLanes =
+    selectedLaneNames.length > 0
+      ? selectNamedLanes(
+          dedupeLanes([
+            ...allReleasePathLanes({ includeOpenWebUI }),
+            ...retriedMainLanes,
+            ...retriedTailLanes,
+          ]),
+          selectedLaneNames,
+          "OPENCLAW_DOCKER_ALL_LANES",
+        )
+      : undefined;
+  const configuredLanes = selectedLanes
+    ? selectedLanes
+    : releaseLanes
+      ? releaseLanes
+      : liveMode === "only"
+        ? applyLiveMode([...retriedMainLanes, ...retriedTailLanes], liveMode)
+        : applyLiveMode(retriedMainLanes, liveMode);
+  const configuredTailLanes =
+    selectedLanes || releaseLanes
+      ? []
+      : liveMode === "only"
+        ? []
+        : applyLiveMode(retriedTailLanes, liveMode);
+  const orderedLanes = orderLanes(configuredLanes, timingStore);
+  const orderedTailLanes = orderLanes(configuredTailLanes, timingStore);
 
   console.log(`==> Docker test logs: ${logDir}`);
+  console.log(`==> Profile: ${profile}${releaseChunk ? ` chunk=${releaseChunk}` : ""}`);
   console.log(`==> Parallelism: ${parallelism}`);
   console.log(`==> Tail parallelism: ${tailParallelism}`);
   console.log(`==> Lane timeout: ${laneTimeoutMs}ms`);
+  console.log(`==> Live mode: ${liveMode}`);
+  console.log(`==> Live retries: ${liveRetries}`);
   console.log(`==> Lane start stagger: ${laneStartStaggerMs}ms`);
   console.log(`==> Status interval: ${statusIntervalMs}ms`);
   console.log(`==> Fail fast: ${failFast ? "yes" : "no"}`);
@@ -953,15 +1442,22 @@ async function main() {
       preflightCleanup ? " cleanup=yes" : " cleanup=no"
     }`,
   );
+  console.log(`==> Build shared Docker images: ${buildEnabled ? "yes" : "no"}`);
+  if (profile === RELEASE_PATH_PROFILE) {
+    console.log(`==> Include Open WebUI: ${includeOpenWebUI ? "yes" : "no"}`);
+  }
+  if (selectedLaneNames.length > 0) {
+    console.log(`==> Selected lanes: ${selectedLaneNames.join(", ")}`);
+  }
   console.log(`==> Docker lane timings: ${timingStore.enabled ? timingsFile : "disabled"}`);
   console.log(`==> Live-test bundled plugin deps: ${baseEnv.OPENCLAW_DOCKER_BUILD_EXTENSIONS}`);
   const schedulerOptions = parseSchedulerOptions(process.env, parallelism);
   const tailSchedulerOptions = parseSchedulerOptions(process.env, tailParallelism);
   console.log(
-    `==> Scheduler: weight=${schedulerOptions.weightLimit} docker=${schedulerOptions.resourceLimits.docker} live=${schedulerOptions.resourceLimits.live} npm=${schedulerOptions.resourceLimits.npm} service=${schedulerOptions.resourceLimits.service}`,
+    `==> Scheduler: weight=${schedulerOptions.weightLimit} ${resourceLimitsSummary(schedulerOptions.resourceLimits)}`,
   );
   console.log(
-    `==> Tail scheduler: weight=${tailSchedulerOptions.weightLimit} docker=${tailSchedulerOptions.resourceLimits.docker} live=${tailSchedulerOptions.resourceLimits.live} npm=${tailSchedulerOptions.resourceLimits.npm} service=${tailSchedulerOptions.resourceLimits.service}`,
+    `==> Tail scheduler: weight=${tailSchedulerOptions.weightLimit} ${resourceLimitsSummary(tailSchedulerOptions.resourceLimits)}`,
   );
   printLaneManifest("Main", orderedLanes, timingStore);
   printLaneManifest("Tail", orderedTailLanes, timingStore);
@@ -976,17 +1472,27 @@ async function main() {
     runTimeoutMs: preflightRunTimeoutMs,
   });
 
-  await runForegroundGroup(
-    [
-      ["Build shared live-test image once", "pnpm test:docker:live-build"],
-      [
+  if (buildEnabled) {
+    const buildEntries = [];
+    const scheduledLanes = [...orderedLanes, ...orderedTailLanes];
+    if (scheduledLanes.some((poolLane) => poolLane.live)) {
+      buildEntries.push(["Build shared live-test image once", "pnpm test:docker:live-build"]);
+    }
+    if (scheduledLanes.some((poolLane) => !poolLane.live)) {
+      buildEntries.push([
         `Build shared Docker E2E image once: ${baseEnv.OPENCLAW_DOCKER_E2E_IMAGE}`,
         "pnpm test:docker:e2e-build",
-      ],
-    ],
-    baseEnv,
-  );
-  await prepareBundledChannelPackage(baseEnv, logDir);
+      ]);
+    }
+    await runForegroundGroup(buildEntries, baseEnv);
+  } else {
+    console.log(`==> Shared Docker image builds: skipped`);
+  }
+  if (lanesNeedBundledPackage([...orderedLanes, ...orderedTailLanes])) {
+    await prepareBundledChannelPackage(baseEnv, logDir);
+  } else {
+    console.log("==> Bundled channel package: not needed for selected lanes");
+  }
 
   const options = {
     ...schedulerOptions,
@@ -1001,34 +1507,74 @@ async function main() {
   const allResults = [...mainResult.results];
   await writeTimingStore(timingStore, mainResult.results);
   if (failFast && failures.length > 0) {
+    await writeRunSummary(logDir, {
+      chunk: releaseChunk || undefined,
+      failures,
+      image: baseEnv.OPENCLAW_DOCKER_E2E_IMAGE,
+      lanes: allResults,
+      profile,
+      selectedLanes: selectedLaneNames.length > 0 ? selectedLaneNames : undefined,
+      startedAt: runStartedAt,
+      status: "failed",
+    });
     await printFailureSummary(failures, tailLines);
     process.exit(1);
   }
 
-  console.log("==> Running provider-sensitive Docker tail lanes");
-  const tailResult = await runLanePool(orderedTailLanes, baseEnv, logDir, tailParallelism, {
-    ...options,
-    ...tailSchedulerOptions,
-    poolLabel: "tail",
-  });
-  failures.push(...tailResult.failures);
-  allResults.push(...tailResult.results);
-  await writeTimingStore(timingStore, tailResult.results);
+  if (orderedTailLanes.length > 0) {
+    console.log("==> Running provider-sensitive Docker tail lanes");
+    const tailResult = await runLanePool(orderedTailLanes, baseEnv, logDir, tailParallelism, {
+      ...options,
+      ...tailSchedulerOptions,
+      poolLabel: "tail",
+    });
+    failures.push(...tailResult.failures);
+    allResults.push(...tailResult.results);
+    await writeTimingStore(timingStore, tailResult.results);
+  } else {
+    console.log("==> Provider-sensitive Docker tail lanes: none");
+  }
   if (failures.length > 0) {
+    await writeRunSummary(logDir, {
+      chunk: releaseChunk || undefined,
+      failures,
+      image: baseEnv.OPENCLAW_DOCKER_E2E_IMAGE,
+      lanes: allResults,
+      profile,
+      selectedLanes: selectedLaneNames.length > 0 ? selectedLaneNames : undefined,
+      startedAt: runStartedAt,
+      status: "failed",
+    });
     await printFailureSummary(failures, tailLines);
     process.exit(1);
   }
 
-  await runForeground(
-    "Run cleanup smoke after parallel lanes",
-    "pnpm test:docker:cleanup",
-    baseEnv,
-  );
+  if (profile === DEFAULT_PROFILE && selectedLaneNames.length === 0) {
+    await runForeground(
+      "Run cleanup smoke after parallel lanes",
+      "pnpm test:docker:cleanup",
+      baseEnv,
+    );
+  } else {
+    console.log("==> Cleanup smoke after parallel lanes: skipped for selected/release lanes");
+  }
   await writeTimingStore(timingStore, allResults);
+  await writeRunSummary(logDir, {
+    chunk: releaseChunk || undefined,
+    failures,
+    image: baseEnv.OPENCLAW_DOCKER_E2E_IMAGE,
+    lanes: allResults,
+    profile,
+    selectedLanes: selectedLaneNames.length > 0 ? selectedLaneNames : undefined,
+    startedAt: runStartedAt,
+    status: "passed",
+  });
   console.log("==> Docker test suite passed");
 }
 
-await main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exit(1);
-});
+if (IS_MAIN) {
+  await main().catch((error) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
+}
