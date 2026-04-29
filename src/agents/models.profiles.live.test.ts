@@ -219,14 +219,6 @@ describe("isProviderUnavailableErrorMessage", () => {
       isProviderUnavailableErrorMessage("provider returned error: 502 Internal Server Error"),
     ).toBe(true);
   });
-
-  it("matches transient xAI model unavailability", () => {
-    expect(
-      isProviderUnavailableErrorMessage(
-        "Error Code null: Service temporarily unavailable. The model did not respond to this request.",
-      ),
-    ).toBe(true);
-  });
 });
 
 function isChatGPTUsageLimitErrorMessage(raw: string): boolean {
@@ -265,10 +257,8 @@ function isProviderUnavailableErrorMessage(raw: string): boolean {
     isCloudflareOrHtmlErrorPage(raw) ||
     msg.includes("no allowed providers are available") ||
     msg.includes("provider unavailable") ||
-    msg.includes("service temporarily unavailable") ||
     msg.includes("upstream provider unavailable") ||
     msg.includes("upstream error from google") ||
-    msg.includes("the model did not respond") ||
     msg.includes("temporarily rate-limited upstream") ||
     msg.includes("unable to access non-serverless model") ||
     msg.includes("create and start a new dedicated endpoint") ||
@@ -313,6 +303,15 @@ function isUnsupportedPlanErrorMessage(raw: string): boolean {
   return /current token plan (?:does )?not support (?:this )?model/i.test(raw);
 }
 
+function isOpenRouterOpaqueBadRequestErrorMessage(raw: string): boolean {
+  const msg = raw.toLowerCase();
+  return (
+    msg.includes("provider returned error") &&
+    msg.includes('"code":400') &&
+    msg.includes('"msg":"bad request"')
+  );
+}
+
 describe("isUnsupportedPlanErrorMessage", () => {
   it("matches provider plan-gated models", () => {
     expect(isUnsupportedPlanErrorMessage("current token plan does not support this model")).toBe(
@@ -320,6 +319,17 @@ describe("isUnsupportedPlanErrorMessage", () => {
     );
     expect(isUnsupportedPlanErrorMessage("your current token plan not support model")).toBe(true);
     expect(isUnsupportedPlanErrorMessage("model not found")).toBe(false);
+  });
+});
+
+describe("isOpenRouterOpaqueBadRequestErrorMessage", () => {
+  it("matches opaque OpenRouter upstream bad requests", () => {
+    expect(
+      isOpenRouterOpaqueBadRequestErrorMessage(
+        'Error: 400 Provider returned error {"code":400,"msg":"bad request","request_id":"abc"}',
+      ),
+    ).toBe(true);
+    expect(isOpenRouterOpaqueBadRequestErrorMessage("Error: 400 bad request")).toBe(false);
   });
 });
 
@@ -351,12 +361,12 @@ function resolveLiveModelsJsonTimeoutMs(
   modelsJsonTimeoutRaw?: string,
   setupTimeoutMs = LIVE_SETUP_TIMEOUT_MS,
 ): number {
-  return Math.max(setupTimeoutMs, toInt(modelsJsonTimeoutRaw, 120_000));
+  return Math.max(setupTimeoutMs, toInt(modelsJsonTimeoutRaw, 180_000));
 }
 
 describe("resolveLiveModelsJsonTimeoutMs", () => {
   it("defaults models.json preparation to a longer setup timeout", () => {
-    expect(resolveLiveModelsJsonTimeoutMs(undefined, 45_000)).toBe(120_000);
+    expect(resolveLiveModelsJsonTimeoutMs(undefined, 45_000)).toBe(180_000);
   });
 
   it("never goes below the shared live setup timeout", () => {
@@ -1159,6 +1169,15 @@ describeLive("live models (profile keys)", () => {
             if (allowNotFoundSkip && isProviderUnavailableErrorMessage(message)) {
               skipped.push({ model: id, reason: message });
               logProgress(`${progressLabel}: skip (provider unavailable)`);
+              break;
+            }
+            if (
+              allowNotFoundSkip &&
+              model.provider === "openrouter" &&
+              isOpenRouterOpaqueBadRequestErrorMessage(message)
+            ) {
+              skipped.push({ model: id, reason: message });
+              logProgress(`${progressLabel}: skip (openrouter upstream bad request)`);
               break;
             }
             if (allowNotFoundSkip && isModelNotFoundErrorMessage(message)) {

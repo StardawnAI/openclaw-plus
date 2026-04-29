@@ -41,11 +41,26 @@ vi.mock("../plugins/providers.runtime.js", () => ({
   resolvePluginProviders,
 }));
 
-import { resolveProviderSetupFlowContributions } from "./provider-flow.js";
-import { resolveProviderModelPickerFlowContributions } from "./provider-flow.runtime.js";
+async function resolveProviderSetupFlowContributions(
+  ...params: Parameters<typeof import("./provider-flow.js").resolveProviderSetupFlowContributions>
+) {
+  const { resolveProviderSetupFlowContributions: resolve } = await import("./provider-flow.js");
+  return resolve(...params);
+}
+
+async function resolveProviderModelPickerFlowContributions(
+  ...params: Parameters<
+    typeof import("./provider-flow.runtime.js").resolveProviderModelPickerFlowContributions
+  >
+) {
+  const { resolveProviderModelPickerFlowContributions: resolve } =
+    await import("./provider-flow.runtime.js");
+  return resolve(...params);
+}
 
 describe("provider flow install catalog contributions", () => {
   beforeEach(() => {
+    vi.resetModules();
     resolveManifestProviderAuthChoices.mockReset();
     resolveManifestProviderAuthChoices.mockReturnValue([]);
     resolveProviderInstallCatalogEntries.mockReset();
@@ -58,7 +73,7 @@ describe("provider flow install catalog contributions", () => {
     resolvePluginProviders.mockReturnValue([]);
   });
 
-  it("surfaces manifest provider auth choices before setup runtime loads", () => {
+  it("surfaces manifest provider auth choices before setup runtime loads", async () => {
     resolveManifestProviderAuthChoices.mockReturnValue([
       {
         pluginId: "openai-compatible",
@@ -76,7 +91,7 @@ describe("provider flow install catalog contributions", () => {
       },
     ]);
 
-    expect(resolveProviderSetupFlowContributions()).toEqual([
+    expect(await resolveProviderSetupFlowContributions()).toEqual([
       {
         id: "provider:setup:openai-compatible-api-key",
         kind: "provider",
@@ -108,7 +123,7 @@ describe("provider flow install catalog contributions", () => {
     expect(resolvePluginProviders).not.toHaveBeenCalled();
   });
 
-  it("prefers manifest setup contributions over duplicate install-catalog entries", () => {
+  it("prefers manifest setup contributions over duplicate install-catalog entries", async () => {
     resolveManifestProviderAuthChoices.mockReturnValue([
       {
         pluginId: "openai",
@@ -133,7 +148,7 @@ describe("provider flow install catalog contributions", () => {
       },
     ]);
 
-    expect(resolveProviderSetupFlowContributions()).toEqual([
+    expect(await resolveProviderSetupFlowContributions()).toEqual([
       {
         id: "provider:setup:openai-api-key",
         kind: "provider",
@@ -154,7 +169,7 @@ describe("provider flow install catalog contributions", () => {
     expect(resolveProviderWizardOptions).not.toHaveBeenCalled();
   });
 
-  it("surfaces install-catalog provider choices when runtime setup options are absent", () => {
+  it("surfaces install-catalog provider choices when runtime setup options are absent", async () => {
     resolveProviderInstallCatalogEntries.mockReturnValue([
       {
         pluginId: "vllm",
@@ -174,7 +189,7 @@ describe("provider flow install catalog contributions", () => {
       },
     ]);
 
-    expect(resolveProviderSetupFlowContributions()).toEqual([
+    expect(await resolveProviderSetupFlowContributions()).toEqual([
       {
         id: "provider:setup:vllm",
         kind: "provider",
@@ -201,7 +216,7 @@ describe("provider flow install catalog contributions", () => {
     );
   });
 
-  it("adds a fallback group when install-catalog entries omit group metadata", () => {
+  it("adds a fallback group when install-catalog entries omit group metadata", async () => {
     resolveProviderInstallCatalogEntries.mockReturnValue([
       {
         pluginId: "demo-provider",
@@ -217,7 +232,7 @@ describe("provider flow install catalog contributions", () => {
       },
     ]);
 
-    expect(resolveProviderSetupFlowContributions()).toEqual([
+    expect(await resolveProviderSetupFlowContributions()).toEqual([
       {
         id: "provider:setup:demo-provider-api-key",
         kind: "provider",
@@ -237,7 +252,7 @@ describe("provider flow install catalog contributions", () => {
     ]);
   });
 
-  it("hides install-catalog choices that cannot be enabled", () => {
+  it("hides install-catalog choices that cannot be enabled", async () => {
     resolveProviderInstallCatalogEntries.mockReturnValue([
       {
         pluginId: "blocked-provider",
@@ -254,7 +269,7 @@ describe("provider flow install catalog contributions", () => {
     ]);
 
     expect(
-      resolveProviderSetupFlowContributions({
+      await resolveProviderSetupFlowContributions({
         config: {
           plugins: {
             enabled: false,
@@ -264,7 +279,7 @@ describe("provider flow install catalog contributions", () => {
     ).toEqual([]);
   });
 
-  it("hides install-catalog choices outside a configured plugin allowlist", () => {
+  it("hides install-catalog choices outside a configured plugin allowlist", async () => {
     resolveProviderInstallCatalogEntries.mockReturnValue([
       {
         pluginId: "blocked-provider",
@@ -282,7 +297,7 @@ describe("provider flow install catalog contributions", () => {
     ]);
 
     expect(
-      resolveProviderSetupFlowContributions({
+      await resolveProviderSetupFlowContributions({
         config: {
           plugins: {
             allow: ["openai"],
@@ -292,7 +307,7 @@ describe("provider flow install catalog contributions", () => {
     ).toEqual([]);
   });
 
-  it("keeps setup contributions on cold metadata instead of runtime wizard options", () => {
+  it("keeps setup contributions on cold metadata instead of runtime wizard options", async () => {
     resolveProviderWizardOptions.mockReturnValue([
       {
         value: "openai-api-key",
@@ -318,7 +333,7 @@ describe("provider flow install catalog contributions", () => {
       },
     ]);
 
-    expect(resolveProviderSetupFlowContributions()).toEqual([
+    expect(await resolveProviderSetupFlowContributions()).toEqual([
       {
         id: "provider:setup:openai-api-key",
         kind: "provider",
@@ -340,7 +355,7 @@ describe("provider flow install catalog contributions", () => {
     expect(resolvePluginProviders).not.toHaveBeenCalled();
   });
 
-  it("keeps docs attached to runtime model-picker contributions", () => {
+  it("keeps docs attached to runtime model-picker contributions", async () => {
     resolvePluginProviders.mockReturnValue([
       {
         id: "openai",
@@ -356,7 +371,7 @@ describe("provider flow install catalog contributions", () => {
       },
     ]);
 
-    expect(resolveProviderModelPickerFlowContributions()).toEqual([
+    expect(await resolveProviderModelPickerFlowContributions()).toEqual([
       {
         id: "provider:model-picker:provider-plugin:openai:gpt-5.4",
         kind: "provider",

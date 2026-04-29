@@ -122,7 +122,7 @@ Options:
   --provider <openai|anthropic|minimax>
                              Provider auth/model lane. Default: openai
   --model <provider/model>    Override the model used for agent-turn smoke checks.
-                             Default: openai/gpt-5.5 for the OpenAI lane
+                             Default: openai/gpt-5.4-mini for the OpenAI lane
   --api-key-env <var>        Host env var name for provider API key.
                              Default: OPENAI_API_KEY for openai, ANTHROPIC_API_KEY for anthropic
   --openai-api-key-env <var> Alias for --api-key-env (backward compatible)
@@ -214,7 +214,7 @@ case "$PROVIDER" in
   openai)
     AUTH_CHOICE="openai-api-key"
     AUTH_KEY_FLAG="openai-api-key"
-    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.5}"
+    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.4-mini}"
     [[ -n "$API_KEY_ENV" ]] || API_KEY_ENV="OPENAI_API_KEY"
     ;;
   anthropic)
@@ -236,6 +236,7 @@ esac
 
 API_KEY_VALUE="${!API_KEY_ENV:-}"
 [[ -n "$API_KEY_VALUE" ]] || die "$API_KEY_ENV is required"
+
 resolve_python_bin
 
 resolve_linux_vm_name() {
@@ -701,35 +702,6 @@ function Stop-OpenClawUpdateProcesses {
     }
 }
 
-function Remove-FuturePluginEntries {
-  $configPath = Join-Path $env:USERPROFILE '.openclaw\openclaw.json'
-  if (-not (Test-Path $configPath)) {
-    return
-  }
-  try {
-    $config = Get-Content $configPath -Raw | ConvertFrom-Json -AsHashtable
-  } catch {
-    return
-  }
-  $plugins = $config['plugins']
-  if (-not ($plugins -is [hashtable])) {
-    return
-  }
-  $entries = $plugins['entries']
-  if ($entries -is [hashtable]) {
-    foreach ($pluginId in @('feishu', 'whatsapp')) {
-      if ($entries.ContainsKey($pluginId)) {
-        $entries.Remove($pluginId)
-      }
-    }
-  }
-  $allow = $plugins['allow']
-  if ($allow -is [array]) {
-    $plugins['allow'] = @($allow | Where-Object { $_ -notin @('feishu', 'whatsapp') })
-  }
-  $config | ConvertTo-Json -Depth 100 | Set-Content -Path $configPath -Encoding UTF8
-}
-
 function Invoke-OpenClawUpdateWithTimeout {
   param(
     [Parameter(Mandatory = $true)][string]$OpenClawPath,
@@ -742,7 +714,7 @@ function Invoke-OpenClawUpdateWithTimeout {
     $previousDisableBundledPlugins = $env:OPENCLAW_DISABLE_BUNDLED_PLUGINS
     $env:OPENCLAW_DISABLE_BUNDLED_PLUGINS = '1'
     try {
-      $output = & $Path update --tag $Target --yes --json *>&1
+      $output = & $Path update --tag $Target --yes --no-restart --json *>&1
     } finally {
       if ($null -eq $previousDisableBundledPlugins) {
         Remove-Item Env:OPENCLAW_DISABLE_BUNDLED_PLUGINS -ErrorAction SilentlyContinue
@@ -764,8 +736,7 @@ function Invoke-OpenClawUpdateWithTimeout {
     }
     Remove-Job $updateJob -Force -ErrorAction SilentlyContinue
     if ($result.ExitCode -ne 0) {
-      Write-ProgressLog 'update.openclaw-update.nonzero'
-      "openclaw update exited with code $($result.ExitCode); continuing to installed-version and gateway recovery checks" | Tee-Object -FilePath $LogPath -Append | Out-Null
+      throw "openclaw update failed with exit code $($result.ExitCode)"
     }
     return
   }
@@ -834,6 +805,33 @@ function Invoke-OpenClawAgentWithTimeout {
     $combined.Trim() | Tee-Object -FilePath $LogPath -Append | Out-Null
   }
   throw "openclaw agent timed out after ${TimeoutSeconds}s"
+}
+
+function Invoke-OpenClawVersionWithRetry {
+  param(
+    [Parameter(Mandatory = $true)][string]$OpenClawPath,
+    [Parameter(Mandatory = $false)][string]$ExpectedNeedle,
+    [int]$Attempts = 12,
+    [int]$SleepSeconds = 2
+  )
+
+  $lastError = ''
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    Write-ProgressLog "update.verify-version.attempt-$attempt"
+    try {
+      $version = Invoke-CaptureLogged 'openclaw --version' { & $OpenClawPath --version }
+      if (-not $ExpectedNeedle -or $version -match [regex]::Escape($ExpectedNeedle)) {
+        return $version
+      }
+      $lastError = "version mismatch: expected substring $ExpectedNeedle"
+    } catch {
+      $lastError = $_ | Out-String
+    }
+    if ($attempt -lt $Attempts) {
+      Start-Sleep -Seconds $SleepSeconds
+    }
+  }
+  throw $lastError
 }
 
 function Start-GatewayRunFallback {
@@ -944,15 +942,11 @@ try {
   }
   Set-Item -Path ('Env:' + $ProviderKeyEnv) -Value $ProviderKey
   $openclaw = Join-Path $env:APPDATA 'npm\openclaw.cmd'
-  Remove-FuturePluginEntries
   Stop-OpenClawGatewayProcesses
   Write-ProgressLog 'update.openclaw-update'
   Invoke-OpenClawUpdateWithTimeout -OpenClawPath $openclaw -UpdateTarget $UpdateTarget
   Write-ProgressLog 'update.verify-version'
-  $version = Invoke-CaptureLogged 'openclaw --version' { & $openclaw --version }
-  if ($ExpectedNeedle -and $version -notmatch [regex]::Escape($ExpectedNeedle)) {
-    throw "version mismatch: expected substring $ExpectedNeedle"
-  }
+  $version = Invoke-OpenClawVersionWithRetry -OpenClawPath $openclaw -ExpectedNeedle $ExpectedNeedle
   Write-ProgressLog $version
   Write-ProgressLog 'update.status'
   Invoke-Logged 'openclaw update status' { & $openclaw update status --json }
@@ -1055,10 +1049,19 @@ gateway_listener_ready() {
 gateway_log_ready() {
   latest="\$(/bin/ls -t /tmp/openclaw/openclaw-*.log 2>/dev/null | /usr/bin/head -n 1 || true)"
   [ -n "\$latest" ] || return 1
-  /usr/bin/tail -n 160 "\$latest" | /usr/bin/grep -q 'ready ('
+  /usr/bin/tail -n 160 "\$latest" | /usr/bin/grep -Eq 'ready( \(|[[:space:]]*\$)'
 }
 gateway_smoke_ready() {
   gateway_listener_ready && gateway_log_ready
+}
+stop_openclaw_gateway_processes() {
+  OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 /opt/homebrew/bin/openclaw gateway stop >/dev/null 2>&1 || true
+  /usr/bin/pkill -9 -f openclaw-gateway || true
+  /usr/bin/pkill -9 -f 'openclaw gateway run' || true
+  /usr/bin/pkill -9 -f 'openclaw.mjs gateway' || true
+  for pid in \$(/usr/sbin/lsof -tiTCP:18789 -sTCP:LISTEN 2>/dev/null || true); do
+    /bin/kill -9 "\$pid" 2>/dev/null || true
+  done
 }
 if [ -n "\$busy" ]; then
   printf 'update still has active npm/pnpm/openclaw processes\n%s\n' "\$busy" >&2
@@ -1095,6 +1098,18 @@ if [ "\$gateway_ready" != "1" ]; then
   done
 fi
 if [ "\$gateway_ready" != "1" ]; then
+  stop_openclaw_gateway_processes
+  /opt/homebrew/bin/openclaw gateway run --bind loopback --port 18789 --force >/tmp/openclaw-parallels-npm-update-macos-recover-gateway.log 2>&1 </dev/null &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if gateway_smoke_ready; then
+      gateway_ready=1
+      break
+    fi
+    sleep 2
+  done
+fi
+if [ "\$gateway_ready" != "1" ]; then
+  tail -n 120 /tmp/openclaw-parallels-npm-update-macos-recover-gateway.log 2>/dev/null || true
   echo "gateway did not become ready after transport recovery" >&2
   exit 1
 fi
@@ -1490,7 +1505,7 @@ run_windows_script_via_log() {
   local provider_key="$7"
   local runner_name log_name done_name done_status launcher_state guest_log
   local start_seconds poll_deadline startup_checked poll_rc state_rc log_rc
-  local log_state_path provider_key_b64
+  local log_state_path provider_key_b64 plugin_allow_b64
   runner_name="openclaw-update-$RANDOM-$RANDOM.ps1"
   log_name="openclaw-update-$RANDOM-$RANDOM.log"
   done_name="openclaw-update-$RANDOM-$RANDOM.done"
@@ -1638,37 +1653,10 @@ gateway_listener_ready() {
 gateway_log_ready() {
   latest="\$(/bin/ls -t /tmp/openclaw/openclaw-*.log 2>/dev/null | /usr/bin/head -n 1 || true)"
   [ -n "\$latest" ] || return 1
-  /usr/bin/tail -n 160 "\$latest" | /usr/bin/grep -q 'ready ('
+  /usr/bin/tail -n 160 "\$latest" | /usr/bin/grep -Eq 'ready( \(|[[:space:]]*\$)'
 }
 gateway_smoke_ready() {
   gateway_listener_ready && gateway_log_ready
-}
-scrub_future_plugin_entries() {
-  node - <<'JS' || true
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-
-const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
-if (!fs.existsSync(configPath)) process.exit(0);
-let config;
-try {
-  config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-} catch {
-  process.exit(0);
-}
-const plugins = config?.plugins;
-if (!plugins || typeof plugins !== "object" || Array.isArray(plugins)) process.exit(0);
-const entries = plugins.entries;
-if (entries && typeof entries === "object" && !Array.isArray(entries)) {
-  delete entries.feishu;
-  delete entries.whatsapp;
-}
-if (Array.isArray(plugins.allow)) {
-  plugins.allow = plugins.allow.filter((pluginId) => pluginId !== "feishu" && pluginId !== "whatsapp");
-}
-fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\\n");
-JS
 }
 stop_openclaw_gateway_processes() {
   OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 /opt/homebrew/bin/openclaw gateway stop >/dev/null 2>&1 || true
@@ -1679,29 +1667,43 @@ stop_openclaw_gateway_processes() {
     /bin/kill -9 "\$pid" 2>/dev/null || true
   done
 }
+openclaw_version_with_retry() {
+  bin="\$1"
+  expected="\$2"
+  version=""
+  last_output=""
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    set +e
+    version="\$("\$bin" --version 2>&1)"
+    status=\$?
+    set -e
+    if [ "\$status" -eq 0 ]; then
+      printf '%s\n' "\$version"
+      if [ -z "\$expected" ] || [[ "\$version" == *"\$expected"* ]]; then
+        return 0
+      fi
+      last_output="version mismatch: expected substring \$expected"
+    else
+      last_output="\$version"
+      printf '%s\n' "\$last_output" >&2
+    fi
+    sleep 2
+  done
+  printf '%s\n' "\$last_output" >&2
+  return 1
+}
 # Stop the pre-update gateway before replacing the package. Otherwise the old
 # host can observe new plugin metadata mid-update and abort config validation.
-scrub_future_plugin_entries
 stop_openclaw_gateway_processes
 # The baseline updater process may run its post-install doctor through the old
 # host while new bundled plugin metadata is already on disk. Keep this
 # same-guest update hop focused on core/package migration; post-update smoke
 # below starts the fresh gateway with bundled plugins enabled.
-OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 /opt/homebrew/bin/openclaw update --tag "$update_target" --yes --json
+OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 /opt/homebrew/bin/openclaw update --tag "$update_target" --yes --no-restart --json
 # Same-guest npm upgrades can leave the old gateway process holding the old
 # bundled plugin host version. Stop it before post-update config commands.
 stop_openclaw_gateway_processes
-version="\$(/opt/homebrew/bin/openclaw --version)"
-printf '%s\n' "\$version"
-if [ -n "$expected_needle" ]; then
-  case "\$version" in
-    *"$expected_needle"*) ;;
-    *)
-      echo "version mismatch: expected substring $expected_needle" >&2
-      exit 1
-      ;;
-  esac
-fi
+version="\$(openclaw_version_with_retry /opt/homebrew/bin/openclaw "$expected_needle")"
 /opt/homebrew/bin/openclaw update status --json
   /opt/homebrew/bin/openclaw models set "$MODEL_ID"
   /opt/homebrew/bin/openclaw config set agents.defaults.skipBootstrap true --strict-json
@@ -1776,33 +1778,6 @@ run_linux_update() {
 set -euo pipefail
 export HOME=/root
 cd "\$HOME"
-scrub_future_plugin_entries() {
-  node - <<'JS' || true
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
-
-const configPath = path.join(os.homedir(), ".openclaw", "openclaw.json");
-if (!fs.existsSync(configPath)) process.exit(0);
-let config;
-try {
-  config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-} catch {
-  process.exit(0);
-}
-const plugins = config?.plugins;
-if (!plugins || typeof plugins !== "object" || Array.isArray(plugins)) process.exit(0);
-const entries = plugins.entries;
-if (entries && typeof entries === "object" && !Array.isArray(entries)) {
-  delete entries.feishu;
-  delete entries.whatsapp;
-}
-if (Array.isArray(plugins.allow)) {
-  plugins.allow = plugins.allow.filter((pluginId) => pluginId !== "feishu" && pluginId !== "whatsapp");
-}
-fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\\n");
-JS
-}
 stop_openclaw_gateway_processes() {
   OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 openclaw gateway stop >/dev/null 2>&1 || true
   pkill -9 -f openclaw-gateway || true
@@ -1817,25 +1792,39 @@ stop_openclaw_gateway_processes() {
     done
   fi
 }
+openclaw_version_with_retry() {
+  bin="\$1"
+  expected="\$2"
+  version=""
+  last_output=""
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    set +e
+    version="\$("\$bin" --version 2>&1)"
+    status=\$?
+    set -e
+    if [ "\$status" -eq 0 ]; then
+      printf '%s\n' "\$version"
+      if [ -z "\$expected" ] || [[ "\$version" == *"\$expected"* ]]; then
+        return 0
+      fi
+      last_output="version mismatch: expected substring \$expected"
+    else
+      last_output="\$version"
+      printf '%s\n' "\$last_output" >&2
+    fi
+    sleep 2
+  done
+  printf '%s\n' "\$last_output" >&2
+  return 1
+}
 # Stop the pre-update manual gateway before replacing the package. Otherwise
 # the old host can observe new plugin metadata mid-update and abort validation.
-scrub_future_plugin_entries
 stop_openclaw_gateway_processes
-OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 openclaw update --tag "$update_target" --yes --json
+OPENCLAW_DISABLE_BUNDLED_PLUGINS=1 openclaw update --tag "$update_target" --yes --no-restart --json
 # The fresh Linux lane starts a manual gateway; stop the old process before
 # post-update config validation sees mixed old-host/new-plugin metadata.
 stop_openclaw_gateway_processes
-version="\$(openclaw --version)"
-printf '%s\n' "\$version"
-if [ -n "$expected_needle" ]; then
-  case "\$version" in
-    *"$expected_needle"*) ;;
-    *)
-      echo "version mismatch: expected substring $expected_needle" >&2
-      exit 1
-      ;;
-  esac
-fi
+version="\$(openclaw_version_with_retry openclaw "$expected_needle")"
 openclaw update status --json
 openclaw models set "$MODEL_ID"
 openclaw config set agents.defaults.skipBootstrap true --strict-json

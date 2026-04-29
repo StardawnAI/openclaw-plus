@@ -1,4 +1,5 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 
 type DiscoveredModel = { id: string; contextWindow?: number; contextTokens?: number };
 type ContextModule = typeof import("./context.js");
@@ -165,6 +166,34 @@ describe("lookupContextTokens", () => {
     expect(lookupContextTokens("gpt-5.4", { allowAsyncLoad: false })).toBe(272_000);
   });
 
+  it("scopes async discovery warmup to the explicit provider", async () => {
+    const cfg: OpenClawConfig = {
+      models: {
+        providers: {
+          openai: {
+            baseUrl: "https://example.com",
+            models: [],
+          },
+        },
+      },
+    };
+    const { ensureOpenClawModelsJson } = mockContextModuleDeps(() => cfg);
+
+    const { resolveContextTokensForModel } = await importContextModule();
+    expect(
+      resolveContextTokensForModel({
+        cfg,
+        provider: "openai",
+        model: "gpt-5.4",
+      }),
+    ).toBeUndefined();
+
+    await flushAsyncWarmup();
+    expect(ensureOpenClawModelsJson).toHaveBeenCalledWith(cfg, undefined, {
+      providerDiscoveryProviderIds: ["openai"],
+    });
+  });
+
   it("rehydrates config-backed cache entries after module reload when runtime config survives", async () => {
     const firstLoadConfigMock = vi.fn(() => ({
       models: {
@@ -222,6 +251,9 @@ describe("lookupContextTokens", () => {
     expect(shouldEagerWarmContextWindowCache(["node", "openclaw", "logs", "--limit", "5"])).toBe(
       false,
     );
+    expect(
+      shouldEagerWarmContextWindowCache(["node", "openclaw", "memory", "search", "--json"]),
+    ).toBe(false);
     expect(shouldEagerWarmContextWindowCache(["node", "openclaw", "status", "--json"])).toBe(false);
     expect(shouldEagerWarmContextWindowCache(["node", "openclaw", "sessions", "--json"])).toBe(
       false,

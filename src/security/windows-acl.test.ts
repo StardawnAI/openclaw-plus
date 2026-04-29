@@ -1,19 +1,21 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WindowsAclEntry, WindowsAclSummary } from "./windows-acl.js";
 
 const MOCK_USERNAME = "MockUser";
-const userInfoMock = vi.hoisted(() =>
-  vi.fn(() => ({
+function createMockUserInfo() {
+  return {
     username: MOCK_USERNAME,
     uid: -1,
     gid: -1,
     shell: "C:\\Windows\\System32\\cmd.exe",
     homedir: "C:\\Users\\MockUser",
-  })),
-);
+  };
+}
+
+const userInfoMock = vi.hoisted(() => vi.fn(createMockUserInfo));
 
 vi.mock("node:os", async () => {
-  const { mockNodeBuiltinModule } = await import("../../test/helpers/node-builtin-mocks.js");
+  const { mockNodeBuiltinModule } = await import("openclaw/plugin-sdk/test-node-mocks");
   return mockNodeBuiltinModule(
     () => vi.importActual<typeof import("node:os")>("node:os"),
     { userInfo: userInfoMock as unknown as typeof import("node:os").userInfo },
@@ -29,7 +31,11 @@ let parseIcaclsOutput: typeof import("./windows-acl.js").parseIcaclsOutput;
 let resolveWindowsUserPrincipal: typeof import("./windows-acl.js").resolveWindowsUserPrincipal;
 let summarizeWindowsAcl: typeof import("./windows-acl.js").summarizeWindowsAcl;
 
-beforeAll(async () => {
+beforeEach(async () => {
+  vi.resetModules();
+  vi.unstubAllEnvs();
+  userInfoMock.mockReset();
+  userInfoMock.mockReturnValue(createMockUserInfo());
   ({
     createIcaclsResetCommand,
     formatIcaclsResetCommand,
@@ -39,10 +45,6 @@ beforeAll(async () => {
     resolveWindowsUserPrincipal,
     summarizeWindowsAcl,
   } = await import("./windows-acl.js"));
-});
-
-beforeEach(() => {
-  vi.unstubAllEnvs();
 });
 
 function aclEntry(params: {

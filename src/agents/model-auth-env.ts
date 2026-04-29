@@ -3,10 +3,12 @@ import os from "node:os";
 import path from "node:path";
 import { getShellEnvAppliedKeys } from "../infra/shell-env.js";
 import { resolvePluginSetupProvider } from "../plugins/setup-registry.js";
+import { CORE_PROVIDER_AUTH_ENV_VAR_CANDIDATES } from "../secrets/provider-env-vars.js";
 import { normalizeOptionalSecretInput } from "../utils/normalize-secret-input.js";
 import { resolveProviderEnvApiKeyCandidates } from "./model-auth-env-vars.js";
 import { GCP_VERTEX_CREDENTIALS_MARKER } from "./model-auth-markers.js";
 import { resolveProviderIdForAuth } from "./provider-auth-aliases.js";
+import { normalizeProviderId } from "./provider-id.js";
 
 export type EnvApiKeyResult = {
   apiKey: string;
@@ -40,8 +42,7 @@ export function resolveEnvApiKey(
   provider: string,
   env: NodeJS.ProcessEnv = process.env,
 ): EnvApiKeyResult | null {
-  const normalized = resolveProviderIdForAuth(provider, { env });
-  const candidateMap = resolveProviderEnvApiKeyCandidates({ env });
+  const rawProvider = normalizeProviderId(provider);
   const applied = new Set(getShellEnvAppliedKeys());
   const pick = (envVar: string): EnvApiKeyResult | null => {
     const value = normalizeOptionalSecretInput(env[envVar]);
@@ -51,6 +52,33 @@ export function resolveEnvApiKey(
     const source = applied.has(envVar) ? `shell env: ${envVar}` : `env: ${envVar}`;
     return { apiKey: value, source };
   };
+
+  const coreCandidates = Object.hasOwn(CORE_PROVIDER_AUTH_ENV_VAR_CANDIDATES, rawProvider)
+    ? CORE_PROVIDER_AUTH_ENV_VAR_CANDIDATES[
+        rawProvider as keyof typeof CORE_PROVIDER_AUTH_ENV_VAR_CANDIDATES
+      ]
+    : undefined;
+  if (Array.isArray(coreCandidates)) {
+    for (const envVar of coreCandidates) {
+      const resolved = pick(envVar);
+      if (resolved) {
+        return resolved;
+      }
+    }
+  }
+
+  if (rawProvider === "google-vertex") {
+    const envKey = resolveGoogleVertexEnvApiKey(env);
+    if (envKey) {
+      return { apiKey: envKey, source: "gcloud adc" };
+    }
+  }
+
+  const candidateMap = resolveProviderEnvApiKeyCandidates({ env });
+  const normalized = resolveProviderIdForAuth(rawProvider, { env });
+  if (normalized === rawProvider && coreCandidates) {
+    return null;
+  }
 
   const candidates = Object.hasOwn(candidateMap, normalized) ? candidateMap[normalized] : undefined;
   if (Array.isArray(candidates)) {

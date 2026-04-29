@@ -28,6 +28,7 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", async () => {
 
 describe("telegram live qa runtime", () => {
   afterEach(() => {
+    vi.useRealTimers();
     fetchWithSsrFGuardMock.mockClear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -100,6 +101,46 @@ describe("telegram live qa runtime", () => {
     ).toBe(true);
   });
 
+  it("normalizes the Telegram canary timeout env", () => {
+    expect(
+      __testing.resolveTelegramQaCanaryTimeoutMs({
+        OPENCLAW_QA_TELEGRAM_CANARY_TIMEOUT_MS: "12345",
+      }),
+    ).toBe(12345);
+    expect(
+      __testing.resolveTelegramQaCanaryTimeoutMs({
+        OPENCLAW_QA_TELEGRAM_CANARY_TIMEOUT_MS: "nope",
+      }),
+    ).toBe(60_000);
+  });
+
+  it("waits for Telegram polling connectivity before treating the account as ready", async () => {
+    vi.useFakeTimers();
+    const gateway = {
+      call: vi
+        .fn()
+        .mockResolvedValueOnce({
+          channelAccounts: {
+            telegram: [{ accountId: "sut", connected: false, running: true }],
+          },
+        })
+        .mockResolvedValueOnce({
+          channelAccounts: {
+            telegram: [{ accountId: "sut", connected: true, running: true }],
+          },
+        }),
+    };
+
+    const ready = __testing.waitForTelegramChannelRunning(gateway as never, "sut", {
+      pollIntervalMs: 10,
+      timeoutMs: 1_000,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    await expect(ready).resolves.toBeUndefined();
+    expect(gateway.call).toHaveBeenCalledTimes(2);
+  });
+
   it("sanitizes and truncates Telegram live progress details", () => {
     expect(__testing.sanitizeTelegramQaProgressValue("scenario\nid\tvalue")).toBe(
       "scenario id value",
@@ -165,6 +206,7 @@ describe("telegram live qa runtime", () => {
     expect(next.agents?.defaults?.skipBootstrap).toBe(true);
     expect(next.plugins?.allow).toContain("telegram");
     expect(next.plugins?.entries?.telegram).toEqual({ enabled: true });
+    expect(next.messages?.groupChat?.visibleReplies).toBe("automatic");
     expect(next.channels?.telegram).toEqual({
       enabled: true,
       defaultAccount: "sut",

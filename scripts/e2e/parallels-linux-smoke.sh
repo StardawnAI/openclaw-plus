@@ -106,7 +106,7 @@ Options:
   --provider <openai|anthropic|minimax>
                              Provider auth/model lane. Default: openai
   --model <provider/model>    Override the model used for the agent-turn smoke.
-                             Default: openai/gpt-5.5 for the OpenAI lane
+                             Default: openai/gpt-5.4-mini for the OpenAI lane
   --api-key-env <var>        Host env var name for provider API key.
                              Default: OPENAI_API_KEY for openai, ANTHROPIC_API_KEY for anthropic
   --openai-api-key-env <var> Alias for --api-key-env (backward compatible)
@@ -209,7 +209,7 @@ case "$PROVIDER" in
   openai)
     AUTH_CHOICE="openai-api-key"
     AUTH_KEY_FLAG="openai-api-key"
-    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.5}"
+    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.4-mini}"
     [[ -n "$API_KEY_ENV" ]] || API_KEY_ENV="OPENAI_API_KEY"
     ;;
   anthropic)
@@ -231,6 +231,7 @@ esac
 
 API_KEY_VALUE="${!API_KEY_ENV:-}"
 [[ -n "$API_KEY_VALUE" ]] || die "$API_KEY_ENV is required"
+
 case "${OPENCLAW_PARALLELS_LINUX_DISABLE_BONJOUR:-}" in
   1|true|TRUE|yes|YES|on|ON)
     DISABLE_BONJOUR_FOR_GATEWAY=1

@@ -21,8 +21,10 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { expandPackageDistImportClosure } from "./lib/package-dist-imports.mjs";
 import { resolveNpmRunner } from "./npm-runner.mjs";
 
 export const BUNDLED_PLUGIN_INSTALL_TARGETS = [];
@@ -292,6 +294,16 @@ export function pruneInstalledPackageDist(params = {}) {
     }
   }
   const installedFiles = listInstalledDistFiles(params);
+  const readFile = params.readFileSync ?? readFileSync;
+  expectedFiles = new Set(
+    expandPackageDistImportClosure({
+      files: installedFiles,
+      seedFiles: [...expectedFiles],
+      readText(relativePath) {
+        return readFile(join(packageRoot, relativePath), "utf8");
+      },
+    }),
+  );
   const removed = [];
 
   for (const relativePath of installedFiles) {
@@ -450,6 +462,7 @@ export function createNestedNpmInstallEnv(env = process.env) {
 export function createBundledRuntimeDependencyInstallEnv(env = process.env) {
   return {
     ...createNestedNpmInstallEnv(env),
+    npm_config_dry_run: "false",
     npm_config_legacy_peer_deps: "true",
     npm_config_package_lock: "false",
     npm_config_save: "false",
@@ -715,6 +728,29 @@ function shouldRunBundledPluginPostinstall(params) {
   return true;
 }
 
+export function pruneOpenClawCompileCache(params = {}) {
+  const env = params.env ?? process.env;
+  const pathExists = params.existsSync ?? existsSync;
+  const remove = params.rmSync ?? rmSync;
+  const log = params.log ?? console;
+  const baseDirs = [
+    env.NODE_DISABLE_COMPILE_CACHE ? "" : env.NODE_COMPILE_CACHE,
+    join(tmpdir(), "node-compile-cache"),
+  ].filter((value, index, values) => value && values.indexOf(value) === index);
+
+  for (const baseDir of baseDirs) {
+    const cacheRoot = join(baseDir, "openclaw");
+    if (!pathExists(cacheRoot)) {
+      continue;
+    }
+    try {
+      remove(cacheRoot, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+    } catch (error) {
+      log.warn?.(`[postinstall] could not prune OpenClaw compile cache: ${String(error)}`);
+    }
+  }
+}
+
 export function runBundledPluginPostinstall(params = {}) {
   const env = params.env ?? process.env;
   const packageRoot = params.packageRoot ?? DEFAULT_PACKAGE_ROOT;
@@ -725,6 +761,12 @@ export function runBundledPluginPostinstall(params = {}) {
   if (env?.[DISABLE_POSTINSTALL_ENV]?.trim()) {
     return;
   }
+  pruneOpenClawCompileCache({
+    env,
+    existsSync: pathExists,
+    rmSync: params.rmSync,
+    log,
+  });
   if (isSourceCheckoutRoot({ packageRoot, existsSync: pathExists })) {
     try {
       pruneBundledPluginSourceNodeModules({

@@ -49,11 +49,11 @@ BUILD_LOCK_DIR="${TMPDIR:-/tmp}/openclaw-parallels-build.lock"
 TIMEOUT_INSTALL_SITE_S=420
 TIMEOUT_INSTALL_TGZ_S=420
 TIMEOUT_INSTALL_REGISTRY_S=420
-TIMEOUT_UPDATE_DEV_S="${OPENCLAW_PARALLELS_MACOS_UPDATE_DEV_TIMEOUT_S:-1200}"
+TIMEOUT_UPDATE_DEV_S="${OPENCLAW_PARALLELS_MACOS_UPDATE_DEV_TIMEOUT_S:-1800}"
 TIMEOUT_VERIFY_S=60
 TIMEOUT_ONBOARD_S=180
-TIMEOUT_GATEWAY_S=180
-TIMEOUT_AGENT_S="${OPENCLAW_PARALLELS_MACOS_AGENT_TIMEOUT_S:-240}"
+TIMEOUT_GATEWAY_S=420
+TIMEOUT_AGENT_S="${OPENCLAW_PARALLELS_MACOS_AGENT_TIMEOUT_S:-900}"
 TIMEOUT_PERMISSION_S=60
 TIMEOUT_DASHBOARD_S=180
 TIMEOUT_SNAPSHOT_S=360
@@ -144,7 +144,7 @@ Options:
   --provider <openai|anthropic|minimax>
                              Provider auth/model lane. Default: openai
   --model <provider/model>    Override the model used for the agent-turn smoke.
-                             Default: openai/gpt-5.5 for the OpenAI lane
+                             Default: openai/gpt-5.4-mini for the OpenAI lane
   --api-key-env <var>        Host env var name for provider API key.
                              Default: OPENAI_API_KEY for openai, ANTHROPIC_API_KEY for anthropic
   --openai-api-key-env <var> Alias for --api-key-env (backward compatible)
@@ -266,7 +266,7 @@ case "$PROVIDER" in
   openai)
     AUTH_CHOICE="openai-api-key"
     AUTH_KEY_FLAG="openai-api-key"
-    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.5}"
+    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.4-mini}"
     [[ -n "$API_KEY_ENV" ]] || API_KEY_ENV="OPENAI_API_KEY"
     ;;
   anthropic)
@@ -1109,6 +1109,7 @@ ensure_guest_pnpm_for_dev_update() {
 
 repair_legacy_dev_source_checkout_if_needed() {
   local bootstrap_bin update_root update_entry
+  LEGACY_DEV_SOURCE_REPAIR_APPLIED=0
   bootstrap_bin="/tmp/openclaw-smoke-pnpm-bootstrap/node_modules/.bin"
   update_root="$(resolve_guest_current_user_home)/openclaw"
   update_entry="$update_root/openclaw.mjs"
@@ -1121,6 +1122,7 @@ repair_legacy_dev_source_checkout_if_needed() {
   if ! guest_current_user_exec /bin/test -f "$update_root/src/entry.ts"; then
     return 0
   fi
+  LEGACY_DEV_SOURCE_REPAIR_APPLIED=1
   warn "repairing legacy dev source archive into git checkout"
   ensure_guest_pnpm_for_dev_update
   guest_current_user_exec /bin/rm -rf "$update_root"
@@ -1160,6 +1162,9 @@ EOF
     guest_current_user_tail_file "$update_log" 120 >&2 || true
   fi
   repair_legacy_dev_source_checkout_if_needed
+  if (( update_rc != 0 && LEGACY_DEV_SOURCE_REPAIR_APPLIED == 0 )); then
+    return "$update_rc"
+  fi
   printf 'update-dev: git-version\n'
   guest_current_user_exec "$GUEST_NODE_BIN" "$GUEST_OPENCLAW_ENTRY" --version
   printf 'update-dev: git-status\n'
@@ -1393,6 +1398,17 @@ EOF
   guest_current_user_exec /bin/bash -lc "$cmd"
 }
 
+reset_openclaw_user_state() {
+  guest_current_user_sh "$(cat <<'EOF'
+/usr/bin/pkill -f 'openclaw.*gateway run' >/dev/null 2>&1 || true
+/usr/bin/pkill -f 'openclaw-gateway' >/dev/null 2>&1 || true
+/usr/bin/pkill -f 'openclaw.mjs gateway' >/dev/null 2>&1 || true
+rm -rf "$HOME/.openclaw"
+rm -f /tmp/openclaw-parallels-macos-gateway.log
+EOF
+  )"
+}
+
 run_ref_onboard() {
   local daemon_args=("--install-daemon")
   if headless_guest_fallback; then
@@ -1460,15 +1476,36 @@ EOF
 }
 
 verify_gateway() {
-  local attempt
-  for attempt in 1 2 3 4 5 6 7 8; do
-    if guest_current_user_exec "$GUEST_OPENCLAW_BIN" gateway status --deep --require-rpc --timeout 15000; then
+  local attempt deadline probe_json
+  attempt=1
+  deadline=$((SECONDS + TIMEOUT_GATEWAY_S))
+  while (( SECONDS < deadline )); do
+    if probe_json="$(
+      guest_current_user_exec "$GUEST_OPENCLAW_BIN" gateway probe \
+        --url ws://127.0.0.1:18789 \
+        --timeout 30000 \
+        --json
+    )"; then
+      printf '%s\n' "$probe_json"
+      if PROBE_JSON="$probe_json" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["PROBE_JSON"])
+raise SystemExit(0 if payload.get("ok") else 1)
+PY
+      then
+        return 0
+      fi
+    elif ! guest_current_user_exec "$GUEST_OPENCLAW_BIN" gateway probe --help >/dev/null 2>&1 &&
+      guest_current_user_exec "$GUEST_OPENCLAW_BIN" gateway status --deep --require-rpc --timeout 30000; then
       return 0
     fi
-    if (( attempt < 8 )); then
-      printf 'gateway-status retry %s\n' "$attempt" >&2
+    if (( SECONDS < deadline )); then
+      printf 'gateway-probe retry %s\n' "$attempt" >&2
       sleep 5
     fi
+    attempt=$((attempt + 1))
   done
   return 1
 }
@@ -1482,9 +1519,15 @@ show_gateway_status_compat() {
 }
 
 verify_turn() {
+  local agent_log agent_done agent_runner attempt rc
+  agent_log="/tmp/openclaw-parallels-agent-turn.log"
+  agent_done="/tmp/openclaw-parallels-agent-turn.done"
+  agent_runner="/tmp/openclaw-parallels-agent-turn.sh"
   guest_current_user_exec "$GUEST_NODE_BIN" "$GUEST_OPENCLAW_ENTRY" models set "$MODEL_ID"
   guest_current_user_exec "$GUEST_NODE_BIN" "$GUEST_OPENCLAW_ENTRY" config set agents.defaults.skipBootstrap true --strict-json
-  guest_current_user_sh "$(cat <<EOF
+  for attempt in 1 2; do
+    set +e
+    run_logged_guest_current_user_sh "$(cat <<EOF
 export PATH=$(shell_quote "$GUEST_EXEC_PATH")
 workspace="\${OPENCLAW_WORKSPACE_DIR:-\$HOME/.openclaw/workspace}"
 mkdir -p "\$workspace/.openclaw"
@@ -1508,7 +1551,19 @@ exec /usr/bin/env $(shell_quote "$API_KEY_ENV=$API_KEY_VALUE") \
   --message $(shell_quote "Reply with exact ASCII text OK only.") \
   --json
 EOF
-)"
+)" "$agent_log" "$agent_done" "$TIMEOUT_AGENT_S" "$agent_runner"
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+      return 0
+    fi
+    if (( attempt < 2 )) &&
+      guest_current_user_exec /usr/bin/grep -Eq 'plugin load failed: .*ENOENT: .*plugin-runtime-deps.*/dist/' "$agent_log"; then
+      warn "retrying macOS agent turn after staged runtime mirror race"
+      continue
+    fi
+    return "$rc"
+  done
 }
 
 resolve_dashboard_url() {
@@ -1944,6 +1999,7 @@ run_fresh_main_lane() {
   local snapshot_id="$1"
   local host_ip="$2"
   phase_run "fresh.restore-snapshot" "$TIMEOUT_SNAPSHOT_S" restore_snapshot "$snapshot_id"
+  phase_run "fresh.reset-state" "$TIMEOUT_ONBOARD_S" reset_openclaw_user_state
   phase_run "fresh.install-main" "$(install_main_timeout)" install_main_tgz "$host_ip" "openclaw-main-fresh.tgz"
   FRESH_MAIN_VERSION="$(extract_last_version "$(phase_log_path fresh.install-main)")"
   phase_run "fresh.verify-main-version" "$TIMEOUT_VERIFY_S" verify_target_version
@@ -1971,6 +2027,7 @@ run_upgrade_lane() {
   local snapshot_id="$1"
   local host_ip="$2"
   phase_run "upgrade.restore-snapshot" "$TIMEOUT_SNAPSHOT_S" restore_snapshot "$snapshot_id"
+  phase_run "upgrade.reset-state" "$TIMEOUT_ONBOARD_S" reset_openclaw_user_state
   phase_run "upgrade.install-latest" "$TIMEOUT_INSTALL_SITE_S" install_latest_release
   LATEST_INSTALLED_VERSION="$(extract_last_version "$(phase_log_path upgrade.install-latest)")"
   phase_run "upgrade.verify-latest-version" "$TIMEOUT_VERIFY_S" verify_version_contains "$INSTALL_VERSION"

@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
 import semverSatisfies from "semver/functions/satisfies.js";
 import { resolveNpmRunner } from "./npm-runner.mjs";
@@ -499,7 +500,7 @@ function createInstalledRuntimeClosureFingerprint(rootNodeModulesDir, dependency
     if (depRoot === null || !fs.existsSync(depRoot)) {
       return null;
     }
-    hash.update(`package:${depName}\n`);
+    hash.update(`package:${depName}:${fs.realpathSync(depRoot)}\n`);
     appendDirectoryFingerprint(hash, depRoot);
   }
   return hash.digest("hex");
@@ -885,6 +886,7 @@ function runNpmInstall(params) {
     ...(params.npmRunner.env ?? process.env),
     CI: "1",
     npm_config_audit: "false",
+    npm_config_dry_run: "false",
     npm_config_fund: "false",
     npm_config_legacy_peer_deps: "true",
     npm_config_loglevel: "error",
@@ -1221,69 +1223,102 @@ export function stageBundledPluginRuntimeDeps(params = {}) {
     params.installPluginRuntimeDepsImpl ?? installPluginRuntimeDeps;
   const installAttempts = params.installAttempts ?? 3;
   const pruneConfig = resolveRuntimeDepPruneConfig(params);
+  const timingsEnabled =
+    params.timings ?? process.env.OPENCLAW_RUNTIME_DEPS_STAGING_TIMINGS === "1";
+  const runPluginPhase = (pluginId, label, action) => {
+    const startedAt = performance.now();
+    try {
+      return action();
+    } finally {
+      if (timingsEnabled) {
+        const durationMs = Math.round(performance.now() - startedAt);
+        console.error(
+          `stage-bundled-plugin-runtime-deps: ${pluginId} ${label} completed in ${durationMs}ms`,
+        );
+      }
+    }
+  };
   for (const pluginDir of listBundledPluginRuntimeDirs(repoRoot)) {
     const pluginId = path.basename(pluginDir);
     const sourcePluginRoot = resolveInstalledWorkspacePluginRoot(repoRoot, pluginId);
     const directDependencyPackageRoot = fs.existsSync(path.join(sourcePluginRoot, "package.json"))
       ? sourcePluginRoot
       : null;
-    const packageJson = sanitizeBundledManifestForRuntimeInstall(pluginDir);
+    const packageJson = runPluginPhase(pluginId, "sanitize manifest", () =>
+      sanitizeBundledManifestForRuntimeInstall(pluginDir),
+    );
     const nodeModulesDir = path.join(pluginDir, "node_modules");
     const stampPath = resolveRuntimeDepsStampPath(repoRoot, pluginId);
     const legacyStampPath = resolveLegacyRuntimeDepsStampPath(pluginDir);
-    removePathIfExists(legacyStampPath);
-    removeStaleRuntimeDepsTempDirs(pluginDir);
+    runPluginPhase(pluginId, "cleanup stale runtime dirs", () => {
+      removePathIfExists(legacyStampPath);
+      removeStaleRuntimeDepsTempDirs(pluginDir);
+    });
     if (!hasRuntimeDeps(packageJson) || !shouldStageRuntimeDeps(packageJson)) {
-      removePathIfExists(nodeModulesDir);
-      removePathIfExists(stampPath);
+      runPluginPhase(pluginId, "remove unstaged runtime deps", () => {
+        removePathIfExists(nodeModulesDir);
+        removePathIfExists(stampPath);
+      });
       continue;
     }
-    const cheapFingerprint = createRuntimeDepsCheapFingerprint(packageJson, pruneConfig, {
-      repoRoot,
-    });
+    const cheapFingerprint = runPluginPhase(pluginId, "cheap fingerprint", () =>
+      createRuntimeDepsCheapFingerprint(packageJson, pruneConfig, {
+        repoRoot,
+      }),
+    );
     const stamp = readRuntimeDepsStamp(stampPath);
-    const rootInstalledRuntimeFingerprint = resolveInstalledRuntimeClosureFingerprint({
-      directDependencyPackageRoot,
-      packageJson,
-      rootNodeModulesDir: path.join(repoRoot, "node_modules"),
-    });
+    const rootInstalledRuntimeFingerprint = runPluginPhase(
+      pluginId,
+      "installed runtime fingerprint",
+      () =>
+        resolveInstalledRuntimeClosureFingerprint({
+          directDependencyPackageRoot,
+          packageJson,
+          rootNodeModulesDir: path.join(repoRoot, "node_modules"),
+        }),
+    );
     const fingerprint = createRuntimeDepsFingerprint(packageJson, pruneConfig, {
       repoRoot,
       rootInstalledRuntimeFingerprint,
     });
     if (fs.existsSync(nodeModulesDir) && stamp?.fingerprint === fingerprint) {
+      runPluginPhase(pluginId, "reuse staged runtime deps", () => {});
       continue;
     }
     if (
-      stageInstalledRootRuntimeDeps({
-        directDependencyPackageRoot,
-        fingerprint,
-        cheapFingerprint,
-        packageJson,
-        pluginDir,
-        pruneConfig,
-        repoRoot,
-        stampPath,
-      })
-    ) {
-      continue;
-    }
-    try {
-      installPluginRuntimeDepsWithRetries({
-        attempts: installAttempts,
-        install: installPluginRuntimeDepsImpl,
-        installParams: {
+      runPluginPhase(pluginId, "stage installed root runtime deps", () =>
+        stageInstalledRootRuntimeDeps({
           directDependencyPackageRoot,
           fingerprint,
           cheapFingerprint,
           packageJson,
           pluginDir,
-          pluginId,
           pruneConfig,
           repoRoot,
           stampPath,
-        },
-      });
+        }),
+      )
+    ) {
+      continue;
+    }
+    try {
+      runPluginPhase(pluginId, "fallback install runtime deps", () =>
+        installPluginRuntimeDepsWithRetries({
+          attempts: installAttempts,
+          install: installPluginRuntimeDepsImpl,
+          installParams: {
+            directDependencyPackageRoot,
+            fingerprint,
+            cheapFingerprint,
+            packageJson,
+            pluginDir,
+            pluginId,
+            pruneConfig,
+            repoRoot,
+            stampPath,
+          },
+        }),
+      );
     } catch (error) {
       throw createRootRuntimeStagingError({ packageJson, pluginId, cause: error });
     }

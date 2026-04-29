@@ -10,9 +10,6 @@ vi.mock("../plugins/capability-provider-runtime.js", () => ({
   resolvePluginCapabilityProviders: resolvePluginCapabilityProvidersMock,
 }));
 
-const { getImageGenerationProvider, listImageGenerationProviders } =
-  await import("./provider-registry.js");
-
 function createProvider(
   params: Pick<ImageGenerationProviderPlugin, "id"> & Partial<ImageGenerationProviderPlugin>,
 ): ImageGenerationProviderPlugin {
@@ -29,14 +26,21 @@ function createProvider(
   };
 }
 
+async function loadProviderRegistry() {
+  vi.resetModules();
+  return await import("./provider-registry.js");
+}
+
 describe("image-generation provider registry", () => {
   beforeEach(() => {
+    vi.resetModules();
     resolvePluginCapabilityProvidersMock.mockReset();
     resolvePluginCapabilityProvidersMock.mockReturnValue([]);
   });
 
-  it("delegates provider resolution to the capability provider boundary", () => {
+  it("delegates provider resolution to the capability provider boundary", async () => {
     const cfg = {} as OpenClawConfig;
+    const { listImageGenerationProviders } = await loadProviderRegistry();
 
     expect(listImageGenerationProviders(cfg)).toEqual([]);
     expect(resolvePluginCapabilityProvidersMock).toHaveBeenCalledWith({
@@ -45,8 +49,9 @@ describe("image-generation provider registry", () => {
     });
   });
 
-  it("uses active plugin providers without loading from disk", () => {
+  it("uses active plugin providers without loading from disk", async () => {
     resolvePluginCapabilityProvidersMock.mockReturnValue([createProvider({ id: "custom-image" })]);
+    const { getImageGenerationProvider } = await loadProviderRegistry();
 
     const provider = getImageGenerationProvider("custom-image");
 
@@ -57,11 +62,13 @@ describe("image-generation provider registry", () => {
     });
   });
 
-  it("ignores prototype-like provider ids and aliases", () => {
+  it("ignores prototype-like provider ids and aliases", async () => {
     resolvePluginCapabilityProvidersMock.mockReturnValue([
       createProvider({ id: "__proto__", aliases: ["constructor", "prototype"] }),
       createProvider({ id: "safe-image", aliases: ["safe-alias", "constructor"] }),
     ]);
+    const { getImageGenerationProvider, listImageGenerationProviders } =
+      await loadProviderRegistry();
 
     expect(listImageGenerationProviders().map((provider) => provider.id)).toEqual(["safe-image"]);
     expect(getImageGenerationProvider("__proto__")).toBeUndefined();

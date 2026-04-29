@@ -1,23 +1,18 @@
-import { chromium } from "playwright-core";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SsrFBlockedError } from "../infra/net/ssrf.js";
-import "../../test-support/browser-security-runtime.mock.js";
-import * as chromeModule from "./chrome.js";
+import "../test-support/browser-security.mock.js";
 import { BrowserTabNotFoundError } from "./errors.js";
 import { InvalidBrowserNavigationUrlError } from "./navigation-guard.js";
 import * as navigationGuardModule from "./navigation-guard.js";
-import {
-  BlockedBrowserTargetError,
-  closePlaywrightBrowserConnection,
-  createPageViaPlaywright,
-  forceDisconnectPlaywrightForTarget,
-  getPageForTargetId,
-  gotoPageWithNavigationGuard,
-  listPagesViaPlaywright,
-} from "./pw-session.js";
+import { connectOverCdpMock, getChromeWebSocketUrlMock } from "./pw-session.mock-setup.js";
 
-const connectOverCdpSpy = vi.spyOn(chromium, "connectOverCDP");
-const getChromeWebSocketUrlSpy = vi.spyOn(chromeModule, "getChromeWebSocketUrl");
+let BlockedBrowserTargetError: typeof import("./pw-session.js").BlockedBrowserTargetError;
+let closePlaywrightBrowserConnection: typeof import("./pw-session.js").closePlaywrightBrowserConnection;
+let createPageViaPlaywright: typeof import("./pw-session.js").createPageViaPlaywright;
+let forceDisconnectPlaywrightForTarget: typeof import("./pw-session.js").forceDisconnectPlaywrightForTarget;
+let getPageForTargetId: typeof import("./pw-session.js").getPageForTargetId;
+let gotoPageWithNavigationGuard: typeof import("./pw-session.js").gotoPageWithNavigationGuard;
+let listPagesViaPlaywright: typeof import("./pw-session.js").listPagesViaPlaywright;
 
 const PROXY_ENV_KEYS = [
   "ALL_PROXY",
@@ -101,8 +96,8 @@ function installBrowserMocks() {
     close: browserClose,
   } as unknown as import("playwright-core").Browser;
 
-  connectOverCdpSpy.mockResolvedValue(browser);
-  getChromeWebSocketUrlSpy.mockResolvedValue(null);
+  connectOverCdpMock.mockResolvedValue(browser);
+  getChromeWebSocketUrlMock.mockResolvedValue(null);
 
   const getBrowserDisconnectedHandler = () =>
     browserOn.mock.calls.find((call) => call[0] === "disconnected")?.[1] as
@@ -186,10 +181,22 @@ beforeEach(() => {
   }
 });
 
+beforeAll(async () => {
+  ({
+    BlockedBrowserTargetError,
+    closePlaywrightBrowserConnection,
+    createPageViaPlaywright,
+    forceDisconnectPlaywrightForTarget,
+    getPageForTargetId,
+    gotoPageWithNavigationGuard,
+    listPagesViaPlaywright,
+  } = await import("./pw-session.js"));
+});
+
 afterEach(async () => {
   vi.unstubAllEnvs();
-  connectOverCdpSpy.mockClear();
-  getChromeWebSocketUrlSpy.mockClear();
+  connectOverCdpMock.mockClear();
+  getChromeWebSocketUrlMock.mockClear();
   await closePlaywrightBrowserConnection().catch(() => {});
 });
 

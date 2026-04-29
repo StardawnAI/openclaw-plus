@@ -8,13 +8,20 @@ import {
   normalizeOptionalString,
 } from "../shared/string-coerce.js";
 import { resolveOpenClawAgentDir } from "./agent-paths.js";
+import { modelSupportsInput as modelCatalogEntrySupportsInput } from "./model-catalog-lookup.js";
 import type { ModelCatalogEntry, ModelInputType } from "./model-catalog.types.js";
+import { buildConfiguredModelCatalog } from "./model-selection-shared.js";
 import { ensureOpenClawModelsJson } from "./models-config.js";
 import { normalizeProviderId } from "./provider-id.js";
 
 const log = createSubsystemLogger("model-catalog");
 
 export type { ModelCatalogEntry, ModelInputType } from "./model-catalog.types.js";
+export {
+  findModelCatalogEntry,
+  findModelInCatalog,
+  modelSupportsInput,
+} from "./model-catalog-lookup.js";
 
 type DiscoveredModel = {
   id: string;
@@ -78,16 +85,42 @@ function instantiatePiModelRegistry(
   return new Registry(authStorage, modelsFile);
 }
 
+function catalogEntryDedupeKey(provider: string, id: string): string {
+  return `${normalizeProviderId(provider)}::${normalizeLowercaseStringOrEmpty(id)}`;
+}
+
+function appendCatalogEntriesIfAbsent(
+  models: ModelCatalogEntry[],
+  entries: ModelCatalogEntry[],
+): void {
+  const seen = new Set(models.map((entry) => catalogEntryDedupeKey(entry.provider, entry.id)));
+  for (const entry of entries) {
+    const key = catalogEntryDedupeKey(entry.provider, entry.id);
+    if (seen.has(key)) {
+      continue;
+    }
+    models.push(entry);
+    seen.add(key);
+  }
+}
+
 export async function loadModelCatalog(params?: {
   config?: OpenClawConfig;
   useCache?: boolean;
   readOnly?: boolean;
+  providerDiscoveryProviderIds?: readonly string[];
 }): Promise<ModelCatalogEntry[]> {
   const readOnly = params?.readOnly === true;
+  const providerDiscoveryProviderIds = params?.providerDiscoveryProviderIds
+    ?.map((value) => value.trim())
+    .filter(Boolean);
+  const scopedCatalog =
+    providerDiscoveryProviderIds !== undefined && providerDiscoveryProviderIds.length > 0;
+  const useSharedCache = !readOnly && !scopedCatalog;
   if (!readOnly && params?.useCache === false) {
     modelCatalogPromise = null;
   }
-  if (!readOnly && modelCatalogPromise) {
+  if (useSharedCache && modelCatalogPromise) {
     return modelCatalogPromise;
   }
 
@@ -113,7 +146,11 @@ export async function loadModelCatalog(params?: {
     try {
       const cfg = params?.config ?? getRuntimeConfig();
       if (!readOnly) {
-        await ensureOpenClawModelsJson(cfg);
+        await ensureOpenClawModelsJson(
+          cfg,
+          undefined,
+          scopedCatalog ? { providerDiscoveryProviderIds } : undefined,
+        );
         logStage("models-json-ready");
       }
       // IMPORTANT: keep the dynamic import *inside* the try/catch.
@@ -162,6 +199,7 @@ export async function loadModelCatalog(params?: {
       const supplemental = await augmentModelCatalogWithProviderPlugins({
         config: cfg,
         env: process.env,
+        ...(scopedCatalog ? { providerDiscoveryProviderIds } : {}),
         context: {
           config: cfg,
           agentDir,
@@ -170,26 +208,19 @@ export async function loadModelCatalog(params?: {
         },
       });
       if (supplemental.length > 0) {
-        const seen = new Set(
-          models.map(
-            (entry) =>
-              `${normalizeLowercaseStringOrEmpty(entry.provider)}::${normalizeLowercaseStringOrEmpty(entry.id)}`,
-          ),
-        );
-        for (const entry of supplemental) {
-          const key = `${normalizeLowercaseStringOrEmpty(entry.provider)}::${normalizeLowercaseStringOrEmpty(entry.id)}`;
-          if (seen.has(key)) {
-            continue;
-          }
-          models.push(entry);
-          seen.add(key);
-        }
+        appendCatalogEntriesIfAbsent(models, supplemental);
       }
       logStage("plugin-models-merged", `entries=${models.length}`);
 
+      const configuredModels = buildConfiguredModelCatalog({ cfg });
+      if (configuredModels.length > 0) {
+        appendCatalogEntriesIfAbsent(models, configuredModels);
+      }
+      logStage("configured-models-merged", `entries=${models.length}`);
+
       if (models.length === 0) {
         // If we found nothing, don't cache this result so we can try again.
-        if (!readOnly) {
+        if (useSharedCache) {
           modelCatalogPromise = null;
         }
       }
@@ -203,7 +234,7 @@ export async function loadModelCatalog(params?: {
         log.warn(`Failed to load model catalog: ${String(error)}`);
       }
       // Don't poison the cache on transient dependency/filesystem issues.
-      if (!readOnly) {
+      if (useSharedCache) {
         modelCatalogPromise = null;
       }
       if (models.length > 0) {
@@ -213,7 +244,7 @@ export async function loadModelCatalog(params?: {
     }
   };
 
-  if (readOnly) {
+  if (!useSharedCache) {
     return loadCatalog();
   }
 
@@ -225,29 +256,12 @@ export async function loadModelCatalog(params?: {
  * Check if a model supports image input based on its catalog entry.
  */
 export function modelSupportsVision(entry: ModelCatalogEntry | undefined): boolean {
-  return entry?.input?.includes("image") ?? false;
+  return modelCatalogEntrySupportsInput(entry, "image");
 }
 
 /**
  * Check if a model supports native document/PDF input based on its catalog entry.
  */
 export function modelSupportsDocument(entry: ModelCatalogEntry | undefined): boolean {
-  return entry?.input?.includes("document") ?? false;
-}
-
-/**
- * Find a model in the catalog by provider and model ID.
- */
-export function findModelInCatalog(
-  catalog: ModelCatalogEntry[],
-  provider: string,
-  modelId: string,
-): ModelCatalogEntry | undefined {
-  const normalizedProvider = normalizeProviderId(provider);
-  const normalizedModelId = normalizeLowercaseStringOrEmpty(modelId);
-  return catalog.find(
-    (entry) =>
-      normalizeProviderId(entry.provider) === normalizedProvider &&
-      normalizeLowercaseStringOrEmpty(entry.id) === normalizedModelId,
-  );
+  return modelCatalogEntrySupportsInput(entry, "document");
 }

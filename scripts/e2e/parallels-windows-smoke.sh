@@ -50,9 +50,9 @@ TIMEOUT_UPDATE_POLL_GRACE_S=60
 TIMEOUT_VERIFY_S=120
 TIMEOUT_ONBOARD_S=600
 TIMEOUT_ONBOARD_PHASE_S=$((TIMEOUT_ONBOARD_S + 120))
-# verify_gateway_reachable runs six 30s probes plus short retry sleeps.
 TIMEOUT_GATEWAY_S=420
-TIMEOUT_AGENT_S="${OPENCLAW_PARALLELS_WINDOWS_AGENT_TIMEOUT_S:-900}"
+GATEWAY_RECOVERY_AFTER_S="${OPENCLAW_PARALLELS_WINDOWS_GATEWAY_RECOVERY_AFTER_S:-180}"
+TIMEOUT_AGENT_S="${OPENCLAW_PARALLELS_WINDOWS_AGENT_TIMEOUT_S:-1500}"
 PHASE_STALE_WARN_S=60
 
 FRESH_MAIN_STATUS="skip"
@@ -140,7 +140,7 @@ Options:
   --provider <openai|anthropic|minimax>
                              Provider auth/model lane. Default: openai
   --model <provider/model>    Override the model used for the agent-turn smoke.
-                             Default: openai/gpt-5.5 for the OpenAI lane
+                             Default: openai/gpt-5.4-mini for the OpenAI lane
   --api-key-env <var>        Host env var name for provider API key.
                              Default: OPENAI_API_KEY for openai, ANTHROPIC_API_KEY for anthropic
   --openai-api-key-env <var> Alias for --api-key-env (backward compatible)
@@ -257,7 +257,7 @@ case "$PROVIDER" in
   openai)
     AUTH_CHOICE="openai-api-key"
     AUTH_KEY_FLAG="openai-api-key"
-    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.5}"
+    [[ "$MODEL_ID_EXPLICIT" -eq 1 ]] || MODEL_ID="${OPENCLAW_PARALLELS_OPENAI_MODEL:-openai/gpt-5.4-mini}"
     [[ -n "$API_KEY_ENV" ]] || API_KEY_ENV="OPENAI_API_KEY"
     ;;
   anthropic)
@@ -616,7 +616,7 @@ EOF
 
 guest_run_agent_turn_process() {
   local env_name_q env_value_q runner_basename runner_script_path runner_url runner_url_q
-  local runner_name stdout_name stderr_name done_name
+  local runner_name stdout_name stderr_name done_name ok_name
   local start_seconds poll_deadline startup_checked state_rc log_rc done_rc
   local agent_combined done_status launcher_state
   env_name_q="$(ps_single_quote "$API_KEY_ENV")"
@@ -629,6 +629,7 @@ guest_run_agent_turn_process() {
   stdout_name="openclaw-parallels-agent-$RANDOM-$RANDOM.out.log"
   stderr_name="openclaw-parallels-agent-$RANDOM-$RANDOM.err.log"
   done_name="openclaw-parallels-agent-$RANDOM-$RANDOM.done"
+  ok_name="openclaw-parallels-agent-$RANDOM-$RANDOM.ok"
   start_seconds="$SECONDS"
   poll_deadline=$((SECONDS + TIMEOUT_AGENT_S + 60))
   startup_checked=0
@@ -637,21 +638,33 @@ guest_run_agent_turn_process() {
 param(
   [string]$StdoutPath,
   [string]$StderrPath,
+  [string]$OkPath,
   [string]$DonePath,
-  [string]$EnvName,
-  [string]$EnvValue
+  [string]$EnvName
 )
 $ErrorActionPreference = 'Continue'
 try {
-  if ($EnvName -ne '') {
-    Set-Item -Path ('Env:' + $EnvName) -Value $EnvValue
-  }
   $node = Join-Path $env:ProgramFiles 'nodejs\node.exe'
   if (-not (Test-Path $node)) {
     $node = 'node'
   }
   $entry = Join-Path $env:APPDATA 'npm\node_modules\openclaw\openclaw.mjs'
   & $node $entry agent --local --agent main --session-id 'parallels-windows-smoke' --message 'Reply with exact ASCII text OK only.' --json > $StdoutPath 2> $StderrPath
+  $ok = '0'
+  try {
+    $raw = Get-Content -Path $StdoutPath -Raw -ErrorAction Stop
+    $json = $raw | ConvertFrom-Json -ErrorAction Stop
+    foreach ($payload in @($json.payloads)) {
+      if ($payload.text -eq 'OK') {
+        $ok = '1'
+      }
+    }
+    if ($json.meta.finalAssistantVisibleText -eq 'OK' -or $json.meta.finalAssistantRawText -eq 'OK') {
+      $ok = '1'
+    }
+  } catch {
+  }
+  Set-Content -Path $OkPath -Value $ok
   Set-Content -Path $DonePath -Value ([string]$LASTEXITCODE)
   exit $LASTEXITCODE
 } catch {
@@ -666,8 +679,12 @@ EOF
 \$stdout = Join-Path \$env:TEMP '$stdout_name'
 \$stderr = Join-Path \$env:TEMP '$stderr_name'
 \$done = Join-Path \$env:TEMP '$done_name'
-Remove-Item \$runner, \$stdout, \$stderr, \$done -Force -ErrorAction SilentlyContinue
+\$ok = Join-Path \$env:TEMP '$ok_name'
+Remove-Item \$runner, \$stdout, \$stderr, \$done, \$ok -Force -ErrorAction SilentlyContinue
 curl.exe -fsSL '${runner_url_q}' -o \$runner
+if ('${env_name_q}' -ne '') {
+  Set-Item -Path ('Env:' + '${env_name_q}') -Value '${env_value_q}'
+}
 Start-Process powershell.exe -ArgumentList @(
   '-NoProfile',
   '-ExecutionPolicy',
@@ -678,12 +695,12 @@ Start-Process powershell.exe -ArgumentList @(
   \$stdout,
   '-StderrPath',
   \$stderr,
+  '-OkPath',
+  \$ok,
   '-DonePath',
   \$done,
   '-EnvName',
-  '${env_name_q}',
-  '-EnvValue',
-  '${env_value_q}'
+  '${env_name_q}'
 ) -WindowStyle Hidden | Out-Null
 EOF
   )"
@@ -697,7 +714,7 @@ EOF
     set -e
     if [[ $log_rc -eq 0 ]] && printf '%s\n' "$agent_combined" | grep -Eq '"finalAssistant(Raw|Visible)Text":[[:space:]]*"OK"'; then
       printf '%s\n' "$agent_combined"
-      guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; Remove-Item \$runner, \$done -Force -ErrorAction SilentlyContinue"
+      guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; \$ok = Join-Path \$env:TEMP '$ok_name'; Remove-Item \$runner, \$done, \$ok -Force -ErrorAction SilentlyContinue"
       return 0
     fi
 
@@ -708,10 +725,19 @@ EOF
     done_rc=$?
     set -e
     if [[ $done_rc -eq 0 && -n "$done_status" ]]; then
+      ok_status="$(guest_powershell_poll 20 "\$ok = Join-Path \$env:TEMP '$ok_name'; if (Test-Path \$ok) { (Get-Content \$ok -Raw).Trim() }" 2>/dev/null || true)"
+      ok_status="${ok_status//$'\r'/}"
+      if [[ "$ok_status" == "1" ]]; then
+        if [[ $log_rc -eq 0 && -n "$agent_combined" ]]; then
+          printf '%s\n' "$agent_combined"
+        fi
+        guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; \$ok = Join-Path \$env:TEMP '$ok_name'; Remove-Item \$runner, \$done, \$ok -Force -ErrorAction SilentlyContinue"
+        return 0
+      fi
       if [[ $log_rc -eq 0 && -n "$agent_combined" ]]; then
         printf '%s\n' "$agent_combined"
       fi
-      guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; Remove-Item \$runner, \$done -Force -ErrorAction SilentlyContinue"
+      guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; \$ok = Join-Path \$env:TEMP '$ok_name'; Remove-Item \$runner, \$done, \$ok -Force -ErrorAction SilentlyContinue"
       warn "openclaw agent finished without OK response (exit $done_status)"
       return 1
     fi
@@ -719,7 +745,7 @@ EOF
     if [[ "$startup_checked" -eq 0 && $((SECONDS - start_seconds)) -ge 20 ]]; then
       set +e
       launcher_state="$(
-        guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$stdout = Join-Path \$env:TEMP '$stdout_name'; \$stderr = Join-Path \$env:TEMP '$stderr_name'; \$done = Join-Path \$env:TEMP '$done_name'; \$currentPid = \$PID; \$process = Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$currentPid -and ((\$_.CommandLine -like '*$runner_name*') -or (\$_.CommandLine -like '*openclaw.mjs*agent*parallels-windows-smoke*')) } | Select-Object -First 1; 'runner=' + (Test-Path \$runner) + ' stdout=' + (Test-Path \$stdout) + ' stderr=' + (Test-Path \$stderr) + ' done=' + (Test-Path \$done) + ' process=' + [bool]\$process"
+        guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$stdout = Join-Path \$env:TEMP '$stdout_name'; \$stderr = Join-Path \$env:TEMP '$stderr_name'; \$done = Join-Path \$env:TEMP '$done_name'; \$ok = Join-Path \$env:TEMP '$ok_name'; \$currentPid = \$PID; \$process = Get-CimInstance Win32_Process | Where-Object { \$_.ProcessId -ne \$currentPid -and ((\$_.CommandLine -like '*$runner_name*') -or (\$_.CommandLine -like '*openclaw.mjs*agent*parallels-windows-smoke*')) } | Select-Object -First 1; 'runner=' + (Test-Path \$runner) + ' stdout=' + (Test-Path \$stdout) + ' stderr=' + (Test-Path \$stderr) + ' done=' + (Test-Path \$done) + ' ok=' + (Test-Path \$ok) + ' process=' + [bool]\$process"
       )"
       state_rc=$?
       set -e
@@ -735,7 +761,7 @@ EOF
       if [[ $log_rc -eq 0 && -n "$agent_combined" ]]; then
         printf '%s\n' "$agent_combined"
       fi
-      guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; Remove-Item \$runner, \$done -Force -ErrorAction SilentlyContinue"
+      guest_powershell_poll 20 "\$runner = Join-Path \$env:TEMP '$runner_name'; \$done = Join-Path \$env:TEMP '$done_name'; \$ok = Join-Path \$env:TEMP '$ok_name'; Remove-Item \$runner, \$done, \$ok -Force -ErrorAction SilentlyContinue"
       warn "openclaw agent timed out after $TIMEOUT_AGENT_S seconds"
       return 1
     fi
@@ -1029,11 +1055,24 @@ for wanted in preferred_names:
       break
 
 if best is None:
+  candidates = []
   for asset in assets:
     name = asset.get("name", "")
-    if name.startswith("MinGit-") and name.endswith(".zip") and "busybox" not in name:
-      best = asset
-      break
+    if not (name.startswith("MinGit-") and name.endswith(".zip")):
+      continue
+    if "busybox" in name:
+      continue
+    if "-arm64." in name:
+      rank = 0
+    elif "-64-bit." in name:
+      rank = 1
+    elif "-32-bit." in name:
+      rank = 2
+    else:
+      rank = 3
+    candidates.append((rank, name, asset))
+  if candidates:
+    best = sorted(candidates, key=lambda item: (item[0], item[1]))[0][2]
 
 if best is None:
   raise SystemExit("no MinGit asset found")
@@ -1137,7 +1176,7 @@ ensure_mingit_zip() {
   MINGIT_ZIP_PATH="$MAIN_TGZ_DIR/$mingit_name"
   if [[ ! -f "$MINGIT_ZIP_PATH" ]]; then
     say "Download $MINGIT_ZIP_NAME"
-    curl -fsSL "$mingit_url" -o "$MINGIT_ZIP_PATH"
+    curl --retry 5 --retry-delay 3 --retry-all-errors -fsSL "$mingit_url" -o "$MINGIT_ZIP_PATH"
   fi
 }
 
@@ -2382,8 +2421,13 @@ verify_gateway() {
 }
 
 verify_gateway_reachable() {
-  local probe_json attempt
-  for attempt in 1 2 3 4 5 6; do
+  local probe_json attempt start_seconds deadline recovery_tried
+  start_seconds="$SECONDS"
+  deadline=$((SECONDS + TIMEOUT_GATEWAY_S))
+  recovery_tried=0
+  attempt=1
+
+  while (( SECONDS < deadline )); do
     probe_json="$(
       guest_run_openclaw "" "" gateway probe --url ws://127.0.0.1:18789 --timeout 30000 --json
     )"
@@ -2398,11 +2442,25 @@ PY
     then
       return 0
     fi
-    if (( attempt < 6 )); then
-      printf 'gateway-reachable retry %s\n' "$attempt" >&2
-      sleep 3
+
+    if [[ "$recovery_tried" -eq 0 && $((SECONDS - start_seconds)) -ge "$GATEWAY_RECOVERY_AFTER_S" ]]; then
+      printf 'gateway-reachable recovery: gateway start after %ss\n' "$((SECONDS - start_seconds))" >&2
+      if ! run_gateway_daemon_action start; then
+        printf 'gateway-reachable recovery start failed; continuing probes\n' >&2
+      fi
+      recovery_tried=1
     fi
+
+    printf 'gateway-reachable retry %s elapsed=%ss\n' "$attempt" "$((SECONDS - start_seconds))" >&2
+    attempt=$((attempt + 1))
+    sleep 5
   done
+
+  if [[ "$recovery_tried" -eq 0 ]]; then
+    printf 'gateway-reachable recovery: gateway start after timeout\n' >&2
+    run_gateway_daemon_action start || true
+  fi
+
   return 1
 }
 

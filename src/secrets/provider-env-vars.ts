@@ -8,7 +8,7 @@ import {
 import { loadPluginManifestRegistryForPluginRegistry } from "../plugins/plugin-registry.js";
 import { hasKind } from "../plugins/slots.js";
 
-const CORE_PROVIDER_AUTH_ENV_VAR_CANDIDATES = {
+export const CORE_PROVIDER_AUTH_ENV_VAR_CANDIDATES = {
   anthropic: ["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
   openai: ["OPENAI_API_KEY"],
   voyage: ["VOYAGE_API_KEY"],

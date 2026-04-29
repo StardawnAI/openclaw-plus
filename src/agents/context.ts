@@ -151,6 +151,7 @@ const SKIP_EAGER_WARMUP_PRIMARY_COMMANDS = new Set([
   "health",
   "hooks",
   "logs",
+  "memory",
   "models",
   "pairing",
   "plugins",
@@ -214,9 +215,21 @@ function primeConfiguredContextWindows(): OpenClawConfig | undefined {
   }
 }
 
-function ensureContextWindowCacheLoaded(): Promise<void> {
-  if (CONTEXT_WINDOW_RUNTIME_STATE.loadPromise) {
-    return CONTEXT_WINDOW_RUNTIME_STATE.loadPromise;
+function resolveContextWindowLoadScopeKey(providerIds: readonly string[] | undefined): string {
+  const scoped = providerIds
+    ?.map((value) => normalizeProviderId(value))
+    .filter(Boolean)
+    .toSorted((left, right) => left.localeCompare(right));
+  return scoped?.length ? scoped.join(",") : "*";
+}
+
+function ensureContextWindowCacheLoaded(options?: {
+  providerDiscoveryProviderIds?: readonly string[];
+}): Promise<void> {
+  const scopeKey = resolveContextWindowLoadScopeKey(options?.providerDiscoveryProviderIds);
+  const existing = CONTEXT_WINDOW_RUNTIME_STATE.loadPromises.get(scopeKey);
+  if (existing) {
+    return existing;
   }
 
   const cfg = primeConfiguredContextWindows();
@@ -224,9 +237,17 @@ function ensureContextWindowCacheLoaded(): Promise<void> {
     return Promise.resolve();
   }
 
-  CONTEXT_WINDOW_RUNTIME_STATE.loadPromise = (async () => {
+  const pending = (async () => {
     try {
-      await (await loadModelsConfigRuntime()).ensureOpenClawModelsJson(cfg);
+      await (
+        await loadModelsConfigRuntime()
+      ).ensureOpenClawModelsJson(
+        cfg,
+        undefined,
+        options?.providerDiscoveryProviderIds
+          ? { providerDiscoveryProviderIds: options.providerDiscoveryProviderIds }
+          : undefined,
+      );
     } catch {
       // Continue with best-effort discovery/overrides.
     }
@@ -256,12 +277,16 @@ function ensureContextWindowCacheLoaded(): Promise<void> {
   })().catch(() => {
     // Keep lookup best-effort.
   });
-  return CONTEXT_WINDOW_RUNTIME_STATE.loadPromise;
+  CONTEXT_WINDOW_RUNTIME_STATE.loadPromises.set(scopeKey, pending);
+  if (scopeKey === "*") {
+    CONTEXT_WINDOW_RUNTIME_STATE.loadPromise = pending;
+  }
+  return pending;
 }
 
 export function lookupContextTokens(
   modelId?: string,
-  options?: { allowAsyncLoad?: boolean },
+  options?: { allowAsyncLoad?: boolean; providerDiscoveryProviderIds?: readonly string[] },
 ): number | undefined {
   if (!modelId) {
     return undefined;
@@ -272,7 +297,11 @@ export function lookupContextTokens(
     primeConfiguredContextWindows();
   } else {
     // Best-effort: kick off loading on demand, but don't block lookups.
-    void ensureContextWindowCacheLoaded();
+    void ensureContextWindowCacheLoaded(
+      options?.providerDiscoveryProviderIds
+        ? { providerDiscoveryProviderIds: options.providerDiscoveryProviderIds }
+        : undefined,
+    );
   }
   return lookupCachedContextTokens(modelId);
 }
@@ -458,6 +487,7 @@ export function resolveContextTokensForModel(params: {
     model: params.model,
   });
   const explicitProvider = params.provider?.trim();
+  const discoveryProviderIds = explicitProvider && ref ? ([ref.provider] as const) : undefined;
   if (ref) {
     const modelParams = resolveConfiguredModelParams(params.cfg, ref.provider, ref.model);
     if (modelParams?.context1m === true && isAnthropic1MModel(ref.provider, ref.model)) {
@@ -501,7 +531,10 @@ export function resolveContextTokensForModel(params: {
   if (params.provider && ref && !ref.model.includes("/")) {
     const qualifiedResult = lookupContextTokens(
       `${normalizeProviderId(ref.provider)}/${ref.model}`,
-      { allowAsyncLoad: params.allowAsyncLoad },
+      {
+        allowAsyncLoad: params.allowAsyncLoad,
+        ...(discoveryProviderIds ? { providerDiscoveryProviderIds: discoveryProviderIds } : {}),
+      },
     );
     if (qualifiedResult !== undefined) {
       return qualifiedResult;
@@ -512,6 +545,7 @@ export function resolveContextTokensForModel(params: {
   // (e.g. "google/gemini-2.5-pro") this IS the raw discovery cache key.
   const bareResult = lookupContextTokens(params.model, {
     allowAsyncLoad: params.allowAsyncLoad,
+    ...(discoveryProviderIds ? { providerDiscoveryProviderIds: discoveryProviderIds } : {}),
   });
   if (bareResult !== undefined) {
     return bareResult;

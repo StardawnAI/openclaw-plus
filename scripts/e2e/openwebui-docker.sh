@@ -23,6 +23,7 @@ GW_NAME="openclaw-openwebui-gateway-$$"
 OW_NAME="openclaw-openwebui-$$"
 DOCKER_COMMAND_TIMEOUT="${OPENCLAW_OPENWEBUI_DOCKER_COMMAND_TIMEOUT:-600s}"
 DOCKER_PULL_TIMEOUT="${OPENCLAW_OPENWEBUI_DOCKER_PULL_TIMEOUT:-600s}"
+OPENWEBUI_READY_ATTEMPTS="${OPENCLAW_OPENWEBUI_READY_ATTEMPTS:-420}"
 
 docker_cmd() {
   timeout "$DOCKER_COMMAND_TIMEOUT" "$@"
@@ -177,7 +178,7 @@ docker_cmd docker run -d \
 
 echo "Waiting for Open WebUI..."
 ow_ready=0
-for _ in $(seq 1 240); do
+for _ in $(seq 1 "$OPENWEBUI_READY_ATTEMPTS"); do
   if [ "$(docker_cmd docker inspect -f '{{.State.Running}}' "$OW_NAME" 2>/dev/null || echo false)" != "true" ]; then
     break
   fi

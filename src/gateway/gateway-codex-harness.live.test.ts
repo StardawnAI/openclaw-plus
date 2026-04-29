@@ -520,6 +520,7 @@ async function readSpawnedChildRow(params: {
   childSessionKey: string;
   client: GatewayClient;
   parentSessionKey: string;
+  timeoutMs?: number;
 }): Promise<Record<string, unknown> | undefined> {
   const result = await params.client.request(
     "sessions.list",
@@ -528,7 +529,7 @@ async function readSpawnedChildRow(params: {
       includeLastMessage: true,
       limit: 20,
     },
-    { timeoutMs: 10_000 },
+    { timeoutMs: params.timeoutMs ?? 10_000 },
   );
   const sessions = asRecord(result)?.sessions;
   if (!Array.isArray(sessions)) {
@@ -545,7 +546,7 @@ async function waitForCodexSubagentStarted(params: {
   events: CapturedAgentEvent[];
   parentSessionKey: string;
 }): Promise<Record<string, unknown> | undefined> {
-  const deadline = Date.now() + Math.min(CODEX_HARNESS_REQUEST_TIMEOUT_MS, 120_000);
+  const deadline = Date.now() + Math.min(CODEX_HARNESS_REQUEST_TIMEOUT_MS, 240_000);
   let lastRow: Record<string, unknown> | undefined;
   let lastError: unknown;
   while (Date.now() < deadline) {
@@ -554,6 +555,7 @@ async function waitForCodexSubagentStarted(params: {
         childSessionKey: params.childSessionKey,
         client: params.client,
         parentSessionKey: params.parentSessionKey,
+        timeoutMs: Math.min(30_000, Math.max(10_000, deadline - Date.now())),
       });
       if (
         lastRow &&
