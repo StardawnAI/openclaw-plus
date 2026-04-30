@@ -28,7 +28,6 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", async () => {
 
 describe("telegram live qa runtime", () => {
   afterEach(() => {
-    vi.useRealTimers();
     fetchWithSsrFGuardMock.mockClear();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -101,44 +100,18 @@ describe("telegram live qa runtime", () => {
     ).toBe(true);
   });
 
-  it("normalizes the Telegram canary timeout env", () => {
+  it("normalizes the Telegram QA canary timeout env", () => {
+    expect(__testing.resolveTelegramQaCanaryTimeoutMs({})).toBe(30_000);
     expect(
       __testing.resolveTelegramQaCanaryTimeoutMs({
-        OPENCLAW_QA_TELEGRAM_CANARY_TIMEOUT_MS: "12345",
+        OPENCLAW_QA_TELEGRAM_CANARY_TIMEOUT_MS: "90000",
       }),
-    ).toBe(12345);
+    ).toBe(90_000);
     expect(
       __testing.resolveTelegramQaCanaryTimeoutMs({
         OPENCLAW_QA_TELEGRAM_CANARY_TIMEOUT_MS: "nope",
       }),
-    ).toBe(60_000);
-  });
-
-  it("waits for Telegram polling connectivity before treating the account as ready", async () => {
-    vi.useFakeTimers();
-    const gateway = {
-      call: vi
-        .fn()
-        .mockResolvedValueOnce({
-          channelAccounts: {
-            telegram: [{ accountId: "sut", connected: false, running: true }],
-          },
-        })
-        .mockResolvedValueOnce({
-          channelAccounts: {
-            telegram: [{ accountId: "sut", connected: true, running: true }],
-          },
-        }),
-    };
-
-    const ready = __testing.waitForTelegramChannelRunning(gateway as never, "sut", {
-      pollIntervalMs: 10,
-      timeoutMs: 1_000,
-    });
-    await vi.advanceTimersByTimeAsync(10);
-
-    await expect(ready).resolves.toBeUndefined();
-    expect(gateway.call).toHaveBeenCalledTimes(2);
+    ).toBe(30_000);
   });
 
   it("sanitizes and truncates Telegram live progress details", () => {
@@ -338,25 +311,38 @@ describe("telegram live qa runtime", () => {
   });
 
   it("includes mention gating in the Telegram live scenario catalog", () => {
-    expect(
-      __testing
-        .findScenario([
-          "telegram-help-command",
-          "telegram-commands-command",
-          "telegram-tools-compact-command",
-          "telegram-whoami-command",
-          "telegram-context-command",
-          "telegram-mentioned-message-reply",
-          "telegram-mention-gating",
-        ])
-        .map((scenario) => scenario.id),
-    ).toEqual([
+    const scenarios = __testing.findScenario([
       "telegram-help-command",
       "telegram-commands-command",
       "telegram-tools-compact-command",
       "telegram-whoami-command",
       "telegram-context-command",
       "telegram-mentioned-message-reply",
+      "telegram-mention-gating",
+    ]);
+    expect(scenarios.map((scenario) => scenario.id)).toEqual([
+      "telegram-help-command",
+      "telegram-commands-command",
+      "telegram-tools-compact-command",
+      "telegram-whoami-command",
+      "telegram-context-command",
+      "telegram-mentioned-message-reply",
+      "telegram-mention-gating",
+    ]);
+    expect(
+      scenarios
+        .find((scenario) => scenario.id === "telegram-mentioned-message-reply")
+        ?.buildRun("sut_bot").replyToLatestSutMessage,
+    ).toBe(true);
+  });
+
+  it("keeps bot-to-bot plain mentions out of the default Telegram live set", () => {
+    expect(__testing.findScenario().map((scenario) => scenario.id)).toEqual([
+      "telegram-help-command",
+      "telegram-commands-command",
+      "telegram-tools-compact-command",
+      "telegram-whoami-command",
+      "telegram-context-command",
       "telegram-mention-gating",
     ]);
   });
@@ -505,6 +491,77 @@ describe("telegram live qa runtime", () => {
     expect(signal?.aborted).toBe(false);
     controller.abort();
     expect(signal?.aborted).toBe(true);
+  });
+
+  it("treats transient Telegram getUpdates network errors as recoverable", () => {
+    expect(__testing.isRecoverableTelegramQaPollError(new TypeError("fetch failed"))).toBe(true);
+    expect(__testing.isRecoverableTelegramQaPollError(new Error("socket hang up"))).toBe(true);
+    expect(
+      __testing.isRecoverableTelegramQaPollError(new Error("Bad Request: chat not found")),
+    ).toBe(false);
+  });
+
+  it("retries transient Telegram polling fetch failures while waiting for scenario replies", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            result: [
+              {
+                update_id: 10,
+                message: {
+                  message_id: 99,
+                  chat: { id: -100123 },
+                  from: { id: 88, is_bot: true, username: "sut_bot" },
+                  text: "Identity\nChannel: telegram",
+                  date: 1_700_000_000,
+                  reply_to_message: { message_id: 55 },
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json",
+            },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const observedMessages: Parameters<
+      typeof __testing.waitForObservedMessage
+    >[0]["observedMessages"] = [];
+
+    const result = await __testing.waitForObservedMessage({
+      token: "token",
+      initialOffset: 7,
+      timeoutMs: 5_000,
+      observedMessages,
+      observationScenarioId: "telegram-whoami-command",
+      observationScenarioTitle: "Telegram whoami reply",
+      predicate: (message) =>
+        __testing.matchesTelegramScenarioReply({
+          groupId: "-100123",
+          message,
+          sentMessageId: 55,
+          sutBotId: 88,
+        }),
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.message.messageId).toBe(99);
+    expect(result.nextOffset).toBe(11);
+    expect(observedMessages).toEqual([
+      expect.objectContaining({
+        matchedScenario: true,
+        messageId: 99,
+        scenarioId: "telegram-whoami-command",
+      }),
+    ]);
   });
 
   it("redacts observed message content by default in artifacts", () => {

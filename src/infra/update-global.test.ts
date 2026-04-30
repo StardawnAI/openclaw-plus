@@ -457,26 +457,6 @@ describe("update global helpers", () => {
     });
   });
 
-  it("checks installed dist import references during global verify", async () => {
-    await withTempDir({ prefix: "openclaw-update-global-imports-" }, async (packageRoot) => {
-      await writeGlobalPackageJson(packageRoot, "2026.4.27");
-      const runMain = path.join(packageRoot, "dist", "cli", "run-main.js");
-      await fs.mkdir(path.dirname(runMain), { recursive: true });
-      await fs.writeFile(runMain, 'await import("../memory-state-CcqRgDZU.js");\n', "utf8");
-      await writePackageDistInventory(packageRoot);
-
-      await expect(collectInstalledGlobalPackageErrors({ packageRoot })).resolves.toContain(
-        "missing packaged dist import target ../memory-state-CcqRgDZU.js from dist/cli/run-main.js",
-      );
-
-      const chunk = path.join(packageRoot, "dist", "memory-state-CcqRgDZU.js");
-      await fs.writeFile(chunk, "export {};\n", "utf8");
-      await writePackageDistInventory(packageRoot);
-
-      await expect(collectInstalledGlobalPackageErrors({ packageRoot })).resolves.toEqual([]);
-    });
-  });
-
   it("ignores bundled plugin install stages during installed dist verification", async () => {
     await withTempDir({ prefix: "openclaw-update-global-plugin-stage-" }, async (packageRoot) => {
       await writeGlobalPackageJson(packageRoot);

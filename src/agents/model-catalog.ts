@@ -30,6 +30,7 @@ type DiscoveredModel = {
   contextWindow?: number;
   reasoning?: boolean;
   input?: ModelInputType[];
+  compat?: ModelCatalogEntry["compat"];
 };
 
 type PiSdkModule = typeof import("./pi-model-discovery-runtime.js");
@@ -61,11 +62,11 @@ function loadModelSuppression() {
 export function resetModelCatalogCache() {
   modelCatalogPromise = null;
   hasLoggedModelCatalogError = false;
-  importPiSdk = defaultImportPiSdk;
 }
 
 export function resetModelCatalogCacheForTest() {
   resetModelCatalogCache();
+  importPiSdk = defaultImportPiSdk;
 }
 
 // Test-only escape hatch: allow mocking the dynamic import to simulate transient failures.
@@ -108,19 +109,12 @@ export async function loadModelCatalog(params?: {
   config?: OpenClawConfig;
   useCache?: boolean;
   readOnly?: boolean;
-  providerDiscoveryProviderIds?: readonly string[];
 }): Promise<ModelCatalogEntry[]> {
   const readOnly = params?.readOnly === true;
-  const providerDiscoveryProviderIds = params?.providerDiscoveryProviderIds
-    ?.map((value) => value.trim())
-    .filter(Boolean);
-  const scopedCatalog =
-    providerDiscoveryProviderIds !== undefined && providerDiscoveryProviderIds.length > 0;
-  const useSharedCache = !readOnly && !scopedCatalog;
   if (!readOnly && params?.useCache === false) {
     modelCatalogPromise = null;
   }
-  if (useSharedCache && modelCatalogPromise) {
+  if (!readOnly && modelCatalogPromise) {
     return modelCatalogPromise;
   }
 
@@ -146,11 +140,7 @@ export async function loadModelCatalog(params?: {
     try {
       const cfg = params?.config ?? getRuntimeConfig();
       if (!readOnly) {
-        await ensureOpenClawModelsJson(
-          cfg,
-          undefined,
-          scopedCatalog ? { providerDiscoveryProviderIds } : undefined,
-        );
+        await ensureOpenClawModelsJson(cfg);
         logStage("models-json-ready");
       }
       // IMPORTANT: keep the dynamic import *inside* the try/catch.
@@ -160,7 +150,7 @@ export async function loadModelCatalog(params?: {
       const piSdk = await importPiSdk();
       logStage("pi-sdk-imported");
       const agentDir = resolveOpenClawAgentDir();
-      const { shouldSuppressBuiltInModel } = await loadModelSuppression();
+      const { buildShouldSuppressBuiltInModel } = await loadModelSuppression();
       logStage("catalog-deps-ready");
       const authStorage = piSdk.discoverAuthStorage(
         agentDir,
@@ -175,6 +165,10 @@ export async function loadModelCatalog(params?: {
       logStage("registry-ready");
       const entries = Array.isArray(registry) ? registry : registry.getAll();
       logStage("registry-read", `entries=${entries.length}`);
+
+      const shouldSuppressBuiltInModel = buildShouldSuppressBuiltInModel({ config: cfg });
+      logStage("suppress-resolver-ready");
+
       for (const entry of entries) {
         const id = normalizeOptionalString(entry?.id) ?? "";
         if (!id) {
@@ -184,7 +178,7 @@ export async function loadModelCatalog(params?: {
         if (!provider) {
           continue;
         }
-        if (shouldSuppressBuiltInModel({ provider, id, config: cfg })) {
+        if (shouldSuppressBuiltInModel({ provider, id })) {
           continue;
         }
         const name = normalizeOptionalString(entry?.name ?? id) || id;
@@ -194,12 +188,12 @@ export async function loadModelCatalog(params?: {
             : undefined;
         const reasoning = typeof entry?.reasoning === "boolean" ? entry.reasoning : undefined;
         const input = Array.isArray(entry?.input) ? entry.input : undefined;
-        models.push({ id, name, provider, contextWindow, reasoning, input });
+        const compat = entry?.compat && typeof entry.compat === "object" ? entry.compat : undefined;
+        models.push({ id, name, provider, contextWindow, reasoning, input, compat });
       }
       const supplemental = await augmentModelCatalogWithProviderPlugins({
         config: cfg,
         env: process.env,
-        ...(scopedCatalog ? { providerDiscoveryProviderIds } : {}),
         context: {
           config: cfg,
           agentDir,
@@ -220,7 +214,7 @@ export async function loadModelCatalog(params?: {
 
       if (models.length === 0) {
         // If we found nothing, don't cache this result so we can try again.
-        if (useSharedCache) {
+        if (!readOnly) {
           modelCatalogPromise = null;
         }
       }
@@ -234,7 +228,7 @@ export async function loadModelCatalog(params?: {
         log.warn(`Failed to load model catalog: ${String(error)}`);
       }
       // Don't poison the cache on transient dependency/filesystem issues.
-      if (useSharedCache) {
+      if (!readOnly) {
         modelCatalogPromise = null;
       }
       if (models.length > 0) {
@@ -244,7 +238,7 @@ export async function loadModelCatalog(params?: {
     }
   };
 
-  if (!useSharedCache) {
+  if (readOnly) {
     return loadCatalog();
   }
 

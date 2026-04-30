@@ -4,7 +4,7 @@ import * as net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
 
-const CHILD_PROBE_TIMEOUT_MS = 20_000;
+const CHILD_PROCESS_TIMEOUT_MS = process.env.CI ? 30_000 : 10_000;
 
 async function listenOnLoopback(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -138,7 +138,7 @@ async function runNodeModule(
     const timeout = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`child process timed out\nstdout:\n${stdout}\nstderr:\n${stderr}`));
-    }, 45_000);
+    }, CHILD_PROCESS_TIMEOUT_MS);
 
     child.on("error", (err) => {
       clearTimeout(timeout);
@@ -204,8 +204,6 @@ describe("SSRF external proxy routing", () => {
         import { startProxy, stopProxy } from "./src/infra/net/proxy/proxy-lifecycle.ts";
         import { dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane } from "./src/infra/net/proxy/proxy-lifecycle.ts";
 
-        const probeTimeoutMs = Number(process.env.OPENCLAW_TEST_PROXY_TIMEOUT_MS || "20000");
-
         async function nodeHttpGet(url, options = {}) {
           return new Promise((resolve, reject) => {
             const req = http.get(url, options, (response) => {
@@ -218,7 +216,7 @@ describe("SSRF external proxy routing", () => {
                 resolve({ status: response.statusCode, body });
               });
             });
-            req.setTimeout(probeTimeoutMs, () => {
+            req.setTimeout(5000, () => {
               req.destroy(new Error("node:http request timed out"));
             });
             req.on("error", reject);
@@ -240,7 +238,7 @@ describe("SSRF external proxy routing", () => {
               response.resume();
               response.on("end", resolve);
             });
-            req.setTimeout(probeTimeoutMs, () => {
+            req.setTimeout(5000, () => {
               req.destroy(new Error("node:https request timed out"));
             });
             req.on("error", reject);
@@ -249,7 +247,7 @@ describe("SSRF external proxy routing", () => {
 
         async function websocketProbe(url) {
           return new Promise((resolve, reject) => {
-            const ws = new WebSocket(url, { handshakeTimeout: probeTimeoutMs });
+            const ws = new WebSocket(url, { handshakeTimeout: 5000 });
             ws.once("open", () => {
               ws.close();
               reject(new Error("proxied websocket unexpectedly opened"));
@@ -261,7 +259,7 @@ describe("SSRF external proxy routing", () => {
         async function gatewayLoopbackBypassProbe(url) {
           return new Promise((resolve, reject) => {
             const ws = dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(url, () =>
-              new WebSocket(url, { handshakeTimeout: probeTimeoutMs }),
+              new WebSocket(url, { handshakeTimeout: 5000 }),
             );
             ws.once("open", () => {
               ws.close();
@@ -277,7 +275,7 @@ describe("SSRF external proxy routing", () => {
         }
         try {
           const response = await undiciFetch(process.env.OPENCLAW_TEST_TARGET_URL, {
-            signal: AbortSignal.timeout(probeTimeoutMs),
+            signal: AbortSignal.timeout(5000),
           });
           const body = await response.text();
           const nodeHttp = await nodeHttpGet(process.env.OPENCLAW_TEST_NODE_HTTP_TARGET_URL);
@@ -310,7 +308,6 @@ describe("SSRF external proxy routing", () => {
         OPENCLAW_TEST_NODE_HTTPS_TARGET_URL: `https://127.0.0.1:${httpsLikeTargetPort}/https-connect-proof`,
         OPENCLAW_TEST_WS_TARGET_URL: `ws://127.0.0.1:${targetPort}/websocket-proxied`,
         OPENCLAW_TEST_GATEWAY_BYPASS_WS_URL: `ws://127.0.0.1:${targetPort}/gateway-bypass`,
-        OPENCLAW_TEST_PROXY_TIMEOUT_MS: String(CHILD_PROBE_TIMEOUT_MS),
         NO_PROXY: "127.0.0.1,localhost",
         no_proxy: "localhost",
         GLOBAL_AGENT_NO_PROXY: "localhost",

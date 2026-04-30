@@ -1,27 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WindowsAclEntry, WindowsAclSummary } from "./windows-acl.js";
 
 const MOCK_USERNAME = "MockUser";
-function createMockUserInfo() {
-  return {
-    username: MOCK_USERNAME,
-    uid: -1,
-    gid: -1,
-    shell: "C:\\Windows\\System32\\cmd.exe",
-    homedir: "C:\\Users\\MockUser",
-  };
-}
-
-const userInfoMock = vi.hoisted(() => vi.fn(createMockUserInfo));
-
-vi.mock("node:os", async () => {
-  const { mockNodeBuiltinModule } = await import("openclaw/plugin-sdk/test-node-mocks");
-  return mockNodeBuiltinModule(
-    () => vi.importActual<typeof import("node:os")>("node:os"),
-    { userInfo: userInfoMock as unknown as typeof import("node:os").userInfo },
-    { mirrorToDefault: true },
-  );
-});
+const mockUserInfo = () => ({ username: MOCK_USERNAME });
+const emptyUserInfo = () => ({ username: "" });
 
 let createIcaclsResetCommand: typeof import("./windows-acl.js").createIcaclsResetCommand;
 let formatIcaclsResetCommand: typeof import("./windows-acl.js").formatIcaclsResetCommand;
@@ -31,11 +13,7 @@ let parseIcaclsOutput: typeof import("./windows-acl.js").parseIcaclsOutput;
 let resolveWindowsUserPrincipal: typeof import("./windows-acl.js").resolveWindowsUserPrincipal;
 let summarizeWindowsAcl: typeof import("./windows-acl.js").summarizeWindowsAcl;
 
-beforeEach(async () => {
-  vi.resetModules();
-  vi.unstubAllEnvs();
-  userInfoMock.mockReset();
-  userInfoMock.mockReturnValue(createMockUserInfo());
+beforeAll(async () => {
   ({
     createIcaclsResetCommand,
     formatIcaclsResetCommand,
@@ -45,6 +23,10 @@ beforeEach(async () => {
     resolveWindowsUserPrincipal,
     summarizeWindowsAcl,
   } = await import("./windows-acl.js"));
+});
+
+beforeEach(() => {
+  vi.unstubAllEnvs();
 });
 
 function aclEntry(params: {
@@ -127,7 +109,7 @@ describe("windows-acl", () => {
     it("falls back to os.userInfo when USERNAME is empty", () => {
       // When USERNAME env is empty, falls back to os.userInfo().username
       const env = { USERNAME: "", USERDOMAIN: "WORKGROUP" };
-      const result = resolveWindowsUserPrincipal(env);
+      const result = resolveWindowsUserPrincipal(env, mockUserInfo);
       // Should return a username (from os.userInfo fallback) with WORKGROUP domain
       expect(result).toBe(`WORKGROUP\\${MOCK_USERNAME}`);
     });
@@ -655,6 +637,7 @@ Successfully processed 1 files`;
       const result = formatIcaclsResetCommand("C:\\test\\file.txt", {
         isDir: false,
         env: {},
+        userInfo: mockUserInfo,
       });
       // Should contain the actual system username from os.userInfo
       expect(result).toContain(`"${MOCK_USERNAME}:F"`);
@@ -680,6 +663,7 @@ Successfully processed 1 files`;
       const result = createIcaclsResetCommand("C:\\test\\file.txt", {
         isDir: false,
         env: {},
+        userInfo: mockUserInfo,
       });
       // Should return a valid command using the system username
       expect(result).not.toBeNull();
@@ -719,17 +703,10 @@ Successfully processed 1 files`;
     });
 
     it("returns null when no username can be resolved (line 348)", () => {
-      // Temporarily make os.userInfo().username empty so resolveWindowsUserPrincipal returns null
-      userInfoMock.mockReturnValueOnce({
-        username: "",
-        uid: -1,
-        gid: -1,
-        shell: "",
-        homedir: "",
-      });
       const result = createIcaclsResetCommand("C:\\test\\file.txt", {
         isDir: false,
         env: { USERNAME: "", USERDOMAIN: "" },
+        userInfo: emptyUserInfo,
       });
       expect(result).toBeNull();
     });

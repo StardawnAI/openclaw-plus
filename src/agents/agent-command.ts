@@ -9,7 +9,6 @@ import {
 import { formatCliCommand } from "../cli/command-format.js";
 import type { CliDeps } from "../cli/deps.types.js";
 import type { SessionEntry } from "../config/sessions/types.js";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   clearAgentRunContext,
   emitAgentEvent,
@@ -55,6 +54,7 @@ import { loadModelCatalog } from "./model-catalog.js";
 import { runWithModelFallback } from "./model-fallback.js";
 import {
   buildAllowedModelSet,
+  buildConfiguredModelCatalog,
   modelKey,
   normalizeModelRef,
   parseModelRef,
@@ -252,50 +252,6 @@ function normalizeExplicitOverrideInput(raw: string, kind: "provider" | "model")
   return trimmed;
 }
 
-function resolveModelCatalogProviderScope(params: {
-  cfg: OpenClawConfig;
-  agentId: string;
-  defaultProvider: string;
-  defaultModel: string;
-  hasStoredOverride: boolean;
-  storedModelOverrideSource?: "auto" | "user";
-  explicitProviderOverride?: string;
-  explicitModelOverride?: string;
-}): string[] {
-  const providers = new Set<string>();
-  const addProvider = (provider: string | undefined) => {
-    const normalized = provider?.trim();
-    if (normalized) {
-      providers.add(normalized);
-    }
-  };
-  const addModelRef = (raw: string | undefined, defaultProvider: string) => {
-    const parsed = raw ? parseModelRef(raw, defaultProvider) : null;
-    addProvider(parsed?.provider);
-  };
-
-  addProvider(params.defaultProvider);
-  addModelRef(params.defaultModel, params.defaultProvider);
-  addProvider(params.explicitProviderOverride);
-  addModelRef(
-    params.explicitModelOverride,
-    params.explicitProviderOverride ?? params.defaultProvider,
-  );
-  for (const raw of Object.keys(params.cfg.agents?.defaults?.models ?? {})) {
-    addModelRef(raw, params.defaultProvider);
-  }
-  for (const raw of resolveEffectiveModelFallbacks({
-    cfg: params.cfg,
-    agentId: params.agentId,
-    hasSessionModelOverride: params.hasStoredOverride,
-    modelOverrideSource: params.storedModelOverrideSource,
-  }) ?? []) {
-    addModelRef(raw, params.defaultProvider);
-  }
-
-  return [...providers].toSorted((left, right) => left.localeCompare(right));
-}
-
 async function prepareAgentCommandExecution(
   opts: AgentCommandOpts & { senderIsOwner: boolean },
   runtime: RuntimeEnv,
@@ -343,7 +299,13 @@ async function prepareAgentCommandExecution(
     defaultProvider: DEFAULT_PROVIDER,
     defaultModel: DEFAULT_MODEL,
   });
-  const thinkingLevelsHint = formatThinkingLevels(configuredModel.provider, configuredModel.model);
+  const configuredThinkingCatalog = buildConfiguredModelCatalog({ cfg });
+  const thinkingLevelsHint = formatThinkingLevels(
+    configuredModel.provider,
+    configuredModel.model,
+    ", ",
+    configuredThinkingCatalog.length > 0 ? configuredThinkingCatalog : undefined,
+  );
 
   const thinkOverride = normalizeThinkLevel(opts.thinking);
   const thinkOnce = normalizeThinkLevel(opts.thinkingOnce);
@@ -433,6 +395,7 @@ async function prepareAgentCommandExecution(
     body,
     transcriptBody,
     cfg,
+    configuredThinkingCatalog,
     normalizedSpawned,
     agentCfg,
     thinkOverride,
@@ -469,6 +432,7 @@ async function agentCommandInternal(
     body,
     transcriptBody,
     cfg,
+    configuredThinkingCatalog,
     normalizedSpawned,
     agentCfg,
     thinkOverride,
@@ -768,19 +732,7 @@ async function agentCommandInternal(
     let allowAnyModel = !hasAllowlist;
 
     if (needsModelCatalog) {
-      modelCatalog = await loadModelCatalog({
-        config: cfg,
-        providerDiscoveryProviderIds: resolveModelCatalogProviderScope({
-          cfg,
-          agentId: sessionAgentId,
-          defaultProvider,
-          defaultModel,
-          hasStoredOverride,
-          storedModelOverrideSource,
-          explicitProviderOverride,
-          explicitModelOverride,
-        }),
-      });
+      modelCatalog = await loadModelCatalog({ config: cfg });
       const allowed = buildAllowedModelSet({
         cfg,
         catalog: modelCatalog,
@@ -875,17 +827,18 @@ async function agentCommandInternal(
       }
     }
 
+    const catalogForThinking =
+      modelCatalog ??
+      (allowedModelCatalog.length > 0 ? allowedModelCatalog : configuredThinkingCatalog);
+    const thinkingCatalog = catalogForThinking.length > 0 ? catalogForThinking : undefined;
     if (!resolvedThinkLevel) {
-      const catalogForThinking = modelCatalog ?? allowedModelCatalog;
       resolvedThinkLevel = resolveThinkingDefault({
         cfg,
         provider,
         model,
-        catalog: catalogForThinking.length > 0 ? catalogForThinking : undefined,
+        catalog: thinkingCatalog,
       });
     }
-    const catalogForThinking = modelCatalog ?? allowedModelCatalog;
-    const thinkingCatalog = catalogForThinking.length > 0 ? catalogForThinking : undefined;
     if (
       !isThinkingLevelSupported({
         provider,
@@ -1045,6 +998,7 @@ async function agentCommandInternal(
                     runId,
                     stream: evt.stream,
                     data: evt.data ?? {},
+                    ...(evt.sessionKey ? { sessionKey: evt.sessionKey } : {}),
                   });
                 }
                 if (

@@ -18,14 +18,6 @@ import {
   installEmbeddedRunnerFastRunE2eMocks,
 } from "./test-helpers/pi-embedded-runner-e2e-mocks.js";
 
-type ResolveModelAsyncResult = Awaited<
-  ReturnType<typeof import("./pi-embedded-runner/model.js").resolveModelAsync>
->;
-
-function asResolveModelAsyncResult(value: unknown): ResolveModelAsyncResult {
-  return value as ResolveModelAsyncResult;
-}
-
 const runEmbeddedAttemptMock = vi.fn();
 const disposeSessionMcpRuntimeMock = vi.fn<(sessionId: string) => Promise<void>>(async () => {
   return undefined;
@@ -33,7 +25,7 @@ const disposeSessionMcpRuntimeMock = vi.fn<(sessionId: string) => Promise<void>>
 const resolveSessionKeyForRequestMock = vi.fn();
 const resolveStoredSessionKeyForSessionIdMock = vi.fn();
 const resolveModelAsyncMock = vi.fn(async (provider: string, modelId: string) =>
-  asResolveModelAsyncResult(createResolvedEmbeddedRunnerModel(provider, modelId)),
+  createResolvedEmbeddedRunnerModel(provider, modelId),
 );
 const ensureOpenClawModelsJsonMock = vi.fn(async () => ({ wrote: false }));
 const loggerWarnMock = vi.fn();
@@ -191,7 +183,7 @@ beforeEach(() => {
   resolveStoredSessionKeyForSessionIdMock.mockReset();
   resolveModelAsyncMock.mockReset();
   resolveModelAsyncMock.mockImplementation(async (provider: string, modelId: string) =>
-    asResolveModelAsyncResult(createResolvedEmbeddedRunnerModel(provider, modelId)),
+    createResolvedEmbeddedRunnerModel(provider, modelId),
   );
   ensureOpenClawModelsJsonMock.mockReset();
   ensureOpenClawModelsJsonMock.mockResolvedValue({ wrote: false });
@@ -332,49 +324,6 @@ describe("runEmbeddedPiAgent", () => {
       expect.objectContaining({ skipPiDiscovery: true }),
     );
     expect(ensureOpenClawModelsJsonMock).not.toHaveBeenCalled();
-  });
-
-  it("scopes models.json fallback discovery to the requested provider", async () => {
-    const sessionFile = nextSessionFile();
-    const cfg = createEmbeddedPiRunnerOpenAiConfig(["mock-1"]);
-    resolveModelAsyncMock
-      .mockResolvedValueOnce({
-        model: undefined,
-        error: "Unknown model: openai/mock-1",
-        authStorage: {
-          setRuntimeApiKey: () => undefined,
-        },
-        modelRegistry: {},
-      } as unknown as ResolveModelAsyncResult)
-      .mockResolvedValueOnce(
-        asResolveModelAsyncResult(createResolvedEmbeddedRunnerModel("openai", "mock-1")),
-      );
-    runEmbeddedAttemptMock.mockResolvedValueOnce(
-      makeEmbeddedRunnerAttempt({
-        assistantTexts: ["ok"],
-        lastAssistant: buildEmbeddedRunnerAssistant({
-          content: [{ type: "text", text: "ok" }],
-        }),
-      }),
-    );
-
-    await runEmbeddedPiAgent({
-      sessionId: "scoped-model-discovery",
-      sessionFile,
-      workspaceDir,
-      config: cfg,
-      prompt: "hello",
-      provider: "openai",
-      model: "mock-1",
-      timeoutMs: 5_000,
-      agentDir,
-      runId: nextRunId("scoped-model-discovery"),
-      enqueue: immediateEnqueue,
-    });
-
-    expect(ensureOpenClawModelsJsonMock).toHaveBeenCalledWith(cfg, agentDir, {
-      providerDiscoveryProviderIds: ["openai"],
-    });
   });
 
   it("backfills a trimmed session key from sessionId when the embedded run omits it", async () => {

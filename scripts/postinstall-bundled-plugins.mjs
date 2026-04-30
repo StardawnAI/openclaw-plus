@@ -22,10 +22,21 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, posix, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { expandPackageDistImportClosure } from "./lib/package-dist-imports.mjs";
+import {
+  createBundledRuntimeDependencyInstallArgs,
+  createBundledRuntimeDependencyInstallEnv,
+  createNestedNpmInstallEnv,
+  runBundledRuntimeDependencyNpmInstall,
+} from "./lib/bundled-runtime-deps-install.mjs";
 import { resolveNpmRunner } from "./npm-runner.mjs";
+
+export {
+  createBundledRuntimeDependencyInstallArgs,
+  createBundledRuntimeDependencyInstallEnv,
+  createNestedNpmInstallEnv,
+};
 
 export const BUNDLED_PLUGIN_INSTALL_TARGETS = [];
 
@@ -105,6 +116,7 @@ const BAILEYS_MEDIA_DISPATCHER_HEADER_REPLACEMENT = [
 const BAILEYS_MEDIA_ONCE_IMPORT_RE = /import\s+\{\s*once\s*\}\s+from\s+['"]events['"]/u;
 const BAILEYS_MEDIA_ASYNC_CONTEXT_RE =
   /async\s+function\s+encryptedStream|encryptedStream\s*=\s*async/u;
+const NODE_COMPILE_CACHE_VERSION_DIR_RE = /^v\d+\.\d+\.\d+-/u;
 
 function hasEnvFlag(env, key) {
   const value = env?.[key]?.trim().toLowerCase();
@@ -273,6 +285,137 @@ function pruneEmptyDistDirectories(params = {}) {
   prune(distRoot.distDir);
 }
 
+const JS_DIST_FILE_RE = /^dist\/.*\.(?:cjs|js|mjs)$/u;
+
+function stripSpecifierSuffix(value) {
+  return value.replace(/[?#].*$/u, "");
+}
+
+function resolveDistImportPath(importerPath, specifier) {
+  if (!specifier.startsWith(".")) {
+    return null;
+  }
+  const stripped = stripSpecifierSuffix(specifier);
+  if (!stripped) {
+    return null;
+  }
+  return posix.normalize(posix.join(posix.dirname(importerPath), stripped));
+}
+
+function findStatementStart(source, index) {
+  return (
+    Math.max(
+      source.lastIndexOf(";", index),
+      source.lastIndexOf("{", index),
+      source.lastIndexOf("}", index),
+      source.lastIndexOf("\n", index),
+      source.lastIndexOf("\r", index),
+    ) + 1
+  );
+}
+
+function isImportSpecifierContext(source, index) {
+  const dynamicPrefix = source.slice(Math.max(0, index - 32), index);
+  if (/\bimport\s*\(\s*$/u.test(dynamicPrefix)) {
+    return true;
+  }
+  const statementPrefix = source.slice(findStatementStart(source, index), index).trimStart();
+  return (
+    /^(?:import|export)\b[\s\S]*\bfrom\s*$/u.test(statementPrefix) ||
+    /^import\s*$/u.test(statementPrefix)
+  );
+}
+
+function collectImportSpecifiers(source) {
+  const specifiers = [];
+  let inBlockComment = false;
+  let inLineComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    if (inBlockComment) {
+      if (source[index] === "*" && source[index + 1] === "/") {
+        inBlockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (inLineComment) {
+      if (source[index] === "\n" || source[index] === "\r") {
+        inLineComment = false;
+      }
+      continue;
+    }
+    if (source[index] === "/" && source[index + 1] === "*") {
+      inBlockComment = true;
+      index += 1;
+      continue;
+    }
+    if (source[index] === "/" && source[index + 1] === "/") {
+      inLineComment = true;
+      index += 1;
+      continue;
+    }
+
+    const quote = source[index];
+    if (quote !== '"' && quote !== "'") {
+      continue;
+    }
+
+    let cursor = index + 1;
+    let value = "";
+    while (cursor < source.length) {
+      const char = source[cursor];
+      if (char === "\\") {
+        value += source.slice(cursor, cursor + 2);
+        cursor += 2;
+        continue;
+      }
+      if (char === quote) {
+        break;
+      }
+      value += char;
+      cursor += 1;
+    }
+    if (cursor >= source.length) {
+      break;
+    }
+
+    if (value.startsWith(".") && isImportSpecifierContext(source, index)) {
+      specifiers.push(value);
+    }
+    index = cursor;
+  }
+  return specifiers;
+}
+
+function expandInstalledDistImportClosure(params) {
+  const files = [...new Set(params.files)];
+  const fileSet = new Set(files);
+  const expectedSet = new Set(params.seedFiles);
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    for (const importerPath of [...expectedSet]
+      .filter((file) => fileSet.has(file))
+      .toSorted((left, right) => left.localeCompare(right))) {
+      if (!JS_DIST_FILE_RE.test(importerPath) || importerPath.includes("/node_modules/")) {
+        continue;
+      }
+      const source = params.readText(importerPath);
+      for (const specifier of collectImportSpecifiers(source)) {
+        const importedPath = resolveDistImportPath(importerPath, specifier);
+        if (!importedPath || !fileSet.has(importedPath) || expectedSet.has(importedPath)) {
+          continue;
+        }
+        expectedSet.add(importedPath);
+        changed = true;
+      }
+    }
+  }
+
+  return [...expectedSet].toSorted((left, right) => left.localeCompare(right));
+}
+
 export function pruneInstalledPackageDist(params = {}) {
   const packageRoot = params.packageRoot ?? DEFAULT_PACKAGE_ROOT;
   const removeFile = params.unlinkSync ?? unlinkSync;
@@ -296,7 +439,7 @@ export function pruneInstalledPackageDist(params = {}) {
   const installedFiles = listInstalledDistFiles(params);
   const readFile = params.readFileSync ?? readFileSync;
   expectedFiles = new Set(
-    expandPackageDistImportClosure({
+    expandInstalledDistImportClosure({
       files: installedFiles,
       seedFiles: [...expectedFiles],
       readText(relativePath) {
@@ -449,28 +592,6 @@ export function discoverBundledPluginRuntimeDeps(params = {}) {
       }),
     )
     .toSorted((a, b) => a.name.localeCompare(b.name));
-}
-
-export function createNestedNpmInstallEnv(env = process.env) {
-  const nextEnv = { ...env };
-  delete nextEnv.npm_config_global;
-  delete nextEnv.npm_config_location;
-  delete nextEnv.npm_config_prefix;
-  return nextEnv;
-}
-
-export function createBundledRuntimeDependencyInstallEnv(env = process.env) {
-  return {
-    ...createNestedNpmInstallEnv(env),
-    npm_config_dry_run: "false",
-    npm_config_legacy_peer_deps: "true",
-    npm_config_package_lock: "false",
-    npm_config_save: "false",
-  };
-}
-
-export function createBundledRuntimeDependencyInstallArgs(missingSpecs) {
-  return ["install", "--ignore-scripts", ...missingSpecs];
 }
 
 function shouldEagerInstallBundledPluginDeps(env = process.env) {
@@ -731,6 +852,7 @@ function shouldRunBundledPluginPostinstall(params) {
 export function pruneOpenClawCompileCache(params = {}) {
   const env = params.env ?? process.env;
   const pathExists = params.existsSync ?? existsSync;
+  const readDir = params.readdirSync ?? readdirSync;
   const remove = params.rmSync ?? rmSync;
   const log = params.log ?? console;
   const baseDirs = [
@@ -739,12 +861,25 @@ export function pruneOpenClawCompileCache(params = {}) {
   ].filter((value, index, values) => value && values.indexOf(value) === index);
 
   for (const baseDir of baseDirs) {
-    const cacheRoot = join(baseDir, "openclaw");
-    if (!pathExists(cacheRoot)) {
+    if (!pathExists(baseDir)) {
       continue;
     }
     try {
-      remove(cacheRoot, { recursive: true, force: true, maxRetries: 2, retryDelay: 100 });
+      for (const entry of readDir(baseDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !NODE_COMPILE_CACHE_VERSION_DIR_RE.test(entry.name)) {
+          continue;
+        }
+        try {
+          remove(join(baseDir, entry.name), {
+            recursive: true,
+            force: true,
+            maxRetries: 2,
+            retryDelay: 100,
+          });
+        } catch (error) {
+          log.warn?.(`[postinstall] could not prune OpenClaw compile cache: ${String(error)}`);
+        }
+      }
     } catch (error) {
       log.warn?.(`[postinstall] could not prune OpenClaw compile cache: ${String(error)}`);
     }
@@ -854,19 +989,12 @@ export function runBundledPluginPostinstall(params = {}) {
         comSpec: params.comSpec,
         npmArgs: createBundledRuntimeDependencyInstallArgs(missingSpecs),
       });
-    const result = spawn(npmRunner.command, npmRunner.args, {
+    runBundledRuntimeDependencyNpmInstall({
       cwd: packageRoot,
-      encoding: "utf8",
+      npmRunner,
       env: npmRunner.env ?? installEnv,
-      stdio: "pipe",
-      windowsHide: true,
-      shell: npmRunner.shell,
-      windowsVerbatimArguments: npmRunner.windowsVerbatimArguments,
+      spawnSyncImpl: spawn,
     });
-    if (result.status !== 0) {
-      const output = [result.stderr, result.stdout].filter(Boolean).join("\n").trim();
-      throw new Error(output || "npm install failed");
-    }
     log.log(`[postinstall] installed bundled plugin deps: ${missingSpecs.join(", ")}`);
   } catch (e) {
     // Non-fatal: gateway will surface the missing dep via doctor.

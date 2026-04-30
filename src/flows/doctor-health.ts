@@ -8,7 +8,6 @@ const outro = (message: string) => clackOutro(stylePromptTitle(message) ?? messa
 
 export async function doctorCommand(runtime?: RuntimeEnv, options: DoctorOptions = {}) {
   const effectiveRuntime = runtime ?? (await import("../runtime.js")).defaultRuntime;
-  const envSnapshot = { ...process.env };
   const { createDoctorPrompter } = await import("../commands/doctor-prompter.js");
   const { printWizardHeader } = await import("../commands/onboard-helpers.js");
   const prompter = createDoctorPrompter({ runtime: effectiveRuntime, options });
@@ -58,7 +57,6 @@ export async function doctorCommand(runtime?: RuntimeEnv, options: DoctorOptions
     cfgForPersistence: structuredClone(configResult.cfg),
     sourceConfigValid: configResult.sourceConfigValid ?? true,
     configPath: configResult.path ?? CONFIG_PATH,
-    env: envSnapshot,
   };
   const { runDoctorHealthContributions } = await import("./doctor-health-contributions.js");
   await runDoctorHealthContributions(ctx);

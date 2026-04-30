@@ -116,122 +116,17 @@ export async function disconnectGatewayClient(client: GatewayClient): Promise<vo
   await client.stopAndWait();
 }
 
-const DEVICE_AUTH_REQ_TIMEOUT_MS = 10_000;
-
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function waitForWsOpen(ws: WebSocket, timeoutMs: number): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      ws.terminate();
-      reject(new Error("timeout waiting for ws open"));
-    }, timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      ws.off("open", openHandler);
-      ws.off("error", errorHandler);
-      ws.off("close", closeHandler);
-    };
-    const openHandler = () => {
-      cleanup();
-      resolve();
-    };
-    const errorHandler = (err: Error) => {
-      cleanup();
-      reject(err);
-    };
-    const closeHandler = (code: number, reason: Buffer) => {
-      cleanup();
-      reject(new Error(`closed before open ${code}: ${rawDataToString(reason)}`));
-    };
-    ws.once("open", openHandler);
-    ws.once("error", errorHandler);
-    ws.once("close", closeHandler);
-  });
-}
-
-async function closeWsGracefully(ws: WebSocket, timeoutMs: number): Promise<void> {
-  if (ws.readyState === WebSocket.CLOSED) {
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      ws.terminate();
-      resolve();
-    }, timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      ws.off("close", closeHandler);
-      ws.off("error", errorHandler);
-    };
-    const closeHandler = () => {
-      cleanup();
-      resolve();
-    };
-    const errorHandler = () => {
-      cleanup();
-      resolve();
-    };
-    ws.once("close", closeHandler);
-    ws.once("error", errorHandler);
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.close();
-    } else if (ws.readyState !== WebSocket.CLOSING) {
-      ws.terminate();
-    }
-  });
-}
-
-export async function connectDeviceAuthReq(params: {
-  url: string;
-  token?: string;
-  timeoutMs?: number;
-}) {
-  const timeoutMs = params.timeoutMs ?? DEVICE_AUTH_REQ_TIMEOUT_MS;
-  const deadline = Date.now() + timeoutMs;
-  let lastError: Error | undefined;
-  while (Date.now() < deadline) {
-    const attemptTimeoutMs = Math.max(250, Math.min(5000, deadline - Date.now()));
-    try {
-      return await connectDeviceAuthReqOnce({ ...params, timeoutMs: attemptTimeoutMs });
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      await sleep(Math.min(100, Math.max(0, deadline - Date.now())));
-    }
-  }
-  throw new Error(
-    `device auth request failed after ${timeoutMs}ms: ${lastError?.message ?? "unknown error"}`,
-  );
-}
-
-async function connectDeviceAuthReqOnce(params: {
-  url: string;
-  token?: string;
-  timeoutMs: number;
-}) {
+export async function connectDeviceAuthReq(params: { url: string; token?: string }) {
   const ws = new WebSocket(params.url);
   const connectNoncePromise = new Promise<string>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("timeout waiting for connect challenge"));
-    }, params.timeoutMs);
-    const cleanup = () => {
+    const timer = setTimeout(
+      () => reject(new Error("timeout waiting for connect challenge")),
+      5000,
+    );
+    const closeHandler = (code: number, reason: Buffer) => {
       clearTimeout(timer);
       ws.off("message", handler);
-      ws.off("close", closeHandler);
-      ws.off("error", errorHandler);
-    };
-    const closeHandler = (code: number, reason: Buffer) => {
-      cleanup();
       reject(new Error(`closed ${code}: ${rawDataToString(reason)}`));
-    };
-    const errorHandler = (err: Error) => {
-      cleanup();
-      reject(err);
     };
     const handler = (data: WebSocket.RawData) => {
       try {
@@ -247,7 +142,9 @@ async function connectDeviceAuthReqOnce(params: {
         if (typeof nonce !== "string" || nonce.trim().length === 0) {
           return;
         }
-        cleanup();
+        clearTimeout(timer);
+        ws.off("message", handler);
+        ws.off("close", closeHandler);
         resolve(nonce.trim());
       } catch {
         // ignore parse errors while waiting for challenge
@@ -255,18 +152,9 @@ async function connectDeviceAuthReqOnce(params: {
     };
     ws.on("message", handler);
     ws.once("close", closeHandler);
-    ws.once("error", errorHandler);
   });
-  try {
-    await waitForWsOpen(ws, params.timeoutMs);
-  } catch (err) {
-    ws.terminate();
-    throw err;
-  }
-  const connectNonce = await connectNoncePromise.catch((err: unknown) => {
-    ws.terminate();
-    throw err;
-  });
+  await new Promise<void>((resolve) => ws.once("open", resolve));
+  const connectNonce = await connectNoncePromise;
   const identity = loadOrCreateDeviceIdentity();
   const signedAtMs = Date.now();
   const platform = process.platform;
@@ -288,49 +176,6 @@ async function connectDeviceAuthReqOnce(params: {
     signedAt: signedAtMs,
     nonce: connectNonce,
   };
-  const responsePromise = new Promise<{
-    type: "res";
-    id: string;
-    ok: boolean;
-    error?: { message?: string };
-  }>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error("timeout waiting for connect response"));
-    }, params.timeoutMs);
-    const cleanup = () => {
-      clearTimeout(timer);
-      ws.off("message", handler);
-      ws.off("close", closeHandler);
-      ws.off("error", errorHandler);
-    };
-    const closeHandler = (code: number, reason: Buffer) => {
-      cleanup();
-      reject(new Error(`closed ${code}: ${rawDataToString(reason)}`));
-    };
-    const errorHandler = (err: Error) => {
-      cleanup();
-      reject(err);
-    };
-    const handler = (data: WebSocket.RawData) => {
-      const obj = JSON.parse(rawDataToString(data)) as { type?: unknown; id?: unknown };
-      if (obj?.type !== "res" || obj?.id !== "c1") {
-        return;
-      }
-      cleanup();
-      resolve(
-        obj as {
-          type: "res";
-          id: string;
-          ok: boolean;
-          error?: { message?: string };
-        },
-      );
-    };
-    ws.on("message", handler);
-    ws.once("close", closeHandler);
-    ws.once("error", errorHandler);
-  });
   ws.send(
     JSON.stringify({
       type: "req",
@@ -352,11 +197,39 @@ async function connectDeviceAuthReqOnce(params: {
       },
     }),
   );
-  const res = await responsePromise.catch((err: unknown) => {
-    ws.terminate();
-    throw err;
+  const res = await new Promise<{
+    type: "res";
+    id: string;
+    ok: boolean;
+    error?: { message?: string };
+  }>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout")), 5000);
+    const closeHandler = (code: number, reason: Buffer) => {
+      clearTimeout(timer);
+      ws.off("message", handler);
+      reject(new Error(`closed ${code}: ${rawDataToString(reason)}`));
+    };
+    const handler = (data: WebSocket.RawData) => {
+      const obj = JSON.parse(rawDataToString(data)) as { type?: unknown; id?: unknown };
+      if (obj?.type !== "res" || obj?.id !== "c1") {
+        return;
+      }
+      clearTimeout(timer);
+      ws.off("message", handler);
+      ws.off("close", closeHandler);
+      resolve(
+        obj as {
+          type: "res";
+          id: string;
+          ok: boolean;
+          error?: { message?: string };
+        },
+      );
+    };
+    ws.on("message", handler);
+    ws.once("close", closeHandler);
   });
-  await closeWsGracefully(ws, Math.min(1000, params.timeoutMs));
+  ws.close();
   return res;
 }
 

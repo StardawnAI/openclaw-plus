@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   buildCliRespawnPlan,
   EXPERIMENTAL_WARNING_FLAG,
@@ -6,14 +6,6 @@ import {
   OPENCLAW_NODE_OPTIONS_READY,
   resolveCliRespawnCommand,
 } from "./entry.respawn.js";
-
-const isTruthyEnvValueMock = vi.hoisted(() =>
-  vi.fn((value: string | undefined) => value === "1" || value === "true"),
-);
-
-vi.mock("./infra/env.js", () => ({
-  isTruthyEnvValue: isTruthyEnvValueMock,
-}));
 
 describe("buildCliRespawnPlan", () => {
   it("returns null when respawn policy skips the argv", () => {

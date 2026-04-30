@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { tracePluginLifecyclePhase } from "./plugin-lifecycle-trace.js";
 
 const BUNDLED_RUNTIME_MIRROR_METADATA_FILE = ".openclaw-runtime-mirror.json";
 const BUNDLED_RUNTIME_MIRROR_METADATA_VERSION = 1;
@@ -24,23 +25,29 @@ export function refreshBundledPluginRuntimeMirrorRoot(params: {
   tempDirParent?: string;
   precomputedSourceMetadata?: PrecomputedBundledRuntimeMirrorMetadata;
 }): boolean {
-  if (path.resolve(params.sourceRoot) === path.resolve(params.targetRoot)) {
-    return false;
-  }
-  const metadata = createBundledRuntimeMirrorMetadata(params, params.precomputedSourceMetadata);
-  if (isBundledRuntimeMirrorRootFresh(params.targetRoot, metadata)) {
-    return false;
-  }
-  copyBundledPluginRuntimeRoot(params.sourceRoot, params.targetRoot);
-  writeBundledRuntimeMirrorMetadata(params.targetRoot, metadata);
-  return true;
+  return tracePluginLifecyclePhase(
+    "runtime mirror refresh",
+    () => {
+      if (path.resolve(params.sourceRoot) === path.resolve(params.targetRoot)) {
+        return false;
+      }
+      const metadata = createBundledRuntimeMirrorMetadata(params, params.precomputedSourceMetadata);
+      if (isBundledRuntimeMirrorRootFresh(params.targetRoot, metadata)) {
+        return false;
+      }
+      copyBundledPluginRuntimeRoot(params.sourceRoot, params.targetRoot);
+      writeBundledRuntimeMirrorMetadata(params.targetRoot, metadata);
+      return true;
+    },
+    { pluginId: params.pluginId },
+  );
 }
 
 export function copyBundledPluginRuntimeRoot(sourceRoot: string, targetRoot: string): void {
   if (path.resolve(sourceRoot) === path.resolve(targetRoot)) {
     return;
   }
-  fs.mkdirSync(targetRoot, { recursive: true, mode: 0o755 });
+  ensureBundledRuntimeMirrorDirectory(targetRoot);
   const mirroredNames = new Set<string>();
   for (const entry of fs.readdirSync(sourceRoot, { withFileTypes: true })) {
     if (shouldIgnoreBundledRuntimeMirrorEntry(entry.name)) {
@@ -64,14 +71,59 @@ export function copyBundledPluginRuntimeRoot(sourceRoot: string, targetRoot: str
     }
     removeBundledRuntimeMirrorPathIfTypeChanged(targetPath, "file");
     copyBundledRuntimeMirrorFileAtomic(sourcePath, targetPath);
-    try {
-      const sourceMode = fs.statSync(sourcePath).mode;
-      fs.chmodSync(targetPath, sourceMode | 0o600);
-    } catch {
-      // Readable copied files are enough for plugin loading.
-    }
+    chmodBundledRuntimeMirrorFileReadable(sourcePath, targetPath);
   }
   pruneStaleBundledRuntimeMirrorEntries(targetRoot, mirroredNames);
+}
+
+export function materializeBundledRuntimeMirrorFile(sourcePath: string, targetPath: string): void {
+  if (path.resolve(sourcePath) === path.resolve(targetPath)) {
+    return;
+  }
+  try {
+    if (isBundledRuntimeMirrorFileAlreadyMaterialized(sourcePath, targetPath)) {
+      return;
+    }
+  } catch {
+    // Missing targets are expected before the mirror file is materialized.
+  }
+  ensureBundledRuntimeMirrorDirectory(path.dirname(targetPath));
+  removeBundledRuntimeMirrorPathIfTypeChanged(targetPath, "file");
+  const tempPath = createBundledRuntimeMirrorTempPath(targetPath);
+  try {
+    try {
+      fs.linkSync(sourcePath, tempPath);
+    } catch {
+      fs.copyFileSync(sourcePath, tempPath);
+      chmodBundledRuntimeMirrorFileReadable(sourcePath, tempPath);
+    }
+    fs.renameSync(tempPath, targetPath);
+  } catch (error) {
+    fs.rmSync(tempPath, { force: true });
+    throw error;
+  }
+}
+
+function isBundledRuntimeMirrorFileAlreadyMaterialized(
+  sourcePath: string,
+  targetPath: string,
+): boolean {
+  const sourceStat = fs.lstatSync(sourcePath);
+  const targetStat = fs.lstatSync(targetPath);
+  return (
+    sourceStat.isFile() &&
+    targetStat.isFile() &&
+    sourceStat.dev === targetStat.dev &&
+    sourceStat.ino === targetStat.ino
+  );
+}
+function chmodBundledRuntimeMirrorFileReadable(sourcePath: string, targetPath: string): void {
+  try {
+    const sourceMode = fs.statSync(sourcePath).mode;
+    fs.chmodSync(targetPath, sourceMode | 0o600);
+  } catch {
+    // Readable mirrored files are enough for plugin loading.
+  }
 }
 
 function pruneStaleBundledRuntimeMirrorEntries(
@@ -87,6 +139,21 @@ function pruneStaleBundledRuntimeMirrorEntries(
     }
     fs.rmSync(path.join(targetRoot, entry.name), { recursive: true, force: true });
   }
+}
+
+function ensureBundledRuntimeMirrorDirectory(targetRoot: string): void {
+  try {
+    const stat = fs.lstatSync(targetRoot);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      return;
+    }
+    fs.rmSync(targetRoot, { recursive: true, force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  fs.mkdirSync(targetRoot, { recursive: true, mode: 0o755 });
 }
 
 function removeBundledRuntimeMirrorPathIfTypeChanged(
@@ -111,7 +178,7 @@ function removeBundledRuntimeMirrorPathIfTypeChanged(
 }
 
 function replaceBundledRuntimeMirrorSymlinkAtomic(linkTarget: string, targetPath: string): void {
-  fs.mkdirSync(path.dirname(targetPath), { recursive: true, mode: 0o755 });
+  ensureBundledRuntimeMirrorDirectory(path.dirname(targetPath));
   const tempPath = createBundledRuntimeMirrorTempPath(targetPath);
   try {
     fs.symlinkSync(linkTarget, tempPath);
@@ -122,7 +189,7 @@ function replaceBundledRuntimeMirrorSymlinkAtomic(linkTarget: string, targetPath
 }
 
 function copyBundledRuntimeMirrorFileAtomic(sourcePath: string, targetPath: string): void {
-  fs.mkdirSync(path.dirname(targetPath), { recursive: true, mode: 0o755 });
+  ensureBundledRuntimeMirrorDirectory(path.dirname(targetPath));
   const tempPath = createBundledRuntimeMirrorTempPath(targetPath);
   try {
     fs.copyFileSync(sourcePath, tempPath);
@@ -218,9 +285,15 @@ function writeBundledRuntimeMirrorMetadata(
 }
 
 function fingerprintBundledRuntimeMirrorSourceRoot(sourceRoot: string): string {
-  const hash = createHash("sha256");
-  hashBundledRuntimeMirrorDirectory(hash, sourceRoot, sourceRoot);
-  return hash.digest("hex");
+  return tracePluginLifecyclePhase(
+    "runtime mirror fingerprint",
+    () => {
+      const hash = createHash("sha256");
+      hashBundledRuntimeMirrorDirectory(hash, sourceRoot, sourceRoot);
+      return hash.digest("hex");
+    },
+    { sourceRoot },
+  );
 }
 
 function hashBundledRuntimeMirrorDirectory(

@@ -1,4 +1,3 @@
-import { resolveInboundMentionDecision } from "openclaw/plugin-sdk/channel-inbound";
 import { createStartAccountContext } from "openclaw/plugin-sdk/channel-test-helpers";
 import type { PluginRuntime } from "openclaw/plugin-sdk/core";
 import {
@@ -55,30 +54,6 @@ function createMockQaRuntime(params?: {
         },
         recordInboundSession({ sessionKey }: { sessionKey: string }) {
           sessionUpdatedAt.set(sessionKey, Date.now());
-        },
-      },
-      text: {
-        hasControlCommand() {
-          return false;
-        },
-      },
-      mentions: {
-        buildMentionRegexes() {
-          return [/\b@?openclaw\b/i];
-        },
-        matchesMentionPatterns(text: string, regexes: RegExp[]) {
-          return regexes.some((regex) => regex.test(text));
-        },
-        resolveInboundMentionDecision,
-      },
-      groups: {
-        resolveRequireMention() {
-          return true;
-        },
-      },
-      commands: {
-        shouldHandleTextCommands() {
-          return true;
         },
       },
       reply: {
@@ -217,78 +192,6 @@ describe("qa-channel plugin", () => {
         timeoutMs: 15_000,
       });
       expect("text" in outbound && outbound.text).toContain("qa-echo: hello");
-    } finally {
-      await harness.stop();
-    }
-  });
-
-  it("marks mentioned threaded group traffic before dispatch", { timeout: 20_000 }, async () => {
-    let dispatchedCtx: Record<string, unknown> | null = null;
-    const harness = await startQaChannelTestHarness({
-      allowFrom: ["*"],
-      runtime: createMockQaRuntime({
-        onDispatch: (ctx) => {
-          dispatchedCtx = ctx;
-        },
-      }),
-    });
-
-    try {
-      harness.state.addInboundMessage({
-        conversation: { id: "qa-room", kind: "channel", title: "QA Room" },
-        senderId: "alice",
-        senderName: "Alice",
-        text: "@openclaw thread memory check",
-        threadId: "thread-1",
-        threadTitle: "Thread 1",
-      });
-
-      const outbound = await harness.state.waitFor({
-        kind: "message-text",
-        textIncludes: "qa-echo: @openclaw thread memory check",
-        direction: "outbound",
-        timeoutMs: 15_000,
-      });
-      expect("threadId" in outbound && outbound.threadId).toBe("thread-1");
-      expect(dispatchedCtx).toMatchObject({
-        ChatType: "group",
-        WasMentioned: true,
-        MessageThreadId: "thread-1",
-      });
-    } finally {
-      await harness.stop();
-    }
-  });
-
-  it("drops unmentioned group traffic when mention is required", { timeout: 20_000 }, async () => {
-    let didDispatch = false;
-    const harness = await startQaChannelTestHarness({
-      allowFrom: ["*"],
-      runtime: createMockQaRuntime({
-        onDispatch: () => {
-          didDispatch = true;
-        },
-      }),
-    });
-
-    try {
-      harness.state.addInboundMessage({
-        conversation: { id: "qa-room", kind: "channel", title: "QA Room" },
-        senderId: "alice",
-        senderName: "Alice",
-        text: "thread memory check",
-        threadId: "thread-1",
-      });
-
-      await expect(
-        harness.state.waitFor({
-          kind: "message-text",
-          textIncludes: "qa-echo:",
-          direction: "outbound",
-          timeoutMs: 750,
-        }),
-      ).rejects.toThrow(/wait timeout/i);
-      expect(didDispatch).toBe(false);
     } finally {
       await harness.stop();
     }

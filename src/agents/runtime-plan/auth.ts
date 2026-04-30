@@ -1,7 +1,6 @@
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { normalizeEmbeddedAgentRuntime } from "../pi-embedded-runner/runtime.js";
 import { resolveProviderIdForAuth } from "../provider-auth-aliases.js";
-import { normalizeProviderId } from "../provider-id.js";
 import type { AgentRuntimeAuthPlan } from "./types.js";
 
 const CODEX_HARNESS_AUTH_PROVIDER = "openai-codex";
@@ -25,29 +24,16 @@ export function buildAgentRuntimeAuthPlan(params: {
   harnessRuntime?: string;
   allowHarnessAuthProfileForwarding?: boolean;
 }): AgentRuntimeAuthPlan {
-  const normalizedProvider = normalizeProviderId(params.provider);
-  const normalizedAuthProfileProvider = normalizeProviderId(
-    params.authProfileProvider ?? params.provider,
-  );
   const aliasLookupParams = {
     config: params.config,
     workspaceDir: params.workspaceDir,
   };
+  const providerForAuth = resolveProviderIdForAuth(params.provider, aliasLookupParams);
+  const authProfileProviderForAuth = resolveProviderIdForAuth(
+    params.authProfileProvider ?? params.provider,
+    aliasLookupParams,
+  );
   const harnessAuthProvider = resolveHarnessAuthProvider(params);
-  if (!params.sessionAuthProfileId && !harnessAuthProvider) {
-    return {
-      providerForAuth: normalizedProvider,
-      authProfileProviderForAuth: normalizedAuthProfileProvider,
-    };
-  }
-  const providerForAuth =
-    normalizedProvider === normalizedAuthProfileProvider
-      ? normalizedProvider
-      : resolveProviderIdForAuth(params.provider, aliasLookupParams);
-  const authProfileProviderForAuth =
-    normalizedProvider === normalizedAuthProfileProvider
-      ? normalizedAuthProfileProvider
-      : resolveProviderIdForAuth(params.authProfileProvider ?? params.provider, aliasLookupParams);
   const harnessProviderForAuth = harnessAuthProvider
     ? resolveProviderIdForAuth(harnessAuthProvider, aliasLookupParams)
     : undefined;

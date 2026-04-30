@@ -520,16 +520,14 @@ async function readSpawnedChildRow(params: {
   childSessionKey: string;
   client: GatewayClient;
   parentSessionKey: string;
-  timeoutMs?: number;
 }): Promise<Record<string, unknown> | undefined> {
   const result = await params.client.request(
     "sessions.list",
     {
       spawnedBy: params.parentSessionKey,
-      includeLastMessage: true,
       limit: 20,
     },
-    { timeoutMs: params.timeoutMs ?? 10_000 },
+    { timeoutMs: 10_000 },
   );
   const sessions = asRecord(result)?.sessions;
   if (!Array.isArray(sessions)) {
@@ -540,13 +538,20 @@ async function readSpawnedChildRow(params: {
     .find((entry): entry is Record<string, unknown> => entry?.key === params.childSessionKey);
 }
 
+function isActiveCodexSubagentRow(row: Record<string, unknown> | undefined): boolean {
+  if (!row) {
+    return false;
+  }
+  return row.hasActiveSubagentRun === true || row.subagentRunState === "active";
+}
+
 async function waitForCodexSubagentStarted(params: {
   childSessionKey: string;
   client: GatewayClient;
   events: CapturedAgentEvent[];
   parentSessionKey: string;
 }): Promise<Record<string, unknown> | undefined> {
-  const deadline = Date.now() + Math.min(CODEX_HARNESS_REQUEST_TIMEOUT_MS, 240_000);
+  const deadline = Date.now() + Math.min(CODEX_HARNESS_REQUEST_TIMEOUT_MS, 120_000);
   let lastRow: Record<string, unknown> | undefined;
   let lastError: unknown;
   while (Date.now() < deadline) {
@@ -555,16 +560,13 @@ async function waitForCodexSubagentStarted(params: {
         childSessionKey: params.childSessionKey,
         client: params.client,
         parentSessionKey: params.parentSessionKey,
-        timeoutMs: Math.min(30_000, Math.max(10_000, deadline - Date.now())),
       });
-      if (
-        lastRow &&
-        params.events.some(
-          (event) =>
-            event.sessionKey === params.childSessionKey &&
-            event.stream === "codex_app_server.lifecycle",
-        )
-      ) {
+      const hasLifecycleEvent = params.events.some(
+        (event) =>
+          event.sessionKey === params.childSessionKey &&
+          event.stream === "codex_app_server.lifecycle",
+      );
+      if (lastRow && (hasLifecycleEvent || isActiveCodexSubagentRow(lastRow))) {
         return lastRow;
       }
     } catch (error) {

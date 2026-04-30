@@ -50,8 +50,8 @@ type MatrixQaGatewayChild = {
 };
 
 const DEFAULT_MATRIX_QA_RUN_TIMEOUT_MS = 30 * 60_000;
-const DEFAULT_MATRIX_QA_CANARY_TIMEOUT_MS = 90_000;
 const DEFAULT_MATRIX_QA_CLEANUP_TIMEOUT_MS = 90_000;
+const DEFAULT_MATRIX_QA_CANARY_TIMEOUT_MS = 45_000;
 
 type MatrixQaLiveLaneGatewayHarness = {
   gateway: MatrixQaGatewayChild;

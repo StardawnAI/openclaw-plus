@@ -132,7 +132,7 @@ async function main() {
   if (!options.skipBuild) {
     console.error("==> Building OpenClaw package artifacts");
     await run("pnpm", ["build"], sourceDir);
-    console.error("==> Building OpenClaw Control UI assets");
+    console.error("==> Building OpenClaw Control UI artifacts");
     await run("pnpm", ["ui:build"], sourceDir);
   }
 

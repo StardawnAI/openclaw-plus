@@ -19,6 +19,11 @@ vi.mock("./model-suppression.runtime.js", () => ({
       params.provider === "azure-openai-responses" ||
       params.provider === "openai-codex") &&
     params.id === "gpt-5.3-codex-spark",
+  buildShouldSuppressBuiltInModel: () => (params: { provider?: string; id?: string }) =>
+    (params.provider === "openai" ||
+      params.provider === "azure-openai-responses" ||
+      params.provider === "openai-codex") &&
+    params.id === "gpt-5.3-codex-spark",
 }));
 
 function mockCatalogImportFailThenRecover() {
@@ -120,6 +125,26 @@ describe("loadModelCatalog", () => {
     }
   });
 
+  it("reloads dynamic registry entries after clearing the cache", async () => {
+    const models = [{ id: "existing", name: "Existing", provider: "ollama" }];
+    mockPiDiscoveryModels(models);
+
+    const first = await loadModelCatalog({ config: {} as OpenClawConfig });
+    expect(first).toContainEqual({ id: "existing", name: "Existing", provider: "ollama" });
+
+    models.push({ id: "glm-5.1:cloud", name: "GLM 5.1 Cloud", provider: "ollama" });
+    resetModelCatalogCacheForTest();
+    mockPiDiscoveryModels(models);
+
+    const second = await loadModelCatalog({ config: {} as OpenClawConfig });
+    expect(second).toContainEqual({ id: "existing", name: "Existing", provider: "ollama" });
+    expect(second).toContainEqual({
+      id: "glm-5.1:cloud",
+      name: "GLM 5.1 Cloud",
+      provider: "ollama",
+    });
+  });
+
   it("returns partial results on discovery errors", async () => {
     setLoggerOverride({ level: "silent", consoleLevel: "warn" });
     try {
@@ -173,20 +198,6 @@ describe("loadModelCatalog", () => {
     expect(result).toEqual([{ id: "gpt-4.1", name: "GPT-4.1", provider: "openai" }]);
     expect(ensureOpenClawModelsJsonMock).not.toHaveBeenCalled();
     expect(discoverAuthStorage).toHaveBeenCalledWith("/tmp/openclaw", { readOnly: true });
-  });
-
-  it("scopes models.json preparation when catalog provider scope is supplied", async () => {
-    mockSingleOpenAiCatalogModel();
-    const cfg = {} as OpenClawConfig;
-
-    await loadModelCatalog({
-      config: cfg,
-      providerDiscoveryProviderIds: ["openai"],
-    });
-
-    expect(ensureOpenClawModelsJsonMock).toHaveBeenCalledWith(cfg, undefined, {
-      providerDiscoveryProviderIds: ["openai"],
-    });
   });
 
   it("does not synthesize stale openai-codex/gpt-5.3-codex-spark entries from gpt-5.4", async () => {
