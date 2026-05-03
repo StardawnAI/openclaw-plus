@@ -1,11 +1,11 @@
 // Barnacle owns deterministic GitHub triage and auto-response behavior.
 
-export const activePrLimit = 10;
+const activePrLimit = 20;
 
 const thirdPartyExtensionMessage =
   "Please publish this as a third-party plugin on [ClawHub](https://clawhub.ai) instead of adding it to the core repo. Docs: https://docs.openclaw.ai/plugin and https://docs.openclaw.ai/tools/clawhub";
 
-export const rules = [
+const rules = [
   {
     label: "r: skill",
     close: true,
@@ -17,6 +17,12 @@ export const rules = [
     close: true,
     message:
       "Please use [our support server](https://discord.gg/clawd) and ask in #help or #users-helping-users to resolve this, or follow the stuck FAQ at https://docs.openclaw.ai/help/faq#im-stuck-whats-the-fastest-way-to-get-unstuck.",
+  },
+  {
+    label: "r: false-positive",
+    close: true,
+    message:
+      "Closing this because it looks like a false positive or reclassification-only report rather than an actionable OpenClaw bug. If this is still a real issue, please open a fresh report with concrete reproduction steps and current-version details.",
   },
   {
     label: "r: no-ci-pr",
@@ -64,13 +70,17 @@ export const managedLabelSpecs = {
     color: "0E8A16",
     description: "Auto-close: support requests belong in Discord or support docs.",
   },
+  "r: false-positive": {
+    color: "D93F0B",
+    description: "Auto-close: false positive or reclassification-only report.",
+  },
   "r: no-ci-pr": {
     color: "D93F0B",
     description: "Auto-close: PR only chasing known main CI/test failures.",
   },
   "r: too-many-prs": {
     color: "D93F0B",
-    description: "Auto-close: author has more than ten active PRs.",
+    description: "Auto-close: author has more than twenty active PRs.",
   },
   "r: too-many-prs-override": {
     color: "C2E0C6",
@@ -149,7 +159,7 @@ export const candidateLabels = {
   externalPluginCandidate: "triage: external-plugin-candidate",
 };
 
-export const bugSubtypeLabelSpecs = {
+const bugSubtypeLabelSpecs = {
   regression: {
     color: "D93F0B",
     description: "Behavior that previously worked and now fails",
@@ -241,7 +251,7 @@ const candidateActionRules = [
 const normalizeLogin = (login) => login.toLowerCase();
 const automationPrHeadPrefixes = ["clawsweeper/", "clownfish/"];
 
-export function isAutomationPullRequest(pullRequest) {
+function isAutomationPullRequest(pullRequest) {
   const headRefName = pullRequest.headRefName ?? pullRequest.head?.ref ?? "";
   return (
     typeof headRefName === "string" &&
@@ -249,7 +259,7 @@ export function isAutomationPullRequest(pullRequest) {
   );
 }
 
-export function extractIssueFormValue(body, field) {
+function extractIssueFormValue(body, field) {
   if (!body) {
     return "";
   }
@@ -271,17 +281,17 @@ export function extractIssueFormValue(body, field) {
   return "";
 }
 
-export function hasLinkedReference(text) {
+function hasLinkedReference(text) {
   return /(?:#\d+|github\.com\/openclaw\/openclaw\/(?:issues|pull)\/\d+)/i.test(text);
 }
 
-export function hasFilledTemplateLine(body, field) {
+function hasFilledTemplateLine(body, field) {
   const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const regex = new RegExp(`^\\s*-\\s*${escapedField}:\\s*\\S`, "im");
   return regex.test(body);
 }
 
-export function hasMostlyBlankTemplate(body) {
+function hasMostlyBlankTemplate(body) {
   if (!body) {
     return true;
   }
@@ -322,7 +332,7 @@ function stripPullRequestTemplateBoilerplate(text) {
     );
 }
 
-export function hasConcreteBehaviorContext(body, text) {
+function hasConcreteBehaviorContext(body, text) {
   if (hasLinkedReference(text)) {
     return true;
   }
@@ -339,7 +349,7 @@ export function hasConcreteBehaviorContext(body, text) {
   );
 }
 
-export function hasClearDesignContext(body, text) {
+function hasClearDesignContext(body, text) {
   if (hasConcreteBehaviorContext(body, text)) {
     return true;
   }
@@ -349,7 +359,7 @@ export function hasClearDesignContext(body, text) {
   );
 }
 
-export function isMarkdownOrDocsFile(filename) {
+function isMarkdownOrDocsFile(filename) {
   return (
     filename.startsWith("docs/") ||
     /\.mdx?$/i.test(filename) ||
@@ -357,7 +367,7 @@ export function isMarkdownOrDocsFile(filename) {
   );
 }
 
-export function isTestLikeFile(filename) {
+function isTestLikeFile(filename) {
   return (
     /(^|\/)(__tests__|fixtures?|snapshots?)(\/|$)/i.test(filename) ||
     /(^|\/)test\/helpers\//i.test(filename) ||
@@ -367,7 +377,7 @@ export function isTestLikeFile(filename) {
   );
 }
 
-export function isInfraLikeFile(filename) {
+function isInfraLikeFile(filename) {
   return (
     /^\.github\/(?:workflows|actions)\//.test(filename) ||
     filename.startsWith("scripts/") ||
@@ -380,7 +390,7 @@ export function isInfraLikeFile(filename) {
   );
 }
 
-export function surfacesForFile(filename) {
+function surfacesForFile(filename) {
   const surfaces = new Set();
   if (/\.generated\/|generated|\.snap$/i.test(filename)) {
     surfaces.add("generated");
@@ -718,10 +728,17 @@ async function applyPullRequestCandidateLabels(github, context, core, pullReques
   );
 }
 
+function isAutomationUser(user, fallbackLogin = "") {
+  const login = user?.login ?? fallbackLogin;
+  return user?.type === "Bot" || /\[bot\]$/i.test(login) || login.startsWith("app/");
+}
+
 function isAutomationActor(context) {
-  const sender = context.payload.sender;
-  const login = sender?.login ?? context.actor ?? "";
-  return sender?.type === "Bot" || /\[bot\]$/i.test(login);
+  return isAutomationUser(context.payload.sender, context.actor ?? "");
+}
+
+function isGitHubAppPullRequestAuthor(pullRequest) {
+  return isAutomationUser(pullRequest.user);
 }
 
 function candidateActionRuleForLabelSet(labelSet, preferredLabel = "") {
@@ -791,12 +808,12 @@ async function removeLabels(github, context, issueNumber, labels, labelSet) {
         issue_number: issueNumber,
         name: label,
       });
-      labelSet.delete(label);
     } catch (error) {
       if (error?.status !== 404) {
         throw error;
       }
     }
+    labelSet.delete(label);
   }
 }
 
@@ -965,6 +982,11 @@ export async function runBarnacleAutoResponse({ github, context, core = console 
       return;
     }
 
+    if (isGitHubAppPullRequestAuthor(pullRequest)) {
+      await removeLabels(github, context, pullRequest.number, [activePrLimitLabel], labelSet);
+      core.info(`Skipping active PR limit for GitHub App-authored PR #${pullRequest.number}.`);
+    }
+
     await applyPullRequestCandidateLabels(github, context, core, pullRequest, labelSet);
 
     if (labelSet.has(dirtyLabel)) {
@@ -1051,7 +1073,10 @@ export async function runBarnacleAutoResponse({ github, context, core = console 
   if (pullRequest && labelSet.has(activePrLimitOverrideLabel)) {
     labelSet.delete(activePrLimitLabel);
   }
-  if (pullRequest && isAutomationPullRequest(pullRequest)) {
+  if (
+    pullRequest &&
+    (isAutomationPullRequest(pullRequest) || isGitHubAppPullRequestAuthor(pullRequest))
+  ) {
     await removeLabels(github, context, pullRequest.number, [activePrLimitLabel], labelSet);
   }
 
