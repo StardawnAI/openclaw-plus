@@ -323,9 +323,6 @@ function applyDefaultOpenAIGptRuntimeParams(
   if (!Object.hasOwn(merged, "text_verbosity") && !Object.hasOwn(merged, "textVerbosity")) {
     merged.text_verbosity = "low";
   }
-  if (params.provider === "openai" && !Object.hasOwn(merged, "transport")) {
-    merged.transport = "sse";
-  }
   if (!Object.hasOwn(merged, "openaiWsWarmup")) {
     merged.openaiWsWarmup = false;
   }

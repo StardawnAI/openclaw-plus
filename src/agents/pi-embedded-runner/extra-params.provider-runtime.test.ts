@@ -8,11 +8,6 @@ import {
 } from "./extra-params.js";
 import { runExtraParamsCase } from "./extra-params.test-support.js";
 
-type OpenAIResponseRuntimeOptions = {
-  transport?: string;
-  openaiWsWarmup?: boolean;
-};
-
 vi.mock("@mariozechner/pi-ai", () => createPiAiStreamSimpleMock());
 
 beforeEach(() => {
@@ -134,59 +129,5 @@ describe("extra-params: provider runtime handoff", () => {
     }).payload as Record<string, unknown>;
 
     expect(payload.think).toBeUndefined();
-  });
-
-  it("defaults OpenAI GPT-5 API-key runs to SSE transport", () => {
-    const result = runExtraParamsCase({
-      applyProvider: "openai",
-      applyModelId: "gpt-5.4",
-      model: {
-        api: "openai-responses",
-        provider: "openai",
-        id: "gpt-5.4",
-      } as unknown as Model<"openai-responses">,
-      payload: {
-        model: "gpt-5.4",
-        input: [],
-      },
-    });
-
-    const options = result.options as OpenAIResponseRuntimeOptions | undefined;
-    expect(options?.transport).toBe("sse");
-    expect(options?.openaiWsWarmup).toBe(false);
-  });
-
-  it("preserves explicit OpenAI GPT-5 transport overrides", () => {
-    const result = runExtraParamsCase({
-      applyProvider: "openai",
-      applyModelId: "gpt-5.4",
-      cfg: {
-        agents: {
-          defaults: {
-            models: {
-              "openai/gpt-5.4": {
-                params: {
-                  transport: "websocket",
-                  openaiWsWarmup: true,
-                },
-              },
-            },
-          },
-        },
-      },
-      model: {
-        api: "openai-responses",
-        provider: "openai",
-        id: "gpt-5.4",
-      } as unknown as Model<"openai-responses">,
-      payload: {
-        model: "gpt-5.4",
-        input: [],
-      },
-    });
-
-    const options = result.options as OpenAIResponseRuntimeOptions | undefined;
-    expect(options?.transport).toBe("websocket");
-    expect(options?.openaiWsWarmup).toBe(true);
   });
 });
