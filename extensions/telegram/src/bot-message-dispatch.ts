@@ -9,6 +9,7 @@ import { createChannelReplyPipeline } from "openclaw/plugin-sdk/channel-reply-pi
 import {
   createChannelProgressDraftGate,
   formatChannelProgressDraftLine,
+  formatChannelProgressDraftLineForEntry,
   formatChannelProgressDraftText,
   isChannelProgressDraftWorkToolName,
   resolveChannelProgressDraftMaxLines,
@@ -27,6 +28,7 @@ import {
   createOutboundPayloadPlan,
   projectOutboundPayloadPlanForDelivery,
 } from "openclaw/plugin-sdk/outbound-runtime";
+import { chunkMarkdownTextWithMode } from "openclaw/plugin-sdk/reply-chunking";
 import { clearHistoryEntriesIfEnabled } from "openclaw/plugin-sdk/reply-history";
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
@@ -74,7 +76,7 @@ import {
   shouldSuppressTelegramError,
 } from "./error-policy.js";
 import { shouldSuppressLocalTelegramExecApprovalPrompt } from "./exec-approvals.js";
-import { renderTelegramHtmlText } from "./format.js";
+import { markdownToTelegramChunks, renderTelegramHtmlText } from "./format.js";
 import {
   type ArchivedPreview,
   createLaneDeliveryStateTracker,
@@ -238,10 +240,13 @@ function clipProgressMarkdownText(text: string): string {
   return `${text.slice(0, MAX_PROGRESS_MARKDOWN_TEXT_CHARS - 1).trimEnd()}…`;
 }
 
+function sanitizeProgressMarkdownText(text: string): string {
+  return text.replaceAll("`", "'");
+}
+
 function formatProgressAsMarkdownCode(text: string): string {
   const clipped = clipProgressMarkdownText(text);
-  const safe = clipped.replaceAll("`", "'");
-  return `\`${safe}\``;
+  return `\`${sanitizeProgressMarkdownText(clipped)}\``;
 }
 
 export const dispatchTelegramMessage = async ({
@@ -479,6 +484,7 @@ export const dispatchTelegramMessage = async ({
     Boolean(answerLane.stream) && resolveChannelStreamingPreviewToolProgress(telegramCfg);
   let previewToolProgressSuppressed = false;
   let previewToolProgressLines: string[] = [];
+  let answerLaneHasAssistantContent = false;
   const renderProgressDraft = async (options?: { flush?: boolean }) => {
     if (!answerLane.stream || streamMode !== "progress") {
       return;
@@ -509,7 +515,7 @@ export const dispatchTelegramMessage = async ({
     if (options?.toolName !== undefined && !isChannelProgressDraftWorkToolName(options.toolName)) {
       return;
     }
-    const normalized = line?.replace(/\s+/g, " ").trim();
+    const normalized = sanitizeProgressMarkdownText(line?.replace(/\s+/g, " ").trim() ?? "");
     if (streamMode !== "progress") {
       if (!previewToolProgressEnabled || previewToolProgressSuppressed || !normalized) {
         return;
@@ -601,13 +607,14 @@ export const dispatchTelegramMessage = async ({
           messageId: previewMessageId,
           textSnapshot: answerLane.lastPartialText,
           visibleSinceMs: answerLane.stream?.visibleSinceMs?.(),
-          deleteIfUnused: false,
+          deleteIfUnused: !answerLaneHasAssistantContent,
         });
       }
       answerLane.stream?.forceNewMessage();
       didForceNewMessage = true;
     }
     resetDraftLaneState(answerLane);
+    answerLaneHasAssistantContent = false;
     if (didForceNewMessage) {
       activePreviewLifecycleByLane.answer = "transient";
       retainPreviewOnCleanupByLane.answer = false;
@@ -626,6 +633,7 @@ export const dispatchTelegramMessage = async ({
       if (streamMode === "progress") {
         return;
       }
+      answerLaneHasAssistantContent = true;
       previewToolProgressSuppressed = true;
       previewToolProgressLines = [];
     }
@@ -777,6 +785,27 @@ export const dispatchTelegramMessage = async ({
       }
       return { ...payload, text };
     };
+    const applyTextToFollowUpPayload = (payload: ReplyPayload, text: string): ReplyPayload => {
+      const next = applyTextToPayload(payload, text);
+      const {
+        replyToId: _replyToId,
+        replyToCurrent: _replyToCurrent,
+        replyToTag: _replyToTag,
+        ...followUp
+      } = next;
+      return followUp;
+    };
+    const splitFinalTextForPreview = (text: string): string[] => {
+      const markdownChunks =
+        chunkMode === "newline"
+          ? chunkMarkdownTextWithMode(text, draftMaxChars, chunkMode)
+          : [text];
+      return markdownChunks.flatMap((chunk) =>
+        markdownToTelegramChunks(chunk, draftMaxChars, { tableMode }).map(
+          (telegramChunk) => telegramChunk.text,
+        ),
+      );
+    };
     const applyQuoteReplyTarget = (payload: ReplyPayload): ReplyPayload => {
       if (
         !implicitQuoteReplyTargetId ||
@@ -829,6 +858,8 @@ export const dispatchTelegramMessage = async ({
       retainPreviewOnCleanupByLane,
       draftMaxChars,
       applyTextToPayload,
+      applyTextToFollowUpPayload,
+      splitFinalTextForPreview,
       sendPayload,
       flushDraftLane,
       stopDraftLane: async (lane) => {
@@ -1025,10 +1056,6 @@ export const dispatchTelegramMessage = async ({
                         continue;
                       }
                       if (info.kind === "final") {
-                        if (reasoningLane.hasStreamedMessage) {
-                          activePreviewLifecycleByLane.reasoning = "complete";
-                          retainPreviewOnCleanupByLane.reasoning = true;
-                        }
                         reasoningStepState.resetForNextStep();
                       }
                     }
@@ -1174,18 +1201,22 @@ export const dispatchTelegramMessage = async ({
                       await statusReactionController.setTool(toolName);
                     }
                     await pushPreviewToolProgress(
-                      formatChannelProgressDraftLine({
-                        event: "tool",
-                        name: toolName,
-                        phase: payload.phase,
-                        args: payload.args,
-                      }),
+                      formatChannelProgressDraftLineForEntry(
+                        telegramCfg,
+                        {
+                          event: "tool",
+                          name: toolName,
+                          phase: payload.phase,
+                          args: payload.args,
+                        },
+                        payload.detailMode ? { detailMode: payload.detailMode } : undefined,
+                      ),
                       { toolName },
                     );
                   },
                   onItemEvent: async (payload) => {
                     await pushPreviewToolProgress(
-                      formatChannelProgressDraftLine({
+                      formatChannelProgressDraftLineForEntry(telegramCfg, {
                         event: "item",
                         itemKind: payload.kind,
                         title: payload.title,

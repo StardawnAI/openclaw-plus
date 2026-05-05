@@ -11,7 +11,6 @@ import {
   recoverInstalledLaunchAgentAfterUpdate,
   recoverLaunchAgentAndRecheckGatewayHealth,
   resolvePostInstallDoctorEnv,
-  resolveUpdateCommandChannel,
   shouldPrepareUpdatedInstallRestart,
   resolveUpdatedGatewayRestartPort,
   shouldUseLegacyProcessRestartAfterUpdate,
@@ -223,6 +222,37 @@ describe("collectMissingPluginInstallPayloads", () => {
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("skips disabled tracked records when requested", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-update-plugin-payload-"));
+    const missingDir = path.join(tmpDir, "state", "npm", "node_modules", "@openclaw", "missing");
+    try {
+      await expect(
+        collectMissingPluginInstallPayloads({
+          env: { HOME: tmpDir } as NodeJS.ProcessEnv,
+          skipDisabledPlugins: true,
+          config: {
+            plugins: {
+              entries: {
+                missing: {
+                  enabled: false,
+                },
+              },
+            },
+          },
+          records: {
+            missing: {
+              source: "npm",
+              spec: "@openclaw/missing@beta",
+              installPath: missingDir,
+            },
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("shouldUseLegacyProcessRestartAfterUpdate", () => {
@@ -237,43 +267,6 @@ describe("shouldUseLegacyProcessRestartAfterUpdate", () => {
     expect(shouldUseLegacyProcessRestartAfterUpdate({ updateMode: "unknown" })).toBe(true);
   });
 });
-
-describe("resolveUpdateCommandChannel", () => {
-  it("keeps package updates on beta when the installed core is beta", () => {
-    expect(
-      resolveUpdateCommandChannel({
-        updateInstallKind: "package",
-        currentVersion: "2026.5.3-beta.1",
-      }),
-    ).toBe("beta");
-  });
-
-  it("keeps installed beta packages on beta even with stale stable config", () => {
-    expect(
-      resolveUpdateCommandChannel({
-        storedChannel: "stable",
-        updateInstallKind: "package",
-        currentVersion: "2026.5.3-beta.1",
-      }),
-    ).toBe("beta");
-  });
-
-  it("lets an explicit requested channel override the installed beta version", () => {
-    expect(
-      resolveUpdateCommandChannel({
-        requestedChannel: "stable",
-        storedChannel: "beta",
-        updateInstallKind: "package",
-        currentVersion: "2026.5.3-beta.1",
-      }),
-    ).toBe("stable");
-  });
-
-  it("keeps git installs on the dev default", () => {
-    expect(resolveUpdateCommandChannel({ updateInstallKind: "git" })).toBe("dev");
-  });
-});
-
 describe("recoverInstalledLaunchAgentAfterUpdate", () => {
   it("re-bootstraps an installed-but-not-loaded macOS LaunchAgent after update", async () => {
     const service = {} as never;

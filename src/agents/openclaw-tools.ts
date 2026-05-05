@@ -94,6 +94,17 @@ function isToolAllowedByFactoryPolicy(params: {
   });
 }
 
+function isToolExplicitlyAllowedByFactoryPolicy(params: {
+  toolName: string;
+  allowlist?: string[];
+  denylist?: string[];
+}): boolean {
+  if (!params.allowlist?.some((entry) => typeof entry === "string" && entry.trim().length > 0)) {
+    return false;
+  }
+  return isToolAllowedByFactoryPolicy(params);
+}
+
 function mergeFactoryPolicyList(...lists: Array<string[] | undefined>): string[] | undefined {
   const merged = lists.flatMap((list) => (Array.isArray(list) ? list : []));
   return merged.length > 0 ? Array.from(new Set(merged)) : undefined;
@@ -260,6 +271,12 @@ export function createOpenClawTools(
     sandboxBrowserBridgeUrl?: string;
     allowHostBrowserControl?: boolean;
     agentSessionKey?: string;
+    /**
+     * The actual live run session key. When the tool is constructed with a sandbox/policy
+     * session key, this allows `session_status({sessionKey:"current"})` to resolve to
+     * the live run session instead of the stale sandbox key.
+     */
+    runSessionKey?: string;
     agentChannel?: GatewayMessageChannel;
     agentAccountId?: string;
     /** Delivery target for topic/thread routing. */
@@ -493,6 +510,19 @@ export function createOpenClawTools(
   const effectiveCallGateway = embedded
     ? createEmbeddedCallGateway()
     : openClawToolsDeps.callGateway;
+  const includeUpdatePlanTool =
+    isToolExplicitlyAllowedByFactoryPolicy({
+      toolName: "update_plan",
+      allowlist: mergeFactoryPolicyList(resolvedConfig?.tools?.allow, options?.pluginToolAllowlist),
+      denylist: mergeFactoryPolicyList(resolvedConfig?.tools?.deny, options?.pluginToolDenylist),
+    }) ||
+    isUpdatePlanToolEnabledForOpenClawTools({
+      config: resolvedConfig,
+      agentSessionKey: options?.agentSessionKey,
+      agentId: options?.requesterAgentIdOverride,
+      modelProvider: options?.modelProvider,
+      modelId: options?.modelId,
+    });
   const tools: AnyAgentTool[] = [
     ...(embedded
       ? []
@@ -533,15 +563,7 @@ export function createOpenClawTools(
       agentSessionKey: options?.agentSessionKey,
       requesterAgentIdOverride: options?.requesterAgentIdOverride,
     }),
-    ...(isUpdatePlanToolEnabledForOpenClawTools({
-      config: resolvedConfig,
-      agentSessionKey: options?.agentSessionKey,
-      agentId: options?.requesterAgentIdOverride,
-      modelProvider: options?.modelProvider,
-      modelId: options?.modelId,
-    })
-      ? [createUpdatePlanTool()]
-      : []),
+    ...(includeUpdatePlanTool ? [createUpdatePlanTool()] : []),
     createSessionsListTool({
       agentSessionKey: options?.agentSessionKey,
       sandboxed: options?.sandboxed,
@@ -589,6 +611,7 @@ export function createOpenClawTools(
     }),
     createSessionStatusTool({
       agentSessionKey: options?.agentSessionKey,
+      runSessionKey: options?.runSessionKey,
       config: resolvedConfig,
       sandboxed: options?.sandboxed,
     }),

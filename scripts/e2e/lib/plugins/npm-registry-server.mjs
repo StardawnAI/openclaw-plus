@@ -38,7 +38,7 @@ for (let index = 0; index < packageArgs.length; index += 3) {
 
 const metadataFor = (entry, baseUrl) => ({
   name: entry.packageName,
-  "dist-tags": { latest: entry.latestVersion, beta: entry.latestVersion },
+  "dist-tags": { latest: entry.latestVersion },
   versions: Object.fromEntries(
     [...entry.versions.entries()].map(([version, versionEntry]) => [
       version,

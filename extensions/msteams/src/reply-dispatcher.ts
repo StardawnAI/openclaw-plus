@@ -1,5 +1,6 @@
 import {
   formatChannelProgressDraftLine,
+  formatChannelProgressDraftLineForEntry,
   resolveChannelPreviewStreamMode,
   resolveChannelStreamingBlockEnabled,
 } from "openclaw/plugin-sdk/channel-streaming";
@@ -381,14 +382,19 @@ export function createMSTeamsReplyDispatcher(params: {
               name?: string;
               phase?: string;
               args?: Record<string, unknown>;
+              detailMode?: "explain" | "raw";
             }) => {
               await streamController.pushProgressLine(
-                formatChannelProgressDraftLine({
-                  event: "tool",
-                  name: payload.name,
-                  phase: payload.phase,
-                  args: payload.args,
-                }),
+                formatChannelProgressDraftLineForEntry(
+                  msteamsCfg,
+                  {
+                    event: "tool",
+                    name: payload.name,
+                    phase: payload.phase,
+                    args: payload.args,
+                  },
+                  payload.detailMode ? { detailMode: payload.detailMode } : undefined,
+                ),
                 { toolName: payload.name },
               );
             },
@@ -403,7 +409,7 @@ export function createMSTeamsReplyDispatcher(params: {
               status?: string;
             }) => {
               await streamController.pushProgressLine(
-                formatChannelProgressDraftLine({
+                formatChannelProgressDraftLineForEntry(msteamsCfg, {
                   event: "item",
                   itemKind: payload.kind,
                   title: payload.title,

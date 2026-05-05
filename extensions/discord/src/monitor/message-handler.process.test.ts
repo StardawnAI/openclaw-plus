@@ -102,6 +102,7 @@ type DispatchInboundParams = {
       name?: string;
       phase?: string;
       args?: Record<string, unknown>;
+      detailMode?: "explain" | "raw";
     }) => Promise<void> | void;
     onItemEvent?: (payload: {
       progressText?: string;
@@ -138,9 +139,11 @@ type DispatchInboundParams = {
 };
 const dispatchInboundMessage = vi.hoisted(() =>
   vi.fn<
-    (
-      params?: DispatchInboundParams,
-    ) => Promise<{ queuedFinal: boolean; counts: { final: number; tool: number; block: number } }>
+    (params?: DispatchInboundParams) => Promise<{
+      queuedFinal: boolean;
+      counts: { final: number; tool: number; block: number };
+      failedCounts?: { final?: number; tool?: number; block?: number };
+    }>
   >(async (_params?: DispatchInboundParams) => ({
     queuedFinal: false,
     counts: { final: 0, tool: 0, block: 0 },
@@ -618,6 +621,22 @@ describe("processDiscordMessage ack reactions", () => {
     expect(emojis).toContain(DEFAULT_EMOJIS.done);
     expect(emojis).not.toContain(DEFAULT_EMOJIS.thinking);
     expect(emojis).not.toContain(DEFAULT_EMOJIS.coding);
+  });
+
+  it("marks automatic visible replies as failed when final Discord delivery fails", async () => {
+    dispatchInboundMessage.mockResolvedValueOnce({
+      queuedFinal: false,
+      counts: { final: 0, tool: 0, block: 0 },
+      failedCounts: { final: 1 },
+    });
+
+    const ctx = await createAutomaticSourceDeliveryContext();
+
+    await runProcessDiscordMessage(ctx);
+
+    const emojis = getReactionEmojis();
+    expect(emojis).toContain(DEFAULT_EMOJIS.error);
+    expect(emojis).not.toContain(DEFAULT_EMOJIS.done);
   });
 
   it("can bind status reactions to an explicitly tracked reaction target", async () => {
@@ -1534,6 +1553,69 @@ describe("processDiscordMessage draft streaming", () => {
     );
   });
 
+  it("uses raw tool-progress detail in Discord progress drafts", async () => {
+    const draftStream = createMockDraftStreamForTest();
+
+    dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {
+      await params?.replyOptions?.onToolStart?.({
+        name: "exec",
+        phase: "start",
+        args: { command: "pnpm test -- --watch=false" },
+        detailMode: "raw",
+      });
+      await params?.replyOptions?.onItemEvent?.({ progressText: "done" });
+      return createNoQueuedDispatchResult();
+    });
+
+    const ctx = await createAutomaticSourceDeliveryContext({
+      discordConfig: {
+        streaming: {
+          mode: "progress",
+          progress: {
+            label: "Shelling",
+          },
+        },
+      },
+    });
+
+    await runProcessDiscordMessage(ctx);
+
+    expect(draftStream.update).toHaveBeenCalledWith(
+      "Shelling\n🛠️ Exec: run tests, `pnpm test -- --watch=false`\n• done",
+    );
+  });
+
+  it("can hide raw command progress text in Discord progress drafts by config", async () => {
+    const draftStream = createMockDraftStreamForTest();
+
+    dispatchInboundMessage.mockImplementationOnce(async (params?: DispatchInboundParams) => {
+      await params?.replyOptions?.onToolStart?.({
+        name: "exec",
+        phase: "start",
+        args: { command: "pnpm test -- --watch=false" },
+        detailMode: "raw",
+      });
+      await params?.replyOptions?.onItemEvent?.({ progressText: "done" });
+      return createNoQueuedDispatchResult();
+    });
+
+    const ctx = await createAutomaticSourceDeliveryContext({
+      discordConfig: {
+        streaming: {
+          mode: "progress",
+          progress: {
+            label: "Shelling",
+            commandText: "status",
+          },
+        },
+      },
+    });
+
+    await runProcessDiscordMessage(ctx);
+
+    expect(draftStream.update).toHaveBeenCalledWith("Shelling\n🛠️ Exec\n• done");
+  });
+
   it("keeps Discord progress lines across assistant boundaries", async () => {
     const draftStream = createMockDraftStreamForTest();
 
@@ -1561,7 +1643,7 @@ describe("processDiscordMessage draft streaming", () => {
     expect(draftStream.forceNewMessage).not.toHaveBeenCalled();
   });
 
-  it("keeps standalone Discord tool progress when partial preview lines are disabled", async () => {
+  it("suppresses standalone Discord tool progress when partial preview lines are disabled", async () => {
     createMockDraftStreamForTest();
 
     dispatchInboundMessage.mockImplementationOnce(async () => createNoQueuedDispatchResult());
@@ -1581,7 +1663,7 @@ describe("processDiscordMessage draft streaming", () => {
 
     expect(
       dispatchInboundMessage.mock.calls[0]?.[0]?.replyOptions?.suppressDefaultToolProgressMessages,
-    ).toBeUndefined();
+    ).toBe(true);
   });
 
   it("strips reply tags from preview partials", async () => {

@@ -132,42 +132,6 @@ describe("telegram doctor", () => {
     );
   });
 
-  it("normalizes legacy telegram streaming progress config", () => {
-    const normalize = telegramDoctor.normalizeCompatibilityConfig;
-    expect(normalize).toBeDefined();
-    if (!normalize) {
-      return;
-    }
-
-    const result = normalize({
-      cfg: {
-        channels: {
-          telegram: {
-            streaming: {
-              mode: "partial",
-              progress: {
-                label: "Working",
-                maxLines: 3,
-                toolProgress: false,
-              },
-            },
-          },
-        },
-      } as never,
-    });
-
-    expect(result.config.channels?.telegram?.streaming).toEqual({
-      mode: "partial",
-      preview: {
-        toolProgress: false,
-      },
-    });
-    expect(result.changes).toEqual([
-      "Moved channels.telegram.streaming.progress.toolProgress → channels.telegram.streaming.preview.toolProgress.",
-      "Removed channels.telegram.streaming.progress legacy object.",
-    ]);
-  });
-
   it("does not duplicate streaming.mode change messages when streamMode wins over boolean streaming", () => {
     const normalize = telegramDoctor.normalizeCompatibilityConfig;
     expect(normalize).toBeDefined();
