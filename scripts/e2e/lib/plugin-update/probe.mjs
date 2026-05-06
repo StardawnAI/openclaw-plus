@@ -130,8 +130,12 @@ function assertCorruptPluginResult(pluginJsonPath, pluginId) {
 }
 
 function assertCorruptPluginTolerated(plugins, pluginId) {
+  const evidence = collectPluginEvidence(plugins, pluginId);
   if (plugins.status === "ok") {
-    assertCorruptPluginCleanOrRepaired(plugins, pluginId);
+    if (isCorruptPluginDisabledAfterUpdate(evidence, pluginId)) {
+      return;
+    }
+    assertCorruptPluginCleanOrRepaired(evidence);
     return;
   }
   if (plugins.status !== "warning") {
@@ -142,8 +146,17 @@ function assertCorruptPluginTolerated(plugins, pluginId) {
   assertCorruptPluginDetails(plugins, pluginId);
 }
 
-function assertCorruptPluginCleanOrRepaired(plugins, pluginId) {
-  const evidence = collectPluginEvidence(plugins, pluginId);
+function isCorruptPluginDisabledAfterUpdate(evidence, pluginId) {
+  const outcome = evidence.outcome;
+  const message = typeof outcome?.message === "string" ? outcome.message : "";
+  return (
+    outcome?.status === "skipped" &&
+    message.includes(`Disabled "${pluginId}" after plugin update failure`) &&
+    message.includes("OpenClaw will continue without it")
+  );
+}
+
+function assertCorruptPluginCleanOrRepaired(evidence) {
   if (evidence.outcome) {
     throw new Error(
       `expected clean or repaired corrupt plugin state, got ${JSON.stringify(evidence)}`,
