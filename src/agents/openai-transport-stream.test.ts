@@ -890,8 +890,8 @@ describe("openai transport stream", () => {
   it("uses system role instead of developer for responses providers that disable developer role", () => {
     const params = buildOpenAIResponsesParams(
       {
-        id: "grok-4.1-fast",
-        name: "Grok 4.1 Fast",
+        id: "grok-4.3",
+        name: "Grok 4.3",
         api: "openai-responses",
         provider: "xai",
         baseUrl: "https://api.x.ai/v1",
@@ -906,10 +906,11 @@ describe("openai transport stream", () => {
         messages: [],
         tools: [],
       } as never,
-      undefined,
-    ) as { input?: Array<{ role?: string }> };
+      { reasoningEffort: "high" },
+    ) as { input?: Array<{ role?: string }>; reasoning?: unknown };
 
     expect(params.input?.[0]).toMatchObject({ role: "system" });
+    expect(params).not.toHaveProperty("reasoning");
   });
 
   it("keeps developer role for native OpenAI reasoning responses models", () => {

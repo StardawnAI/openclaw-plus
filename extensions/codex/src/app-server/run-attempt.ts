@@ -97,6 +97,12 @@ import {
   startOrResumeThread,
 } from "./thread-lifecycle.js";
 import {
+  inferCodexDynamicToolMeta,
+  resolveCodexToolProgressDetailMode,
+  sanitizeCodexToolArguments,
+  sanitizeCodexToolResponse,
+} from "./tool-progress-normalization.js";
+import {
   createCodexTrajectoryRecorder,
   normalizeCodexTrajectoryError,
   recordCodexTrajectoryCompletion,
@@ -963,6 +969,19 @@ export async function runCodexAppServerAttempt(
         name: call.tool,
         arguments: call.arguments,
       });
+      const toolProgressDetailMode = resolveCodexToolProgressDetailMode(params.toolProgressDetail);
+      const toolMeta = inferCodexDynamicToolMeta(call, toolProgressDetailMode);
+      const toolArgs = sanitizeCodexToolArguments(call.arguments);
+      emitCodexAppServerEvent(params, {
+        stream: "tool",
+        data: {
+          phase: "start",
+          name: call.tool,
+          toolCallId: call.callId,
+          ...(toolMeta ? { meta: toolMeta } : {}),
+          ...(toolArgs ? { args: toolArgs } : {}),
+        },
+      });
       const response = await handleDynamicToolCallWithTimeout({
         call,
         toolBridge,
@@ -985,6 +1004,17 @@ export async function runCodexAppServerAttempt(
         name: call.tool,
         success: response.success,
         contentItems: response.contentItems,
+      });
+      emitCodexAppServerEvent(params, {
+        stream: "tool",
+        data: {
+          phase: "result",
+          name: call.tool,
+          toolCallId: call.callId,
+          ...(toolMeta ? { meta: toolMeta } : {}),
+          isError: !response.success,
+          result: sanitizeCodexToolResponse(response),
+        },
       });
       return response as JsonValue;
     } finally {
