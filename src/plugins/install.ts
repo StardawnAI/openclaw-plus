@@ -9,6 +9,7 @@ import {
 import { resolveNpmIntegrityDriftWithDefaultMessage } from "../infra/npm-integrity.js";
 import {
   readManagedNpmRootInstalledDependency,
+  readOpenClawManagedNpmRootOverrides,
   repairManagedNpmRootOpenClawPeer,
   removeManagedNpmRootDependency,
   resolveManagedNpmRootDependencySpec,
@@ -1369,12 +1370,15 @@ export async function installPluginFromNpmSpec(
       parsedSpec,
       resolution: npmResolution,
     }),
+    managedOverrides: await readOpenClawManagedNpmRootOverrides(),
   });
   const install = await runCommandWithTimeout(
     [
       "npm",
       ...createSafeNpmInstallArgs({
         omitDev: true,
+        omitPeer: true,
+        legacyPeerDeps: true,
         loglevel: "error",
         noAudit: true,
         noFund: true,
@@ -1385,7 +1389,11 @@ export async function installPluginFromNpmSpec(
     {
       cwd: npmRoot,
       timeoutMs: Math.max(timeoutMs, 300_000),
-      env: createSafeNpmInstallEnv(process.env, { packageLock: true, quiet: true }),
+      env: createSafeNpmInstallEnv(process.env, {
+        legacyPeerDeps: true,
+        packageLock: true,
+        quiet: true,
+      }),
     },
   );
   if (install.code !== 0) {

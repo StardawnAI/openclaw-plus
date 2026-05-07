@@ -4677,6 +4677,7 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
     public let severity: String?
     public let toolname: String?
     public let toolcallid: String?
+    public let alloweddecisions: [String]?
     public let agentid: String?
     public let sessionkey: String?
     public let turnsourcechannel: String?
@@ -4693,6 +4694,7 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
         severity: String?,
         toolname: String?,
         toolcallid: String?,
+        alloweddecisions: [String]?,
         agentid: String?,
         sessionkey: String?,
         turnsourcechannel: String?,
@@ -4708,6 +4710,7 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
         self.severity = severity
         self.toolname = toolname
         self.toolcallid = toolcallid
+        self.alloweddecisions = alloweddecisions
         self.agentid = agentid
         self.sessionkey = sessionkey
         self.turnsourcechannel = turnsourcechannel
@@ -4725,6 +4728,7 @@ public struct PluginApprovalRequestParams: Codable, Sendable {
         case severity
         case toolname = "toolName"
         case toolcallid = "toolCallId"
+        case alloweddecisions = "allowedDecisions"
         case agentid = "agentId"
         case sessionkey = "sessionKey"
         case turnsourcechannel = "turnSourceChannel"

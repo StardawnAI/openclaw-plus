@@ -755,6 +755,50 @@ describe("handleToolExecutionEnd derived tool events", () => {
     );
   });
 
+  it("caps oversized exec live update payloads", async () => {
+    resetAgentEventsForTest();
+    const events: Array<{ stream?: string; data?: Record<string, unknown> }> = [];
+    registerAgentEventListener((evt) => {
+      events.push(evt as never);
+    });
+    try {
+      const { ctx } = createTestContext();
+      const aggregated = `head-${"x".repeat(90 * 1024)}-tail`;
+
+      await handleToolExecutionStart(
+        ctx as never,
+        {
+          type: "tool_execution_start",
+          toolName: "exec",
+          toolCallId: "tool-exec-update-long-output",
+          args: { command: "yes" },
+        } as never,
+      );
+
+      handleToolExecutionUpdate(
+        ctx as never,
+        {
+          type: "tool_execution_update",
+          toolName: "exec",
+          toolCallId: "tool-exec-update-long-output",
+          partialResult: { details: { aggregated } },
+        } as never,
+      );
+
+      const updateEvent = events.findLast(
+        (evt) => evt.stream === "tool" && (evt.data as { phase?: string })?.phase === "update",
+      );
+      const partialResult = updateEvent?.data?.partialResult as
+        | { details?: { aggregated?: string } }
+        | undefined;
+      expect(partialResult?.details?.aggregated).toContain("live command output truncated");
+      expect(partialResult?.details?.aggregated).toContain("-tail");
+      expect(partialResult?.details?.aggregated).not.toContain("head-");
+    } finally {
+      resetAgentEventsForTest();
+    }
+  });
+
   it("emits command output events for exec results", async () => {
     const { ctx, onAgentEvent } = createTestContext();
 
