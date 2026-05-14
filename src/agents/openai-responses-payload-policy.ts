@@ -46,7 +46,6 @@ type OpenAIResponsesPayloadPolicy = {
   compactThreshold: number;
   explicitStore: boolean | undefined;
   shouldStripDisabledReasoningPayload: boolean;
-  shouldStripReasoningPayload: boolean;
   shouldStripPromptCache: boolean;
   shouldStripStore: boolean;
   useServerCompaction: boolean;
@@ -317,14 +316,6 @@ function stripDisabledOpenAIReasoningPayload(payloadObj: Record<string, unknown>
   }
 }
 
-function shouldStripAllOpenAIResponsesReasoningPayload(
-  model: OpenAIResponsesPayloadModel,
-  capabilities: OpenAIResponsesPayloadCapabilities,
-): boolean {
-  const provider = normalizeLowercaseString(model.provider);
-  return provider === "xai" && !capabilities.usesKnownNativeOpenAIRoute;
-}
-
 export function resolveOpenAIResponsesPayloadPolicy(
   model: OpenAIResponsesPayloadModel,
   options: OpenAIResponsesPayloadPolicyOptions = {},
@@ -345,8 +336,6 @@ export function resolveOpenAIResponsesPayloadPolicy(
   const shouldStripDisabledReasoningPayload =
     isResponsesApi &&
     (!capabilities.usesKnownNativeOpenAIRoute || !supportsOpenAIReasoningEffort(model, "none"));
-  const shouldStripReasoningPayload =
-    isResponsesApi && shouldStripAllOpenAIResponsesReasoningPayload(model, capabilities);
 
   return {
     allowsServiceTier: capabilities.allowsOpenAIServiceTier,
@@ -355,7 +344,6 @@ export function resolveOpenAIResponsesPayloadPolicy(
       resolveOpenAIResponsesCompactThreshold(model),
     explicitStore,
     shouldStripDisabledReasoningPayload,
-    shouldStripReasoningPayload,
     shouldStripPromptCache:
       options.enablePromptCacheStripping === true && capabilities.shouldStripResponsesPromptCache,
     shouldStripStore:
@@ -385,9 +373,6 @@ export function applyOpenAIResponsesPayloadPolicy(
   if (policy.shouldStripPromptCache) {
     delete payloadObj.prompt_cache_key;
     delete payloadObj.prompt_cache_retention;
-  }
-  if (policy.shouldStripReasoningPayload) {
-    delete payloadObj.reasoning;
   }
   if (policy.useServerCompaction && payloadObj.context_management === undefined) {
     payloadObj.context_management = [

@@ -1,4 +1,4 @@
-import type { Model } from "@mariozechner/pi-ai";
+import type { Model } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
   applyOpenAIResponsesPayloadPolicy,
@@ -20,16 +20,15 @@ describe("openai responses payload policy", () => {
       maxTokens: 8192,
     } satisfies Model<"openai-responses">;
 
-    expect(
-      resolveOpenAIResponsesPayloadPolicy(model, { storeMode: "provider-policy" }),
-    ).toMatchObject({
-      explicitStore: true,
-      allowsServiceTier: true,
+    const providerPolicy = resolveOpenAIResponsesPayloadPolicy(model, {
+      storeMode: "provider-policy",
     });
-    expect(resolveOpenAIResponsesPayloadPolicy(model, { storeMode: "disable" })).toMatchObject({
-      explicitStore: false,
-      allowsServiceTier: true,
-    });
+    expect(providerPolicy.explicitStore).toBe(true);
+    expect(providerPolicy.allowsServiceTier).toBe(true);
+
+    const disablePolicy = resolveOpenAIResponsesPayloadPolicy(model, { storeMode: "disable" });
+    expect(disablePolicy.explicitStore).toBe(false);
+    expect(disablePolicy.allowsServiceTier).toBe(true);
   });
 
   it("couples native Responses server compaction to provider-managed store", () => {
@@ -160,46 +159,18 @@ describe("openai responses payload policy", () => {
     expect(payload).not.toHaveProperty("reasoning");
   });
 
-  it("strips explicit reasoning payloads for xAI responses routes", () => {
-    const payload = {
-      reasoning: {
-        effort: "high",
-        summary: "auto",
+  it("emits store false for native OpenAI Codex responses disable mode", () => {
+    const policy = resolveOpenAIResponsesPayloadPolicy(
+      {
+        api: "openai-codex-responses",
+        provider: "openai-codex",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
       },
-    } satisfies Record<string, unknown>;
-
-    applyOpenAIResponsesPayloadPolicy(
-      payload,
-      resolveOpenAIResponsesPayloadPolicy(
-        {
-          api: "openai-responses",
-          provider: "xai",
-          id: "grok-4.3",
-          baseUrl: "https://api.x.ai/v1",
-        },
-        { storeMode: "disable" },
-      ),
+      { storeMode: "disable" },
     );
 
-    expect(payload).toEqual({
-      store: false,
-    });
-  });
-
-  it("emits store false for native OpenAI Codex responses disable mode", () => {
-    expect(
-      resolveOpenAIResponsesPayloadPolicy(
-        {
-          api: "openai-codex-responses",
-          provider: "openai-codex",
-          baseUrl: "https://chatgpt.com/backend-api/codex",
-        },
-        { storeMode: "disable" },
-      ),
-    ).toMatchObject({
-      explicitStore: false,
-      allowsServiceTier: true,
-      shouldStripStore: false,
-    });
+    expect(policy.explicitStore).toBe(false);
+    expect(policy.allowsServiceTier).toBe(true);
+    expect(policy.shouldStripStore).toBe(false);
   });
 });
