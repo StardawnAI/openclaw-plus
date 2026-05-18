@@ -130,6 +130,8 @@ function buildPreparedCliRunContext(params: {
       ...(params.mcpConfigHash ? { mcpConfigHash: params.mcpConfigHash } : {}),
     },
     reusableCliSession: {},
+    hadSessionFile: false,
+    contextEngineConfig: {},
     modelId: params.model,
     normalizedModel: params.model,
     systemPrompt: "You are a helpful assistant.",
@@ -272,6 +274,8 @@ describe("runCliAgent spawn path", () => {
         env: {},
       },
       reusableCliSession: {},
+      hadSessionFile: false,
+      contextEngineConfig: {},
       modelId: "sonnet",
       normalizedModel: "sonnet",
       systemPrompt: "You are a helpful assistant.",
@@ -281,7 +285,7 @@ describe("runCliAgent spawn path", () => {
     };
     await executePreparedCliRun(context);
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as { argv?: string[] };
+    const input = mockCallArg(supervisorSpawnMock) as { argv?: string[] };
     const allArgs = (input.argv ?? []).join("\n");
     expect(allArgs).not.toContain("Tools are disabled in this session");
     expect(allArgs).toContain("You are a helpful assistant.");
@@ -331,7 +335,7 @@ describe("runCliAgent spawn path", () => {
       }),
     );
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       argv?: string[];
       input?: string;
     };
@@ -383,7 +387,7 @@ describe("runCliAgent spawn path", () => {
       }),
     );
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       argv?: string[];
       input?: string;
       mode?: string;
@@ -415,7 +419,7 @@ describe("runCliAgent spawn path", () => {
     expect(resolveArgsInput.thinkingLevel).toBe("high");
     expect(resolveArgsInput.useResume).toBe(false);
     expect(resolveArgsInput.baseArgs).toEqual(["-p", "--output-format", "stream-json"]);
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as { argv?: string[] };
+    const input = mockCallArg(supervisorSpawnMock) as { argv?: string[] };
     expect(requireArgAfter(input.argv, "--effort")).toBe("high");
   });
 
@@ -655,7 +659,7 @@ describe("runCliAgent spawn path", () => {
     const result = await executePreparedCliRun(context, "thread-123");
 
     expect(result.text).toBe("ok");
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       argv?: string[];
       mode?: string;
       timeoutMs?: number;
@@ -917,7 +921,7 @@ describe("runCliAgent spawn path", () => {
         }),
       );
 
-      const spawnInput = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+      const spawnInput = mockCallArg(supervisorSpawnMock) as {
         argv?: string[];
         stdinMode?: string;
       };
@@ -2162,7 +2166,7 @@ describe("runCliAgent spawn path", () => {
       "thread-123",
     );
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       env?: Record<string, string | undefined>;
     };
     expect(input.env?.SAFE_KEY).toBe("ok");
@@ -2190,7 +2194,7 @@ describe("runCliAgent spawn path", () => {
       "thread-123",
     );
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       env?: Record<string, string | undefined>;
     };
     expect(input.env?.SAFE_KEEP).toBe("keep-me");
@@ -2214,7 +2218,7 @@ describe("runCliAgent spawn path", () => {
         "thread-123",
       );
 
-      const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+      const input = mockCallArg(supervisorSpawnMock) as {
         env?: Record<string, string | undefined>;
       };
       expect(input.env?.SAFE_CLEAR).toBe("from-base");
@@ -2243,7 +2247,7 @@ describe("runCliAgent spawn path", () => {
       "thread-123",
     );
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       env?: Record<string, string | undefined>;
     };
     expect(input.env?.SAFE_OVERRIDE).toBe("from-override");
@@ -2299,7 +2303,7 @@ describe("runCliAgent spawn path", () => {
       }),
     );
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       env?: Record<string, string | undefined>;
     };
     expect(input.env?.SAFE_KEEP).toBe("ok");
@@ -2369,7 +2373,7 @@ describe("runCliAgent spawn path", () => {
 
     await executePreparedCliRun(context, "thread-123");
 
-    const input = supervisorSpawnMock.mock.calls.at(0)?.[0] as {
+    const input = mockCallArg(supervisorSpawnMock) as {
       argv?: string[];
       input?: string;
     };

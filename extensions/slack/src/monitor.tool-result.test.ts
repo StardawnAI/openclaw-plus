@@ -366,39 +366,6 @@ describe("monitorSlackProvider tool results", () => {
     expect(replyMock).not.toHaveBeenCalled();
   });
 
-  it("does not derive responsePrefix from routed agent identity when unset", async () => {
-    slackTestState.config = {
-      agents: {
-        list: [
-          {
-            id: "main",
-            default: true,
-            identity: { name: "Mainbot", theme: "space lobster", emoji: "🦞" },
-          },
-          {
-            id: "rich",
-            identity: { name: "Richbot", theme: "lion bot", emoji: "🦁" },
-          },
-        ],
-      },
-      bindings: [
-        {
-          agentId: "rich",
-          match: { channel: "slack", peer: { kind: "direct", id: "U1" } },
-        },
-      ],
-      messages: {
-        ackReaction: "👀",
-        ackReactionScope: "group-mentions",
-      },
-      channels: {
-        slack: { dm: { enabled: true, policy: "open", allowFrom: ["*"] } },
-      },
-    };
-
-    await runDefaultMessageAndExpectSentText("final reply");
-  });
-
   it("includes recent channel history in Body when requireMention is false", async () => {
     setHistoryCaptureConfig({ "*": { requireMention: false } });
     const capturedCtx = captureReplyContexts<{
@@ -556,6 +523,9 @@ describe("monitorSlackProvider tool results", () => {
       messages: {
         ackReaction: "👀",
         ackReactionScope: "all",
+        groupChat: {
+          unmentionedInbound: "room_event",
+        },
         statusReactions: {
           enabled: true,
           timing: { debounceMs: 0, doneHoldMs: 0, errorHoldMs: 0 },
@@ -757,9 +727,9 @@ describe("monitorSlackProvider tool results", () => {
 
     expect(sendMock).not.toHaveBeenCalled();
     expectReactionFlow({
-      startsWith: ["eyes", "scream"],
-      includes: "scream",
-      endsWith: "scream",
+      startsWith: ["eyes", "x"],
+      includes: "x",
+      endsWith: "x",
     });
   });
 
@@ -820,7 +790,7 @@ describe("monitorSlackProvider tool results", () => {
 
     expect(replyMock).toHaveBeenCalledTimes(1);
     const ctx = getFirstReplySessionCtx();
-    expect(ctx.SessionKey).toBe("agent:main:main:thread:123");
+    expect(ctx.SessionKey).toBe("agent:main:main");
     expect(ctx.ParentSessionKey).toBeUndefined();
   });
 

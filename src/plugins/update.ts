@@ -6,6 +6,7 @@ import type { NpmSpecResolution } from "../infra/install-source-utils.js";
 import { resolveNpmSpecMetadata } from "../infra/install-source-utils.js";
 import {
   compareOpenClawReleaseVersions,
+  isOpenClawOrgNpmSpec,
   isPrereleaseResolutionAllowed,
   parseRegistryNpmSpec,
 } from "../infra/npm-registry-spec.js";
@@ -48,6 +49,7 @@ import {
   resolveOfficialExternalPluginInstall,
 } from "./official-external-plugin-catalog.js";
 import { linkOpenClawPeerDependencies } from "./plugin-peer-link.js";
+import { defaultSlotIdForKey } from "./slots.js";
 
 export type PluginUpdateLogger = {
   info?: (message: string) => void;
@@ -427,15 +429,25 @@ function isExternalizedBundledPluginEnabled(params: {
   return false;
 }
 
-function shouldFallbackClawHubBridgeToNpm(result: { ok: false; code?: string }): boolean {
+function shouldFallbackClawHubBridgeToNpm(params: {
+  result: { ok: false; code?: string };
+  npmSpec?: string;
+}): boolean {
+  if (!isOpenClawOrgNpmSpec(params.npmSpec)) {
+    return false;
+  }
   return (
-    result.code === CLAWHUB_INSTALL_ERROR_CODE.PACKAGE_NOT_FOUND ||
-    result.code === CLAWHUB_INSTALL_ERROR_CODE.VERSION_NOT_FOUND
+    params.result.code === CLAWHUB_INSTALL_ERROR_CODE.PACKAGE_NOT_FOUND ||
+    params.result.code === CLAWHUB_INSTALL_ERROR_CODE.VERSION_NOT_FOUND ||
+    params.result.code === CLAWHUB_INSTALL_ERROR_CODE.ARTIFACT_DOWNLOAD_UNAVAILABLE
   );
 }
 
 function shouldFallbackBetaClawHubUpdate(result: { ok: false; code?: string }): boolean {
-  return shouldFallbackClawHubBridgeToNpm(result);
+  return (
+    result.code === CLAWHUB_INSTALL_ERROR_CODE.PACKAGE_NOT_FOUND ||
+    result.code === CLAWHUB_INSTALL_ERROR_CODE.VERSION_NOT_FOUND
+  );
 }
 
 function describeBetaNpmFallback(params: {
@@ -760,14 +772,52 @@ function createPluginUpdateIntegrityDriftHandler(params: {
   };
 }
 
+function removeDisabledPluginIdFromList(
+  list: string[] | undefined,
+  pluginId: string,
+): string[] | undefined {
+  if (!Array.isArray(list) || !list.includes(pluginId)) {
+    return list;
+  }
+  const next = list.filter((id) => id !== pluginId);
+  return next.length > 0 ? next : undefined;
+}
+
+function resetDisabledPluginSlots(
+  slots: NonNullable<OpenClawConfig["plugins"]>["slots"] | undefined,
+  pluginId: string,
+): NonNullable<OpenClawConfig["plugins"]>["slots"] | undefined {
+  if (!slots) {
+    return slots;
+  }
+  let next = slots;
+  if (next.memory === pluginId) {
+    next = {
+      ...next,
+      memory: defaultSlotIdForKey("memory"),
+    };
+  }
+  if (next.contextEngine === pluginId) {
+    next = {
+      ...next,
+      contextEngine: defaultSlotIdForKey("contextEngine"),
+    };
+  }
+  return next;
+}
+
 function disablePluginConfigEntry(config: OpenClawConfig, pluginId: string): OpenClawConfig {
-  const existingEntry = config.plugins?.entries?.[pluginId];
+  const pluginsConfig = config.plugins ?? {};
+  const existingEntry = pluginsConfig.entries?.[pluginId];
   return {
     ...config,
     plugins: {
-      ...config.plugins,
+      ...pluginsConfig,
+      allow: removeDisabledPluginIdFromList(pluginsConfig.allow, pluginId),
+      deny: removeDisabledPluginIdFromList(pluginsConfig.deny, pluginId),
+      slots: resetDisabledPluginSlots(pluginsConfig.slots, pluginId),
       entries: {
-        ...config.plugins?.entries,
+        ...pluginsConfig.entries,
         [pluginId]: {
           ...existingEntry,
           enabled: false,
@@ -1702,7 +1752,7 @@ export async function syncPluginsForUpdateChannel(params: {
           expectedPluginId: targetPluginId,
           logger,
         });
-        if (!result.ok && npmSpec && shouldFallbackClawHubBridgeToNpm(result)) {
+        if (!result.ok && npmSpec && shouldFallbackClawHubBridgeToNpm({ result, npmSpec })) {
           const warning = `ClawHub ${clawhubSpec} unavailable for ${targetPluginId}; falling back to npm ${npmSpec}.`;
           summary.warnings.push(warning);
           logger.warn?.(warning);

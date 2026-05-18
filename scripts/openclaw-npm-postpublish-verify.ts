@@ -13,7 +13,7 @@ import {
 import { builtinModules } from "node:module";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { formatErrorMessage } from "../src/infra/errors.ts";
 import { BUNDLED_RUNTIME_SIDECAR_PATHS } from "../src/plugins/runtime-sidecar-paths.ts";
@@ -69,11 +69,6 @@ const OPTIONAL_OR_EXTERNALIZED_RUNTIME_IMPORTS = new Set([
   // Discord voice decoder fallback. The root chunk catches missing decoders and the owning
   // Discord plugin remains externalized from the root package.
   "opusscript",
-  // Slack remains an official externalized channel plugin. Root dist can retain
-  // orphaned lazy chunks from the plugin build even though dist/extensions/slack
-  // is externalized from the root package scan.
-  "@slack/bolt",
-  "@slack/web-api",
   // Public plugin SDK contract helpers are intentionally test-only entrypoints.
   // Consumers importing them run under their own Vitest dev dependency.
   "vitest",
@@ -134,6 +129,7 @@ export function collectInstalledPackageErrors(params: {
   }
 
   errors.push(...collectInstalledContextEngineRuntimeErrors(params.packageRoot));
+  errors.push(...collectInstalledPluginSdkZodArtifactErrors(params.packageRoot));
   errors.push(...collectInstalledRootDependencyManifestErrors(params.packageRoot));
 
   return errors;
@@ -166,7 +162,7 @@ export function collectInstalledBundledRuntimeSidecarPaths(packageRoot: string):
 
 export function normalizeInstalledBinaryVersion(output: string): string {
   const trimmed = output.trim();
-  const versionMatch = /\b\d{4}\.\d{1,2}\.\d{1,2}(?:-\d+|-beta\.\d+)?\b/u.exec(trimmed);
+  const versionMatch = /\b\d{4}\.\d{1,2}\.\d{1,2}(?:-\d+|-(?:alpha|beta)\.\d+)?\b/u.exec(trimmed);
   return versionMatch?.[0] ?? trimmed;
 }
 
@@ -217,6 +213,97 @@ export function collectInstalledContextEngineRuntimeErrors(packageRoot: string):
     }
   }
   return errors;
+}
+
+function resolveInstalledDistRelativeImport(params: {
+  distRoot: string;
+  importerPath: string;
+  specifier: string;
+}): string | null {
+  if (!params.specifier.startsWith(".")) {
+    return null;
+  }
+
+  const candidatePath = join(dirname(params.importerPath), params.specifier);
+  const candidatePaths = [
+    candidatePath,
+    `${candidatePath}.js`,
+    `${candidatePath}.mjs`,
+    `${candidatePath}.cjs`,
+    join(candidatePath, "index.js"),
+    join(candidatePath, "index.mjs"),
+    join(candidatePath, "index.cjs"),
+  ];
+
+  for (const resolvedPath of candidatePaths) {
+    const relativePath = relative(params.distRoot, resolvedPath);
+    if (
+      relativePath.length === 0 ||
+      relativePath.startsWith("..") ||
+      isAbsolute(relativePath) ||
+      !existsSync(resolvedPath)
+    ) {
+      continue;
+    }
+    return resolvedPath;
+  }
+
+  return null;
+}
+
+export function collectInstalledPluginSdkZodArtifactErrors(packageRoot: string): string[] {
+  const distRoot = join(packageRoot, "dist");
+  const entryRelativePath = "dist/plugin-sdk/zod.js";
+  const entryPath = join(packageRoot, entryRelativePath);
+  const pending = [entryPath];
+  const visited = new Set<string>();
+
+  while (pending.length > 0) {
+    const filePath = pending.pop();
+    if (!filePath || visited.has(filePath)) {
+      continue;
+    }
+    visited.add(filePath);
+
+    if (!existsSync(filePath)) {
+      return [`installed package is missing required plugin SDK artifact: ${entryRelativePath}`];
+    }
+
+    const relativePath = relative(packageRoot, filePath).replaceAll("\\", "/");
+    const fileStat = lstatSync(filePath);
+    if (!fileStat.isFile() || fileStat.size > MAX_INSTALLED_ROOT_DIST_JS_BYTES) {
+      return [
+        `installed package plugin SDK artifact '${relativePath}' is invalid or exceeds ${MAX_INSTALLED_ROOT_DIST_JS_BYTES} bytes.`,
+      ];
+    }
+
+    const source = readFileSync(filePath, "utf8");
+    const parsedSpecifiers = extractJavaScriptImportSpecifiers(source);
+    if (!parsedSpecifiers.ok) {
+      return [
+        `installed package plugin SDK artifact '${relativePath}' could not be parsed for runtime dependency verification: ${parsedSpecifiers.error}.`,
+      ];
+    }
+
+    for (const specifier of parsedSpecifiers.specifiers) {
+      if (specifier === "zod" || specifier.startsWith("zod/")) {
+        return [
+          `installed package plugin SDK zod artifact must be self-contained but ${relativePath} imports ${specifier}.`,
+        ];
+      }
+
+      const resolvedPath = resolveInstalledDistRelativeImport({
+        distRoot,
+        importerPath: filePath,
+        specifier,
+      });
+      if (resolvedPath) {
+        pending.push(resolvedPath);
+      }
+    }
+  }
+
+  return [];
 }
 
 function listInstalledRootDistJavaScriptFiles(packageRoot: string): string[] {

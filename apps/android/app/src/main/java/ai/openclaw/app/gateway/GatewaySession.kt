@@ -64,6 +64,7 @@ data class GatewayConnectErrorDetails(
   val code: String?,
   val canRetryWithDeviceToken: Boolean,
   val recommendedNextStep: String?,
+  val pauseReconnect: Boolean? = null,
   val reason: String? = null,
 )
 
@@ -315,6 +316,22 @@ class GatewaySession(
     return RpcResult(ok = res.ok, payloadJson = res.payloadJson, error = res.error)
   }
 
+  suspend fun sendRequestFrame(
+    method: String,
+    paramsJson: String?,
+    timeoutMs: Long = 15_000,
+    onError: (ErrorShape) -> Unit = {},
+  ) {
+    val conn = currentConnection ?: throw IllegalStateException("not connected")
+    val params =
+      if (paramsJson.isNullOrBlank()) {
+        null
+      } else {
+        json.parseToJsonElement(paramsJson)
+      }
+    conn.sendRequestFrame(method = method, params = params, timeoutMs = timeoutMs, onError = onError)
+  }
+
   private data class RpcResponse(
     val id: String,
     val ok: Boolean,
@@ -359,14 +376,12 @@ class GatewaySession(
       val id = UUID.randomUUID().toString()
       val deferred = CompletableDeferred<RpcResponse>()
       pending[id] = deferred
-      val frame =
-        buildJsonObject {
-          put("type", JsonPrimitive("req"))
-          put("id", JsonPrimitive(id))
-          put("method", JsonPrimitive(method))
-          if (params != null) put("params", params)
-        }
-      sendJson(frame)
+      try {
+        sendJson(buildRequestFrame(id = id, method = method, params = params))
+      } catch (err: Throwable) {
+        pending.remove(id)
+        throw err
+      }
       return try {
         withTimeout(timeoutMs) { deferred.await() }
       } catch (err: TimeoutCancellationException) {
@@ -375,12 +390,56 @@ class GatewaySession(
       }
     }
 
+    suspend fun sendRequestFrame(
+      method: String,
+      params: JsonElement?,
+      timeoutMs: Long,
+      onError: (ErrorShape) -> Unit,
+    ) {
+      val id = UUID.randomUUID().toString()
+      val deferred = CompletableDeferred<RpcResponse>()
+      pending[id] = deferred
+      try {
+        sendJson(buildRequestFrame(id = id, method = method, params = params))
+      } catch (err: Throwable) {
+        pending.remove(id)
+        throw err
+      }
+      scope.launch(Dispatchers.IO) {
+        val response =
+          try {
+            withTimeout(timeoutMs) { deferred.await() }
+          } catch (_: TimeoutCancellationException) {
+            pending.remove(id)
+            onError(ErrorShape("UNAVAILABLE", "request timeout"))
+            return@launch
+          }
+        if (!response.ok) {
+          onError(response.error ?: ErrorShape("UNAVAILABLE", "request failed"))
+        }
+      }
+    }
+
     suspend fun sendJson(obj: JsonObject) {
       val jsonString = obj.toString()
       writeLock.withLock {
-        socket?.send(jsonString)
+        if (socket?.send(jsonString) != true) {
+          throw IllegalStateException("gateway send failed")
+        }
       }
     }
+
+    private fun buildRequestFrame(
+      id: String,
+      method: String,
+      params: JsonElement?,
+    ): JsonObject =
+      buildJsonObject {
+        put("type", JsonPrimitive("req"))
+        put("id", JsonPrimitive(id))
+        put("method", JsonPrimitive(method))
+        if (params != null) put("params", params)
+      }
 
     suspend fun awaitClose() = closedDeferred.await()
 
@@ -736,6 +795,7 @@ class GatewaySession(
                 code = it["code"].asStringOrNull(),
                 canRetryWithDeviceToken = it["canRetryWithDeviceToken"].asBooleanOrNull() == true,
                 recommendedNextStep = it["recommendedNextStep"].asStringOrNull(),
+                pauseReconnect = it["pauseReconnect"].asBooleanOrNull(),
                 reason = it["reason"].asStringOrNull(),
               )
             }
@@ -1040,20 +1100,17 @@ class GatewaySession(
       detailCode == "AUTH_TOKEN_MISMATCH"
   }
 
-  private fun shouldPauseReconnectAfterAuthFailure(error: ErrorShape): Boolean =
-    when (error.details?.code) {
-      "AUTH_TOKEN_MISSING",
-      "AUTH_BOOTSTRAP_TOKEN_INVALID",
-      "AUTH_PASSWORD_MISSING",
-      "AUTH_PASSWORD_MISMATCH",
-      "AUTH_RATE_LIMITED",
-      "PAIRING_REQUIRED",
-      "CONTROL_UI_DEVICE_IDENTITY_REQUIRED",
-      "DEVICE_IDENTITY_REQUIRED",
-      -> true
-      "AUTH_TOKEN_MISMATCH" -> deviceTokenRetryBudgetUsed && !pendingDeviceTokenRetry
-      else -> false
-    }
+  private fun shouldPauseReconnectAfterAuthFailure(error: ErrorShape): Boolean {
+    val target = desired
+    return shouldPauseGatewayReconnectAfterAuthFailure(
+      error = error,
+      hasBootstrapToken = target?.bootstrapToken?.trim()?.isNotEmpty() == true,
+      role = target?.options?.role,
+      scopes = target?.options?.scopes ?: emptyList(),
+      deviceTokenRetryBudgetUsed = deviceTokenRetryBudgetUsed,
+      pendingDeviceTokenRetry = pendingDeviceTokenRetry,
+    )
+  }
 
   private fun shouldClearStoredDeviceTokenAfterRetry(error: ErrorShape): Boolean = error.details?.code == "AUTH_DEVICE_TOKEN_MISMATCH"
 
@@ -1067,6 +1124,36 @@ class GatewaySession(
     return tls?.expectedFingerprint?.trim()?.isNotEmpty() == true
   }
 }
+
+internal fun shouldPauseGatewayReconnectAfterAuthFailure(
+  error: GatewaySession.ErrorShape,
+  hasBootstrapToken: Boolean,
+  role: String?,
+  scopes: List<String>,
+  deviceTokenRetryBudgetUsed: Boolean,
+  pendingDeviceTokenRetry: Boolean,
+): Boolean =
+  when (error.details?.code) {
+    "AUTH_TOKEN_MISSING",
+    "AUTH_BOOTSTRAP_TOKEN_INVALID",
+    "AUTH_PASSWORD_MISSING",
+    "AUTH_PASSWORD_MISMATCH",
+    "AUTH_RATE_LIMITED",
+    "CONTROL_UI_DEVICE_IDENTITY_REQUIRED",
+    "DEVICE_IDENTITY_REQUIRED",
+    -> true
+    "PAIRING_REQUIRED" ->
+      !(
+        hasBootstrapToken &&
+          role?.trim() == "node" &&
+          scopes.isEmpty() &&
+          error.details.reason == "not-paired" &&
+          (error.details.pauseReconnect == false ||
+            error.details.recommendedNextStep == "wait_then_retry")
+      )
+    "AUTH_TOKEN_MISMATCH" -> deviceTokenRetryBudgetUsed && !pendingDeviceTokenRetry
+    else -> false
+  }
 
 internal fun buildGatewayWebSocketUrl(
   host: String,

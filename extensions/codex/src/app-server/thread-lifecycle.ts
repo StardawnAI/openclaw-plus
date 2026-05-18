@@ -15,6 +15,7 @@ import {
   resolveCodexContextEngineProjectionMaxChars,
   resolveCodexContextEngineProjectionReserveTokens,
 } from "./context-engine-projection.js";
+import { invalidInlineImageText, sanitizeInlineImageDataUrl } from "./image-payload-sanitizer.js";
 import {
   isCodexPluginThreadBindingStale,
   mergeCodexThreadConfigs,
@@ -27,6 +28,7 @@ import {
 import {
   isJsonObject,
   type CodexDynamicToolSpec,
+  type CodexSandboxPolicy,
   type CodexThreadResumeParams,
   type CodexThreadStartParams,
   type CodexTurnStartParams,
@@ -41,6 +43,7 @@ import {
   writeCodexAppServerBinding,
   type CodexAppServerAuthProfileLookup,
   type CodexAppServerContextEngineBinding,
+  type CodexAppServerContextEngineProjectionBinding,
   type CodexAppServerThreadBinding,
 } from "./session-binding.js";
 
@@ -53,6 +56,12 @@ export type CodexAppServerThreadLifecycleBinding = CodexAppServerThreadBinding &
   lifecycle: CodexAppServerThreadLifecycle;
 };
 
+export type CodexContextEngineThreadBootstrapProjection = {
+  mode: "thread_bootstrap";
+  epoch: string;
+  fingerprint?: string;
+};
+
 export type CodexPluginThreadConfigProvider = {
   enabled: boolean;
   inputFingerprint?: string;
@@ -62,24 +71,46 @@ export type CodexPluginThreadConfigProvider = {
 
 export const CODEX_CODE_MODE_THREAD_CONFIG: JsonObject = {
   "features.code_mode": true,
-  "features.code_mode_only": true,
+  "features.code_mode_only": false,
+};
+
+export const CODEX_CODE_MODE_DISABLED_THREAD_CONFIG: JsonObject = {
+  "features.code_mode": false,
+  "features.code_mode_only": false,
+};
+
+const CODEX_LIGHTWEIGHT_CONTEXT_THREAD_CONFIG: JsonObject = {
+  project_doc_max_bytes: 0,
 };
 
 export async function startOrResumeThread(params: {
   client: CodexAppServerClient;
   params: EmbeddedRunAttemptParams;
+  agentId?: string;
   cwd: string;
   dynamicTools: CodexDynamicToolSpec[];
   appServer: CodexAppServerRuntimeOptions;
   developerInstructions?: string;
   config?: JsonObject;
+  finalConfigPatch?: JsonObject;
+  nativeCodeModeEnabled?: boolean;
+  userMcpServersEnabled?: boolean;
   mcpServersFingerprint?: string;
   mcpServersFingerprintEvaluated?: boolean;
   pluginThreadConfig?: CodexPluginThreadConfigProvider;
+  contextEngineProjection?: CodexContextEngineThreadBootstrapProjection;
 }): Promise<CodexAppServerThreadLifecycleBinding> {
   const dynamicToolsFingerprint = fingerprintDynamicTools(params.dynamicTools);
-  const contextEngineBinding = buildContextEngineBinding(params.params);
-  const userMcpServersConfigPatch = buildCodexUserMcpServersThreadConfigPatch(params.params.config);
+  const contextEngineBinding = buildContextEngineBinding(
+    params.params,
+    params.contextEngineProjection,
+  );
+  const userMcpServersConfigPatch =
+    params.userMcpServersEnabled === false
+      ? undefined
+      : buildCodexUserMcpServersThreadConfigPatch(params.params.config, {
+          agentId: params.agentId ?? params.params.agentId,
+        });
   const userMcpServersFingerprint = fingerprintUserMcpServersConfigPatch(userMcpServersConfigPatch);
   let binding = await readCodexAppServerBinding(params.params.sessionFile, {
     authProfileStore: params.params.authProfileStore,
@@ -89,6 +120,16 @@ export async function startOrResumeThread(params: {
   let preserveExistingBinding = false;
   let rotatedContextEngineBinding = false;
   let prebuiltPluginThreadConfig: CodexPluginThreadConfig | undefined;
+  if (binding?.threadId && params.nativeCodeModeEnabled === false) {
+    embeddedAgentLog.debug(
+      "codex app-server native tool surface disabled for turn; starting transient thread",
+      {
+        threadId: binding.threadId,
+      },
+    );
+    preserveExistingBinding = true;
+    binding = undefined;
+  }
   if (binding?.threadId && (binding.contextEngine || contextEngineBinding)) {
     if (
       !contextEngineBinding ||
@@ -100,6 +141,12 @@ export async function startOrResumeThread(params: {
           threadId: binding.threadId,
           engineId: contextEngineBinding?.engineId,
           previousEngineId: binding.contextEngine?.engineId,
+          epoch: contextEngineBinding?.projection?.epoch,
+          previousEpoch: binding.contextEngine?.projection?.epoch,
+          fingerprint: contextEngineBinding?.projection?.fingerprint,
+          previousFingerprint: binding.contextEngine?.projection?.fingerprint,
+          policyFingerprint: contextEngineBinding?.policyFingerprint,
+          previousPolicyFingerprint: binding.contextEngine?.policyFingerprint,
         },
       );
       await clearCodexAppServerBinding(params.params.sessionFile);
@@ -203,7 +250,11 @@ export async function startOrResumeThread(params: {
     } else {
       try {
         const authProfileId = params.params.authProfileId ?? binding.authProfileId;
-        const resumeConfig = mergeCodexThreadConfigs(params.config, userMcpServersConfigPatch);
+        const resumeConfig = mergeCodexThreadConfigs(
+          params.config,
+          userMcpServersConfigPatch,
+          params.finalConfigPatch,
+        );
         const response = assertCodexThreadResumeResponse(
           await params.client.request(
             "thread/resume",
@@ -213,6 +264,7 @@ export async function startOrResumeThread(params: {
               appServer: params.appServer,
               developerInstructions: params.developerInstructions,
               config: resumeConfig,
+              nativeCodeModeEnabled: params.nativeCodeModeEnabled,
             }),
           ),
         );
@@ -251,6 +303,17 @@ export async function startOrResumeThread(params: {
             config: params.params.config,
           },
         );
+        if (contextEngineBinding) {
+          embeddedAgentLog.info("codex app-server wrote context-engine thread binding", {
+            sessionId: params.params.sessionId,
+            sessionKey: params.params.sessionKey,
+            threadId: response.thread.id,
+            engineId: contextEngineBinding.engineId,
+            epoch: contextEngineBinding.projection?.epoch,
+            fingerprint: contextEngineBinding.projection?.fingerprint,
+            action: "resumed",
+          });
+        }
         return {
           ...binding,
           threadId: response.thread.id,
@@ -286,6 +349,7 @@ export async function startOrResumeThread(params: {
     params.config,
     userMcpServersConfigPatch,
     pluginThreadConfig?.configPatch,
+    params.finalConfigPatch,
   );
   const response = assertCodexThreadStartResponse(
     await params.client.request(
@@ -296,6 +360,7 @@ export async function startOrResumeThread(params: {
         appServer: params.appServer,
         developerInstructions: params.developerInstructions,
         config,
+        nativeCodeModeEnabled: params.nativeCodeModeEnabled,
       }),
     ),
   );
@@ -333,6 +398,17 @@ export async function startOrResumeThread(params: {
         config: params.params.config,
       },
     );
+    if (contextEngineBinding) {
+      embeddedAgentLog.info("codex app-server wrote context-engine thread binding", {
+        sessionId: params.params.sessionId,
+        sessionKey: params.params.sessionKey,
+        threadId: response.thread.id,
+        engineId: contextEngineBinding.engineId,
+        epoch: contextEngineBinding.projection?.epoch,
+        fingerprint: contextEngineBinding.projection?.fingerprint,
+        action: rotatedContextEngineBinding ? "rotated" : "started",
+      });
+    }
   }
   return {
     schemaVersion: 1,
@@ -358,8 +434,9 @@ export async function startOrResumeThread(params: {
   };
 }
 
-function buildContextEngineBinding(
+export function buildContextEngineBinding(
   params: EmbeddedRunAttemptParams,
+  projection?: CodexContextEngineThreadBootstrapProjection,
 ): CodexAppServerContextEngineBinding | undefined {
   const contextEngine = isActiveHarnessContextEngine(params.contextEngine)
     ? params.contextEngine
@@ -386,17 +463,45 @@ function buildContextEngineBinding(
         }),
       }),
     }),
+    projection: projection ? buildContextEngineProjectionBinding(projection) : undefined,
   };
 }
 
-function isContextEngineBindingCompatible(
+function buildContextEngineProjectionBinding(
+  projection: CodexContextEngineThreadBootstrapProjection,
+): CodexAppServerContextEngineProjectionBinding {
+  return {
+    schemaVersion: 1,
+    mode: "thread_bootstrap",
+    epoch: projection.epoch,
+    fingerprint: projection.fingerprint,
+  };
+}
+
+export function isContextEngineBindingCompatible(
   previous: CodexAppServerContextEngineBinding | undefined,
   next: CodexAppServerContextEngineBinding,
 ): boolean {
   return (
     previous?.schemaVersion === next.schemaVersion &&
     previous.engineId === next.engineId &&
-    previous.policyFingerprint === next.policyFingerprint
+    previous.policyFingerprint === next.policyFingerprint &&
+    areContextEngineProjectionBindingsCompatible(previous.projection, next.projection)
+  );
+}
+
+function areContextEngineProjectionBindingsCompatible(
+  previous: CodexAppServerContextEngineProjectionBinding | undefined,
+  next: CodexAppServerContextEngineProjectionBinding | undefined,
+): boolean {
+  if (!next) {
+    return previous === undefined;
+  }
+  return (
+    previous?.schemaVersion === next.schemaVersion &&
+    previous.mode === next.mode &&
+    previous.epoch === next.epoch &&
+    previous.fingerprint === next.fingerprint
   );
 }
 
@@ -454,6 +559,7 @@ export function buildThreadStartParams(
     appServer: CodexAppServerRuntimeOptions;
     developerInstructions?: string;
     config?: JsonObject;
+    nativeCodeModeEnabled?: boolean;
   },
 ): CodexThreadStartParams {
   const modelProvider = resolveCodexAppServerModelProvider({
@@ -472,7 +578,10 @@ export function buildThreadStartParams(
     sandbox: options.appServer.sandbox,
     ...(options.appServer.serviceTier ? { serviceTier: options.appServer.serviceTier } : {}),
     serviceName: "OpenClaw",
-    config: buildCodexRuntimeThreadConfig(options.config),
+    config: buildCodexRuntimeThreadConfigForRun(params, options.config, {
+      nativeCodeModeEnabled: options.nativeCodeModeEnabled,
+    }),
+    ...(options.nativeCodeModeEnabled === false ? { environments: [] } : {}),
     developerInstructions: options.developerInstructions ?? buildDeveloperInstructions(params),
     dynamicTools: options.dynamicTools,
     experimentalRawEvents: true,
@@ -488,6 +597,7 @@ export function buildThreadResumeParams(
     appServer: CodexAppServerRuntimeOptions;
     developerInstructions?: string;
     config?: JsonObject;
+    nativeCodeModeEnabled?: boolean;
   },
 ): CodexThreadResumeParams {
   const modelProvider = resolveCodexAppServerModelProvider({
@@ -505,16 +615,49 @@ export function buildThreadResumeParams(
     approvalsReviewer: options.appServer.approvalsReviewer,
     sandbox: options.appServer.sandbox,
     ...(options.appServer.serviceTier ? { serviceTier: options.appServer.serviceTier } : {}),
-    config: buildCodexRuntimeThreadConfig(options.config),
+    config: buildCodexRuntimeThreadConfigForRun(params, options.config, {
+      nativeCodeModeEnabled: options.nativeCodeModeEnabled,
+    }),
     developerInstructions: options.developerInstructions ?? buildDeveloperInstructions(params),
     persistExtendedHistory: true,
   };
 }
 
-export function buildCodexRuntimeThreadConfig(config: JsonObject | undefined): JsonObject {
+export function buildCodexRuntimeThreadConfig(
+  config: JsonObject | undefined,
+  options: { nativeCodeModeEnabled?: boolean } = {},
+): JsonObject {
+  if (options.nativeCodeModeEnabled === false) {
+    return (
+      mergeCodexThreadConfigs(
+        CODEX_CODE_MODE_THREAD_CONFIG,
+        config,
+        CODEX_CODE_MODE_DISABLED_THREAD_CONFIG,
+      ) ?? {
+        ...CODEX_CODE_MODE_DISABLED_THREAD_CONFIG,
+      }
+    );
+  }
   return (
-    mergeCodexThreadConfigs(config, CODEX_CODE_MODE_THREAD_CONFIG) ?? {
+    mergeCodexThreadConfigs(CODEX_CODE_MODE_THREAD_CONFIG, config) ?? {
       ...CODEX_CODE_MODE_THREAD_CONFIG,
+    }
+  );
+}
+
+function buildCodexRuntimeThreadConfigForRun(
+  params: EmbeddedRunAttemptParams,
+  config: JsonObject | undefined,
+  options: { nativeCodeModeEnabled?: boolean } = {},
+): JsonObject {
+  const runtimeConfig = buildCodexRuntimeThreadConfig(config, options);
+  if (params.bootstrapContextMode !== "lightweight") {
+    return runtimeConfig;
+  }
+  return (
+    mergeCodexThreadConfigs(runtimeConfig, CODEX_LIGHTWEIGHT_CONTEXT_THREAD_CONFIG) ?? {
+      ...runtimeConfig,
+      ...CODEX_LIGHTWEIGHT_CONTEXT_THREAD_CONFIG,
     }
   );
 }
@@ -526,6 +669,7 @@ export function buildTurnStartParams(
     cwd: string;
     appServer: CodexAppServerRuntimeOptions;
     promptText?: string;
+    sandboxPolicy?: CodexSandboxPolicy;
   },
 ): CodexTurnStartParams {
   return {
@@ -534,7 +678,8 @@ export function buildTurnStartParams(
     cwd: options.cwd,
     approvalPolicy: options.appServer.approvalPolicy,
     approvalsReviewer: options.appServer.approvalsReviewer,
-    sandboxPolicy: codexSandboxPolicyForTurn(options.appServer.sandbox, options.cwd),
+    sandboxPolicy:
+      options.sandboxPolicy ?? codexSandboxPolicyForTurn(options.appServer.sandbox, options.cwd),
     model: params.modelId,
     ...(options.appServer.serviceTier ? { serviceTier: options.appServer.serviceTier } : {}),
     effort: resolveReasoningEffort(params.thinkLevel, params.modelId),
@@ -552,10 +697,28 @@ export function buildTurnCollaborationMode(
     settings: {
       model: params.modelId,
       reasoning_effort: resolveReasoningEffort(params.thinkLevel, params.modelId),
-      developer_instructions:
-        params.trigger === "heartbeat" ? buildHeartbeatCollaborationInstructions() : null,
+      developer_instructions: buildTurnScopedCollaborationInstructions(params),
     },
   };
+}
+
+function buildTurnScopedCollaborationInstructions(params: EmbeddedRunAttemptParams): string | null {
+  if (params.trigger === "cron") {
+    return buildCronCollaborationInstructions();
+  }
+  if (params.trigger === "heartbeat") {
+    return buildHeartbeatCollaborationInstructions();
+  }
+  return null;
+}
+
+function buildCronCollaborationInstructions(): string {
+  return [
+    "This is an OpenClaw cron automation turn. Apply these instructions only to this scheduled job; ordinary chat turns should stay in Codex Default mode.",
+    "Execute the cron payload directly. If it asks you to run an exact command, run that command before doing any investigation, planning, memory review, or workspace bootstrap.",
+    "Use context already provided by the runtime, but do not spend time loading or re-reading workspace bootstrap, memory, or project-doc files before executing the cron payload. Inspect those files only if the payload asks for them or the command fails and they are needed to diagnose it.",
+    "Keep output concise and automation-oriented. Prefer the final command result or a short failure summary over status narration.",
+  ].join("\n\n");
 }
 
 function buildHeartbeatCollaborationInstructions(): string {
@@ -646,6 +809,7 @@ export function buildDeveloperInstructions(params: EmbeddedRunAttemptParams): st
   const promptOverlay = renderCodexRuntimePromptOverlay(params);
   const sections = [
     "Running inside OpenClaw. Use dynamic tools for messaging, cron, sessions, media, gateway, and nodes when available.",
+    "Use Codex native `spawn_agent` for Codex subagents. Use OpenClaw `sessions_spawn` only for OpenClaw or ACP delegation; if it is not already loaded, search for `sessions_spawn` in the `openclaw` dynamic tool namespace before calling it.",
     "Preserve channel/session context. Visible channel replies: use `message`, do not describe would-reply.",
     promptOverlay,
     params.extraSystemPrompt,
@@ -686,15 +850,17 @@ function buildUserInput(
   params: EmbeddedRunAttemptParams,
   promptText: string = params.prompt,
 ): CodexUserInput[] {
-  return [
-    { type: "text", text: promptText, text_elements: [] },
-    ...(params.images ?? []).map(
-      (image): CodexUserInput => ({
-        type: "image",
-        url: `data:${image.mimeType};base64,${image.data}`,
-      }),
-    ),
-  ];
+  const imageInputs = (params.images ?? []).map((image): CodexUserInput => {
+    const imageUrl = sanitizeInlineImageDataUrl(`data:${image.mimeType};base64,${image.data}`);
+    return imageUrl
+      ? { type: "image", url: imageUrl }
+      : {
+          type: "text",
+          text: invalidInlineImageText("codex user input"),
+          text_elements: [],
+        };
+  });
+  return [{ type: "text", text: promptText, text_elements: [] }, ...imageInputs];
 }
 
 export function resolveCodexAppServerModelProvider(params: {

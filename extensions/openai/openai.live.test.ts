@@ -163,7 +163,7 @@ function createLiveTtsConfig(): ResolvedTtsConfig {
     },
     personas: {},
     maxTextLength: 4_000,
-    timeoutMs: 90_000,
+    timeoutMs: 30_000,
   };
 }
 
@@ -288,7 +288,7 @@ describeLive("openai plugin live", () => {
     expect(telephony?.outputFormat).toBe("pcm");
     expect(telephony?.sampleRate).toBe(24_000);
     expect(telephony?.audioBuffer.byteLength).toBeGreaterThan(512);
-  }, 120_000);
+  }, 45_000);
 
   it("transcribes synthesized speech through the registered media provider", async () => {
     const { speechProviders, mediaProviders } = await registerOpenAIPlugin();
