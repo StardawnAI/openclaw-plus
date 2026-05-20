@@ -81,19 +81,37 @@ function normalizeDeliveryTarget(channel: string, to: string): string {
   return normalizeTargetForProvider(channel, toTrimmed) ?? toTrimmed;
 }
 
-function deliveryTargetRecipientsMatch(
-  channel: string,
-  targetTo: string,
-  deliveryTo: string,
-): boolean {
-  const strippedTargetTo = targetTo.replace(/:topic:\d+$/, "").trim();
+const caseSensitivePrefixedTargetProviders = new Set(["googlechat", "mattermost", "matrix"]);
+const lowercaseNormalizedPrefixedTargetProviders = new Set(["discord", "slack"]);
+
+function deliveryTargetsMatch(channel: string, targetTo: string, deliveryTo: string): boolean {
+  const targetToTrimmed = targetTo.trim();
   const deliveryToTrimmed = deliveryTo.trim();
-  if (strippedTargetTo === deliveryToTrimmed) {
+  if (targetToTrimmed === deliveryToTrimmed) {
     return true;
   }
-  const normalizedTargetTo = normalizeDeliveryTarget(channel, strippedTargetTo);
-  const normalizedDeliveryTo = normalizeDeliveryTarget(channel, deliveryToTrimmed);
-  return normalizedTargetTo === normalizedDeliveryTo;
+  const targetPrefixed = targetToTrimmed.match(/^([a-z][a-z0-9_-]*):(.*)$/i);
+  const deliveryPrefixed = deliveryToTrimmed.match(/^([a-z][a-z0-9_-]*):(.*)$/i);
+  const targetKind = targetPrefixed?.[1]?.toLowerCase();
+  const deliveryKind = deliveryPrefixed?.[1]?.toLowerCase();
+  if (
+    targetKind &&
+    targetKind === deliveryKind &&
+    ["channel", "conversation", "group", "user"].includes(targetKind)
+  ) {
+    const targetId = targetPrefixed?.[2]?.trim();
+    const deliveryId = deliveryPrefixed?.[2]?.trim();
+    if (caseSensitivePrefixedTargetProviders.has(channel)) {
+      return targetId === deliveryId;
+    }
+    if (lowercaseNormalizedPrefixedTargetProviders.has(channel)) {
+      return targetId?.toLowerCase() === deliveryId?.toLowerCase();
+    }
+  }
+  return (
+    normalizeDeliveryTarget(channel, targetToTrimmed) ===
+    normalizeDeliveryTarget(channel, deliveryToTrimmed)
+  );
 }
 
 function normalizeDeliveryThreadId(threadId: string | number | undefined): string | undefined {
@@ -119,10 +137,9 @@ export function sourceDeliveryTargetsMatch(
   if (delivery.accountId && target.accountId && target.accountId !== delivery.accountId) {
     return false;
   }
-  // Strip :topic:NNN from message targets and only fall back to plugin
-  // normalization when raw recipients differ. Most source delivery checks
-  // already carry canonical ids, and plugin lookup is comparatively expensive.
-  if (!deliveryTargetRecipientsMatch(channel, target.to, delivery.to)) {
+  // Strip :topic:NNN from message targets and normalize Feishu/Lark prefixes on
+  // both sides so source-delivery suppression compares canonical IDs.
+  if (!deliveryTargetsMatch(channel, target.to.replace(/:topic:\d+$/, ""), delivery.to)) {
     return false;
   }
   const deliveryThreadId = normalizeDeliveryThreadId(delivery.threadId);

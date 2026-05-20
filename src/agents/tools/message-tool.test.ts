@@ -385,16 +385,18 @@ describe("message tool secret scoping", () => {
     const defaultTool = createMessageTool();
 
     expect(scopedTool.description).toContain(
-      'use action="send" with message for visible replies to the current source conversation',
+      'if visible output is needed in the current source conversation, call action="send" with message before ending',
     );
     expect(scopedTool.description).toContain("target defaults to the current source conversation");
-    expect(scopedTool.description).toContain("Normal final answers stay private");
+    expect(scopedTool.description).toContain(
+      "Normal final answers stay private and are not visible in this mode",
+    );
     expect(explicitTargetTool.description).toContain("Include target when sending");
     expect(explicitTargetTool.description).not.toContain(
       "target defaults to the current source conversation",
     );
     expect(defaultTool.description).not.toContain(
-      "visible replies to the current source conversation",
+      "if visible output is needed in the current source conversation",
     );
   });
 
@@ -405,7 +407,7 @@ describe("message tool secret scoping", () => {
     }).find((candidate) => candidate.name === "message");
 
     expect(tool?.description).toContain(
-      'use action="send" with message for visible replies to the current source conversation',
+      'if visible output is needed in the current source conversation, call action="send" with message before ending',
     );
   });
 
@@ -1694,15 +1696,29 @@ describe("message tool reasoning tag sanitization", () => {
     },
     {
       field: "message",
-      input: "Reasoning:\n_internal plan_\n\nVisible answer",
+      input: "Thinking...\nI'll check that now",
+      expected: "Thinking...\nI'll check that now",
+      target: "telegram:123",
+      channel: "telegram",
+    },
+    {
+      field: "message",
+      input: "Thinking\n_internal plan_\n\nVisible answer",
       expected: "Visible answer",
       target: "telegram:123",
       channel: "telegram",
     },
     {
       field: "message",
-      input: "Reasoning:\n_internal plan_\n_more internal notes_",
+      input: "Thinking\n_internal plan_\n_more internal notes_",
       expected: "",
+      target: "telegram:123",
+      channel: "telegram",
+    },
+    {
+      field: "message",
+      input: "Reasoning:\n_internal plan_\n\nVisible answer",
+      expected: "Visible answer",
       target: "telegram:123",
       channel: "telegram",
     },

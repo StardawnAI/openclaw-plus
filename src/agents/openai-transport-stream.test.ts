@@ -8,7 +8,7 @@ import {
   parseTransportChunkUsage,
   resolveAzureOpenAIApiVersion,
   sanitizeTransportPayloadText,
-  __testing,
+  testing,
 } from "./openai-transport-stream.js";
 import { attachModelProviderRequestTransport } from "./provider-request-config.js";
 import {
@@ -21,8 +21,8 @@ import {
 } from "./provider-transport-stream.js";
 import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "./system-prompt-cache-boundary.js";
 
-type OpenAICompletionsOutput = Parameters<typeof __testing.processOpenAICompletionsStream>[1];
-type OpenAIResponsesOutput = Parameters<typeof __testing.processResponsesStream>[1];
+type OpenAICompletionsOutput = Parameters<typeof testing.processOpenAICompletionsStream>[1];
+type OpenAIResponsesOutput = Parameters<typeof testing.processResponsesStream>[1];
 
 type CapturedStreamEvent = { type?: string; delta?: string };
 
@@ -130,7 +130,7 @@ describe("openai transport stream", () => {
   it("fails Azure Responses streams when headers arrive but no first event follows", async () => {
     const model = createAzureResponsesModel();
     await expect(
-      __testing.processResponsesStream(
+      testing.processResponsesStream(
         neverYieldsStream(),
         createResponsesAssistantOutput(model),
         { push: vi.fn() },
@@ -165,8 +165,8 @@ describe("openai transport stream", () => {
       },
     };
 
-    const observation = __testing.buildResponsesFailedNoDetailsObservation(event, model);
-    const summary = __testing.summarizeResponsesFailedNoDetailsObservation(observation);
+    const observation = testing.buildResponsesFailedNoDetailsObservation(event, model);
+    const summary = testing.summarizeResponsesFailedNoDetailsObservation(observation);
 
     expect(observation.providerRuntimeFailureKind).toBe("no_error_details");
     expect(observation.responseId).toBe("resp_failed_123");
@@ -190,7 +190,7 @@ describe("openai transport stream", () => {
     const model = createAzureResponsesModel();
 
     expect(
-      __testing.normalizeResponsesFailedEvent(
+      testing.normalizeResponsesFailedEvent(
         {
           type: "response.failed",
           response: {
@@ -209,7 +209,7 @@ describe("openai transport stream", () => {
     });
 
     expect(
-      __testing.normalizeResponsesFailedEvent(
+      testing.normalizeResponsesFailedEvent(
         {
           type: "response.failed",
           response: {
@@ -230,7 +230,7 @@ describe("openai transport stream", () => {
     const output = createResponsesAssistantOutput(model);
 
     await expect(
-      __testing.processResponsesStream(
+      testing.processResponsesStream(
         streamChunks([
           {
             type: "response.failed",
@@ -255,7 +255,7 @@ describe("openai transport stream", () => {
     const output = createResponsesAssistantOutput(model);
 
     await expect(
-      __testing.processResponsesStream(
+      testing.processResponsesStream(
         streamChunks([
           {
             type: "response.failed",
@@ -277,11 +277,82 @@ describe("openai transport stream", () => {
     expect(output.responseId).toBe("resp_failed_empty_error");
   });
 
+  it("tags Responses encrypted reasoning with replay provenance while streaming", async () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      baseUrl: "https://proxy.example.com/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-codex-responses">;
+    const output: OpenAIResponsesOutput = {
+      role: "assistant" as const,
+      content: [],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+
+    await testing.processResponsesStream(
+      streamChunks([
+        { type: "response.output_item.added", item: { type: "reasoning" } },
+        {
+          type: "response.output_item.done",
+          item: {
+            type: "reasoning",
+            id: "rs_123",
+            encrypted_content: "ciphertext",
+            summary: [{ type: "summary_text", text: "Need a tool." }],
+          },
+        },
+      ]),
+      output,
+      { push: vi.fn() },
+      model,
+      { authProfileId: "openai-codex:oauth", sessionId: "session-123" },
+    );
+
+    const expectedReplayMetadata = testing.buildOpenAIResponsesReasoningReplayMetadata(model, {
+      authProfileId: "openai-codex:oauth",
+      sessionId: "session-123",
+    });
+    const thinkingBlock = output.content[0] as {
+      thinkingSignature?: string;
+      openclawReasoningReplay?: unknown;
+    };
+    const replayItem = JSON.parse(thinkingBlock.thinkingSignature ?? "{}") as Record<
+      string,
+      unknown
+    >;
+    expect(replayItem).toMatchObject({
+      type: "reasoning",
+      id: "rs_123",
+      encrypted_content: "ciphertext",
+    });
+    expect(replayItem).not.toHaveProperty("__openclaw_replay");
+    expect(thinkingBlock.openclawReasoningReplay).toEqual(expectedReplayMetadata);
+  });
+
   it("clamps Responses cached prompt usage at zero", async () => {
     const model = createAzureResponsesModel();
     const output = createResponsesAssistantOutput(model);
 
-    await __testing.processResponsesStream(
+    await testing.processResponsesStream(
       streamChunks([
         {
           type: "response.completed",
@@ -315,7 +386,7 @@ describe("openai transport stream", () => {
     process.env.OPENCLAW_DEBUG_MODEL_PAYLOAD = "tools";
     try {
       expect(
-        __testing.summarizeResponsesTools([
+        testing.summarizeResponsesTools([
           { type: "function", name: "exec" },
           { type: "function", function: { name: "wait" } },
         ]),
@@ -333,7 +404,7 @@ describe("openai transport stream", () => {
     const previous = process.env.OPENCLAW_DEBUG_MODEL_PAYLOAD;
     process.env.OPENCLAW_DEBUG_MODEL_PAYLOAD = "full-redacted";
     try {
-      const summary = __testing.summarizeResponsesPayload({
+      const summary = testing.summarizeResponsesPayload({
         model: "gpt-5.5",
         stream: true,
         input: [],
@@ -361,14 +432,14 @@ describe("openai transport stream", () => {
       ],
     };
 
-    __testing.enforceCodeModeResponsesToolSurface(payload);
-    __testing.assertCodeModeResponsesToolSurface(payload);
+    testing.enforceCodeModeResponsesToolSurface(payload);
+    testing.assertCodeModeResponsesToolSurface(payload);
     expect(payload.tools).toHaveLength(2);
   });
 
   it("fails closed when the code mode final payload tool surface is not exec/wait", () => {
     expect(() =>
-      __testing.assertCodeModeResponsesToolSurface({
+      testing.assertCodeModeResponsesToolSurface({
         tools: [{ type: "function", name: "exec" }, { type: "web_search_preview" }],
       }),
     ).toThrow(/Code mode payload tool surface violation/);
@@ -376,7 +447,7 @@ describe("openai transport stream", () => {
 
   it("adds OpenClaw attribution to native OpenAI transport headers and protects it from pi", () => {
     vi.stubEnv("OPENCLAW_VERSION", "2026.3.22");
-    const headers = __testing.buildOpenAIClientHeaders(
+    const headers = testing.buildOpenAIClientHeaders(
       {
         id: "gpt-5.4",
         name: "GPT-5.4",
@@ -413,7 +484,7 @@ describe("openai transport stream", () => {
 
   it("adds OpenClaw attribution to native OpenAI Codex transport headers", () => {
     vi.stubEnv("OPENCLAW_VERSION", "2026.3.22");
-    const headers = __testing.buildOpenAIClientHeaders(
+    const headers = testing.buildOpenAIClientHeaders(
       {
         id: "gpt-5.4-codex",
         name: "GPT-5.4 Codex",
@@ -441,7 +512,7 @@ describe("openai transport stream", () => {
   });
 
   it("moves Azure OpenAI completions api-version headers into default query params", () => {
-    const config = __testing.buildOpenAICompletionsClientConfig(
+    const config = testing.buildOpenAICompletionsClientConfig(
       {
         id: "gpt-4o-mini",
         name: "GPT-4o Mini",
@@ -476,7 +547,7 @@ describe("openai transport stream", () => {
   });
 
   it("preserves configured base URL query params without moving non-Azure headers", () => {
-    const config = __testing.buildOpenAICompletionsClientConfig(
+    const config = testing.buildOpenAICompletionsClientConfig(
       {
         id: "proxy-model",
         name: "Proxy Model",
@@ -808,9 +879,9 @@ describe("openai transport stream", () => {
       reasoning: false,
     } satisfies Model<"openai-completions"> & { requestTimeoutMs: number };
 
-    expect(__testing.buildOpenAISdkClientOptions(responsesModel).timeout).toBe(requestTimeoutMs);
-    expect(__testing.buildOpenAISdkClientOptions(azureModel).timeout).toBe(requestTimeoutMs);
-    expect(__testing.buildOpenAISdkClientOptions(completionsModel).timeout).toBe(requestTimeoutMs);
+    expect(testing.buildOpenAISdkClientOptions(responsesModel).timeout).toBe(requestTimeoutMs);
+    expect(testing.buildOpenAISdkClientOptions(azureModel).timeout).toBe(requestTimeoutMs);
+    expect(testing.buildOpenAISdkClientOptions(completionsModel).timeout).toBe(requestTimeoutMs);
   });
 
   it("passes provider request timeouts to OpenAI SDK per-request options", () => {
@@ -829,12 +900,12 @@ describe("openai transport stream", () => {
       requestTimeoutMs: 900_000.7,
     } satisfies Model<"openai-completions"> & { requestTimeoutMs: number };
 
-    expect(__testing.buildOpenAISdkRequestOptions(model, signal)).toEqual({
+    expect(testing.buildOpenAISdkRequestOptions(model, signal)).toEqual({
       signal,
       timeout: 900_000,
     });
     expect(
-      __testing.buildOpenAISdkRequestOptions(
+      testing.buildOpenAISdkRequestOptions(
         { ...model, requestTimeoutMs: -1 } as Model<"openai-completions">,
         undefined,
       ),
@@ -1161,7 +1232,7 @@ describe("openai transport stream", () => {
       };
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expectRecordFields(output.usage, {
       input: 8,
@@ -1214,7 +1285,7 @@ describe("openai transport stream", () => {
     }, 0);
 
     await expect(
-      __testing.processOpenAICompletionsStream(mockStream(), output, model, stream, {
+      testing.processOpenAICompletionsStream(mockStream(), output, model, stream, {
         signal: abort.signal,
       }),
     ).rejects.toThrow("Request was aborted");
@@ -1242,7 +1313,7 @@ describe("openai transport stream", () => {
     }, 0);
 
     await expect(
-      __testing.processResponsesStream(mockStream(), output, stream, model, {
+      testing.processResponsesStream(mockStream(), output, stream, model, {
         signal: abort.signal,
       }),
     ).rejects.toThrow("Request was aborted");
@@ -1301,7 +1372,7 @@ describe("openai transport stream", () => {
       };
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.content).toStrictEqual([{ type: "text", text: "ok" }]);
     expect(output.stopReason).toBe("stop");
@@ -1312,7 +1383,7 @@ describe("openai transport stream", () => {
     const output = createAssistantOutput(model);
     const events: CapturedStreamEvent[] = [];
 
-    await __testing.processOpenAICompletionsStream(
+    await testing.processOpenAICompletionsStream(
       streamChunks([
         {
           id: "chatcmpl-deepseek-dsml",
@@ -1377,7 +1448,7 @@ describe("openai transport stream", () => {
     const model = createDeepSeekCompletionsModel();
     const output = createAssistantOutput(model);
 
-    await __testing.processOpenAICompletionsStream(
+    await testing.processOpenAICompletionsStream(
       streamChunks([
         {
           id: "chatcmpl-deepseek-native-tool",
@@ -1426,7 +1497,7 @@ describe("openai transport stream", () => {
     const output = createAssistantOutput(model);
     const events: CapturedStreamEvent[] = [];
 
-    await __testing.processOpenAICompletionsStream(
+    await testing.processOpenAICompletionsStream(
       streamChunks([
         {
           id: "chatcmpl-deepseek-post-tool-dsml",
@@ -1491,7 +1562,7 @@ describe("openai transport stream", () => {
     const output = createAssistantOutput(model);
     const events: CapturedStreamEvent[] = [];
 
-    await __testing.processOpenAICompletionsStream(
+    await testing.processOpenAICompletionsStream(
       streamChunks([
         {
           id: "chatcmpl-deepseek-split-dsml",
@@ -1953,7 +2024,7 @@ describe("openai transport stream", () => {
       top_p: 0.85,
     };
 
-    const sanitized = __testing.sanitizeOpenAICodexResponsesParams(
+    const sanitized = testing.sanitizeOpenAICodexResponsesParams(
       {
         id: "gpt-5.4",
         name: "GPT-5.4",
@@ -2080,7 +2151,7 @@ describe("openai transport stream", () => {
       temperature: 0.2,
     };
 
-    const sanitized = __testing.sanitizeOpenAICodexResponsesParams(
+    const sanitized = testing.sanitizeOpenAICodexResponsesParams(
       {
         id: "gpt-5.4",
         name: "GPT-5.4",
@@ -2099,7 +2170,7 @@ describe("openai transport stream", () => {
     expect(sanitized).toEqual(payload);
   });
 
-  it("omits prior Responses replay item ids for native Codex responses", () => {
+  it("omits native Codex replay item ids and unproven encrypted reasoning", () => {
     const params = buildOpenAIResponsesParams(
       {
         id: "gpt-5.4",
@@ -2185,9 +2256,9 @@ describe("openai transport stream", () => {
     const reasoningItem = params.input?.find((item) => item.type === "reasoning");
     expectRecordFields(reasoningItem, {
       type: "reasoning",
-      encrypted_content: "ciphertext",
     });
     expect(reasoningItem?.id).toBeUndefined();
+    expect(reasoningItem).not.toHaveProperty("encrypted_content");
     const assistantMessage = params.input?.find(
       (item) => item.type === "message" && item.role === "assistant",
     );
@@ -2206,19 +2277,21 @@ describe("openai transport stream", () => {
   });
 
   it("preserves prior Responses replay item ids for custom Codex-compatible responses", () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      baseUrl: "https://proxy.example.com/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-codex-responses">;
+
     const params = buildOpenAIResponsesParams(
-      {
-        id: "gpt-5.4",
-        name: "GPT-5.4",
-        api: "openai-codex-responses",
-        provider: "openai-codex",
-        baseUrl: "https://proxy.example.com/v1",
-        reasoning: true,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 8192,
-      } satisfies Model<"openai-codex-responses">,
+      model,
       {
         systemPrompt: "system",
         messages: [
@@ -2246,6 +2319,13 @@ describe("openai transport stream", () => {
                   id: "rs_prior",
                   encrypted_content: "ciphertext",
                 }),
+                openclawReasoningReplay: testing.buildOpenAIResponsesReasoningReplayMetadata(
+                  model,
+                  {
+                    authProfileId: "openai-codex:oauth",
+                    sessionId: "session-123",
+                  },
+                ),
               },
               {
                 type: "text",
@@ -2267,7 +2347,7 @@ describe("openai transport stream", () => {
         ],
         tools: [],
       } as never,
-      { sessionId: "session-123" },
+      { authProfileId: "openai-codex:oauth", sessionId: "session-123" },
     ) as {
       input?: Array<{
         type?: string;
@@ -2275,12 +2355,17 @@ describe("openai transport stream", () => {
         id?: string;
         call_id?: string;
         phase?: string;
+        encrypted_content?: string;
       }>;
     };
 
-    expect(
-      params.input?.reduce((count, item) => count + (item.type === "reasoning" ? 1 : 0), 0),
-    ).toBe(1);
+    const reasoningItem = params.input?.find((item) => item.type === "reasoning");
+    expectRecordFields(reasoningItem, {
+      type: "reasoning",
+      id: "rs_prior",
+      encrypted_content: "ciphertext",
+    });
+    expect(reasoningItem).not.toHaveProperty("__openclaw_replay");
     const assistantMessage = params.input?.find(
       (item) => item.type === "message" && item.role === "assistant",
     );
@@ -2296,6 +2381,266 @@ describe("openai transport stream", () => {
       id: "fc_prior",
       call_id: "call_abc",
     });
+  });
+
+  it("strips encrypted reasoning replay when provenance does not match", () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      baseUrl: "https://proxy.example.com/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-codex-responses">;
+
+    const params = buildOpenAIResponsesParams(
+      model,
+      {
+        systemPrompt: "system",
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-codex-responses",
+            provider: "openai-codex",
+            model: "gpt-5.4",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: 1,
+            content: [
+              {
+                type: "thinking",
+                thinking: "Need a tool.",
+                thinkingSignature: JSON.stringify({
+                  type: "reasoning",
+                  id: "rs_prior",
+                  encrypted_content: "ciphertext",
+                }),
+                openclawReasoningReplay: testing.buildOpenAIResponsesReasoningReplayMetadata(
+                  model,
+                  {
+                    authProfileId: "openai-codex:oauth",
+                    sessionId: "different-session",
+                  },
+                ),
+              },
+            ],
+          },
+        ],
+        tools: [],
+      } as never,
+      { authProfileId: "openai-codex:oauth", sessionId: "session-123" },
+    ) as {
+      input?: Array<{
+        type?: string;
+        id?: string;
+        encrypted_content?: string;
+      }>;
+    };
+
+    const reasoningItem = params.input?.find((item) => item.type === "reasoning");
+    expectRecordFields(reasoningItem, {
+      type: "reasoning",
+      id: "rs_prior",
+    });
+    expect(reasoningItem).not.toHaveProperty("encrypted_content");
+  });
+
+  it("strips encrypted reasoning replay when the auth profile provenance changes", () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      baseUrl: "https://proxy.example.com/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-codex-responses">;
+
+    const params = buildOpenAIResponsesParams(
+      model,
+      {
+        systemPrompt: "system",
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-codex-responses",
+            provider: "openai-codex",
+            model: "gpt-5.4",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: 1,
+            content: [
+              {
+                type: "thinking",
+                thinking: "Need a tool.",
+                thinkingSignature: JSON.stringify({
+                  type: "reasoning",
+                  id: "rs_prior",
+                  encrypted_content: "ciphertext",
+                }),
+                openclawReasoningReplay: testing.buildOpenAIResponsesReasoningReplayMetadata(
+                  model,
+                  {
+                    authProfileId: "openai-codex:old-oauth",
+                    sessionId: "session-123",
+                  },
+                ),
+              },
+            ],
+          },
+        ],
+        tools: [],
+      } as never,
+      { authProfileId: "openai-codex:new-oauth", sessionId: "session-123" },
+    ) as {
+      input?: Array<{
+        type?: string;
+        id?: string;
+        encrypted_content?: string;
+      }>;
+    };
+
+    const reasoningItem = params.input?.find((item) => item.type === "reasoning");
+    expectRecordFields(reasoningItem, {
+      type: "reasoning",
+      id: "rs_prior",
+    });
+    expect(reasoningItem).not.toHaveProperty("encrypted_content");
+  });
+
+  it("keeps embedded replay provenance as a compatibility fallback", () => {
+    const model = {
+      id: "gpt-5.4",
+      name: "GPT-5.4",
+      api: "openai-codex-responses",
+      provider: "openai-codex",
+      baseUrl: "https://proxy.example.com/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 200000,
+      maxTokens: 8192,
+    } satisfies Model<"openai-codex-responses">;
+
+    const params = buildOpenAIResponsesParams(
+      model,
+      {
+        systemPrompt: "system",
+        messages: [
+          {
+            role: "assistant",
+            api: "openai-codex-responses",
+            provider: "openai-codex",
+            model: "gpt-5.4",
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: 1,
+            content: [
+              {
+                type: "thinking",
+                thinking: "Need a tool.",
+                thinkingSignature: JSON.stringify(
+                  testing.tagOpenAIResponsesReasoningReplayItem(
+                    {
+                      type: "reasoning",
+                      id: "rs_prior",
+                      encrypted_content: "ciphertext",
+                    },
+                    model,
+                    {
+                      authProfileId: "openai-codex:oauth",
+                      sessionId: "session-123",
+                    },
+                  ),
+                ),
+              },
+            ],
+          },
+        ],
+        tools: [],
+      } as never,
+      { authProfileId: "openai-codex:oauth", sessionId: "session-123" },
+    ) as {
+      input?: Array<{
+        type?: string;
+        id?: string;
+        encrypted_content?: string;
+      }>;
+    };
+
+    const reasoningItem = params.input?.find((item) => item.type === "reasoning");
+    expectRecordFields(reasoningItem, {
+      type: "reasoning",
+      id: "rs_prior",
+      encrypted_content: "ciphertext",
+    });
+    expect(reasoningItem).not.toHaveProperty("__openclaw_replay");
+  });
+
+  it("strips nested encrypted reasoning content from retry payloads without changing ids", () => {
+    const params = {
+      model: "gpt-5.5",
+      stream: true,
+      input: [
+        {
+          type: "reasoning",
+          id: "rs_prior",
+          encrypted_content: "ciphertext",
+          summary: [{ type: "summary_text", text: "checked" }],
+          nested: { encrypted_content: "nested-ciphertext", keep: "value" },
+        },
+        {
+          type: "function_call",
+          id: "fc_prior",
+          call_id: "call_abc",
+          name: "price_lookup",
+          arguments: "{}",
+        },
+      ],
+    };
+
+    const stripped = testing.stripResponsesRequestEncryptedContent(
+      params as never,
+    ) as typeof params;
+
+    expect(stripped).not.toBe(params);
+    expect(stripped.input[0]).toMatchObject({
+      type: "reasoning",
+      id: "rs_prior",
+      summary: [{ type: "summary_text", text: "checked" }],
+      nested: { keep: "value" },
+    });
+    expect(stripped.input[0]).not.toHaveProperty("encrypted_content");
+    expect(stripped.input[0].nested).not.toHaveProperty("encrypted_content");
+    expect(stripped.input[1]).toEqual(params.input[1]);
   });
 
   it("normalizes overlong Copilot Responses replay tool ids before dispatch", () => {
@@ -3013,6 +3358,82 @@ describe("openai transport stream", () => {
     ) as { tools?: Array<{ strict?: boolean }> };
 
     expect(params.tools?.[0]?.strict).toBe(false);
+  });
+
+  it("deduplicates repeated OpenAI strict schema downgrade diagnostics", async () => {
+    const debug = vi.fn();
+    const logger = {
+      subsystem: "openai-transport",
+      isEnabled: vi.fn((level: string, target?: string) => level === "debug" && target === "any"),
+      trace: vi.fn(),
+      debug,
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+      fatal: vi.fn(),
+      raw: vi.fn(),
+      child: vi.fn(),
+    };
+    logger.child.mockReturnValue(logger);
+
+    vi.resetModules();
+    vi.doMock("../logging/subsystem.js", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("../logging/subsystem.js")>()),
+      createSubsystemLogger: vi.fn(() => logger),
+    }));
+
+    try {
+      const { buildOpenAIResponsesParams: isolatedBuildOpenAIResponsesParams } =
+        await import("./openai-transport-stream.js");
+      const model = {
+        id: "gpt-5.4",
+        name: "GPT-5.4",
+        api: "openai-responses",
+        provider: "openai",
+        baseUrl: "https://api.openai.com/v1",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 200000,
+        maxTokens: 8192,
+      } satisfies Model<"openai-responses">;
+      const context = {
+        systemPrompt: "system",
+        messages: [],
+        tools: [
+          {
+            name: "read",
+            description: "Read file",
+            parameters: {
+              type: "object",
+              additionalProperties: false,
+              properties: { path: { type: "string" } },
+              required: [],
+            },
+          },
+        ],
+      } as never;
+
+      const first = isolatedBuildOpenAIResponsesParams(model, context, undefined) as {
+        tools?: Array<{ strict?: boolean }>;
+      };
+      const second = isolatedBuildOpenAIResponsesParams(model, context, undefined) as {
+        tools?: Array<{ strict?: boolean }>;
+      };
+
+      expect(first.tools?.[0]?.strict).toBe(false);
+      expect(second.tools?.[0]?.strict).toBe(false);
+      expect(
+        debug.mock.calls.filter(
+          ([message]) =>
+            typeof message === "string" &&
+            message.includes("tool schema strict mode downgraded to strict=false"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      vi.doUnmock("../logging/subsystem.js");
+      vi.resetModules();
+    }
   });
 
   it("omits responses strict tool shaping for proxy-like OpenAI routes", () => {
@@ -4465,7 +4886,7 @@ describe("openai transport stream", () => {
         }
       }
 
-      await __testing.processOpenAICompletionsStream(mockStream(), output, geminiModel, {
+      await testing.processOpenAICompletionsStream(mockStream(), output, geminiModel, {
         push() {},
       });
 
@@ -5059,7 +5480,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("stop");
     expect(
@@ -5153,7 +5574,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     const thinkingBlock = output.content[0] as { type: string; thinking: string };
     const textBlock = output.content[1] as { type: string; text: string };
@@ -5236,7 +5657,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.content).toEqual([
       { type: "thinking", thinking: "Need to think.", thinkingSignature: "content" },
@@ -5320,7 +5741,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("toolUse");
     expect(output.content).toHaveLength(2);
@@ -5416,7 +5837,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("toolUse");
     const toolCall = (output.content as Array<{ type?: string }>).find(
@@ -5522,7 +5943,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("toolUse");
     expect(output.content).toHaveLength(3);
@@ -5619,7 +6040,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("toolUse");
     expect(output.content).toHaveLength(3);
@@ -5709,7 +6130,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.content).toHaveLength(1);
     expectRecordFields(output.content[0], {
@@ -5780,7 +6201,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.content).toHaveLength(3);
     expectRecordFields(output.content[0], { type: "text", text: "Visible first." });
@@ -5850,7 +6271,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.content).toHaveLength(1);
     expectRecordFields(output.content[0], {
@@ -5918,7 +6339,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.content).toHaveLength(2);
     expectRecordFields(output.content[0], { type: "text", text: "Visible answer." });
@@ -6025,7 +6446,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("toolUse");
     expect(output.content).toHaveLength(2);
@@ -6147,7 +6568,7 @@ describe("openai transport stream", () => {
       }
     }
 
-    await __testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
+    await testing.processOpenAICompletionsStream(mockStream(), output, model, stream);
 
     expect(output.stopReason).toBe("toolUse");
     expect(output.content).toHaveLength(2);
@@ -6239,7 +6660,7 @@ describe("openai transport stream", () => {
     }
 
     await expect(
-      __testing.processOpenAICompletionsStream(mockStream(), output, model, stream),
+      testing.processOpenAICompletionsStream(mockStream(), output, model, stream),
     ).rejects.toThrow("Exceeded post-tool-call delta buffer limit");
   });
 
@@ -6308,7 +6729,7 @@ describe("openai transport stream", () => {
     }
 
     await expect(
-      __testing.processOpenAICompletionsStream(mockStream(), output, model, stream),
+      testing.processOpenAICompletionsStream(mockStream(), output, model, stream),
     ).rejects.toThrow("Exceeded tool-call argument buffer limit");
   });
 });
