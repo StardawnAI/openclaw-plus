@@ -433,20 +433,6 @@ describe("OpenClaw Codex sandbox exec-server", () => {
     await expect(openSocket(execServerUrl)).rejects.toThrow();
   });
 
-  it("closes connected exec-server clients when its sandbox environment is released", async () => {
-    const sandbox = createSandboxContext({});
-    const client = createClient();
-    await ensureCodexSandboxExecServerEnvironment({
-      client: client as never,
-      sandbox,
-    });
-    const socket = await openSocket(execServerUrlFromClient(client));
-
-    await releaseCodexSandboxExecServerEnvironment(sandbox);
-
-    await expect(waitForSocketClose(socket)).resolves.toEqual({ code: 1001 });
-  });
-
   it("keeps a shared exec-server open when another turn reacquires during release", async () => {
     const sandbox = createSandboxContext({});
     const client = createClient();

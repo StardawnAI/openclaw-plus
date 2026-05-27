@@ -26,15 +26,14 @@ async function waitForOutboundMessage(
   options?: { sinceIndex?: number },
 ) {
   return await waitForQaTransportCondition(() => {
-    const cursorOptions = { ...options, cursorSpace: "all" as const };
-    const failureMessage = findFailureOutboundMessage(state, cursorOptions);
+    const failureMessage = findFailureOutboundMessage(state, options);
     if (failureMessage) {
       throw new Error(extractQaFailureReplyText(failureMessage.text) ?? failureMessage.text);
     }
     const match = state
       .getSnapshot()
-      .messages.slice(options?.sinceIndex ?? 0)
-      .filter((message: QaBusMessage) => message.direction === "outbound")
+      .messages.filter((message: QaBusMessage) => message.direction === "outbound")
+      .slice(options?.sinceIndex ?? 0)
       .find(predicate);
     if (!match) {
       return undefined;

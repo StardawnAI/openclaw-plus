@@ -43,7 +43,6 @@ export type CodexSandboxExecEnvironment = {
 };
 
 const SANDBOX_EXEC_SERVERS = new Map<string, Promise<OpenClawExecServer>>();
-const EXEC_SERVER_CLOSE_GRACE_MS = 1_000;
 
 export async function closeCodexSandboxExecServersForTests(): Promise<void> {
   const servers = await Promise.allSettled(SANDBOX_EXEC_SERVERS.values());
@@ -248,22 +247,7 @@ async function closeOpenClawExecServer(execServer: OpenClawExecServer): Promise<
     client.close(1001, "shutdown");
   }
   await new Promise<void>((resolve) => {
-    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-    const forceCloseTimer = setTimeout(() => {
-      for (const client of execServer.server.clients) {
-        client.terminate();
-      }
-      fallbackTimer = setTimeout(resolve, EXEC_SERVER_CLOSE_GRACE_MS);
-      fallbackTimer.unref?.();
-    }, EXEC_SERVER_CLOSE_GRACE_MS);
-    forceCloseTimer.unref?.();
-    execServer.server.close(() => {
-      clearTimeout(forceCloseTimer);
-      if (fallbackTimer) {
-        clearTimeout(fallbackTimer);
-      }
-      resolve();
-    });
+    execServer.server.close(() => resolve());
   });
 }
 
