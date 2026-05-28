@@ -1,7 +1,7 @@
 {
   "name": "@openclaw/diffs",
-  "version": "2026.5.26",
-  "description": "OpenClaw diff viewer plugin",
+  "version": "2026.5.27",
+  "description": "OpenClaw read-only diff viewer plugin and file renderer for agents.",
   "repository": {
     "type": "git",
     "url": "https://github.com/openclaw/openclaw"
@@ -31,10 +31,10 @@
       "minHostVersion": ">=2026.4.30"
     },
     "compat": {
-      "pluginApi": ">=2026.5.26"
+      "pluginApi": ">=2026.5.27"
     },
     "build": {
-      "openclawVersion": "2026.5.26",
+      "openclawVersion": "2026.5.27",
       "staticAssets": [
         {
           "source": "./assets/viewer-runtime.js",

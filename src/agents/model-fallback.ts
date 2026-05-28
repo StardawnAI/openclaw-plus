@@ -60,6 +60,7 @@ import {
 } from "./model-selection-resolve.js";
 import { isLikelyContextOverflowError } from "./pi-embedded-helpers/errors.js";
 import type { FailoverReason } from "./pi-embedded-helpers/types.js";
+import { normalizeEmbeddedAgentRuntime } from "./pi-embedded-runner/runtime.js";
 import { resolveSessionSuspensionReason, suspendSession } from "./session-suspension.js";
 
 const log = createSubsystemLogger("model-fallback");
@@ -397,6 +398,10 @@ async function assertModelFallbackCandidateHarnessAvailable(
     return;
   }
   const agentRuntimeOverride = normalizeOptionalString(agentHarnessRuntimeOverride);
+  const normalizedAgentRuntimeOverride =
+    agentRuntimeOverride === undefined
+      ? undefined
+      : normalizeEmbeddedAgentRuntime(agentRuntimeOverride);
   const harnessPolicy = resolveAgentHarnessPolicy({
     provider: params.provider,
     modelId: params.model,
@@ -404,8 +409,8 @@ async function assertModelFallbackCandidateHarnessAvailable(
     agentId: params.agentId,
     sessionKey: params.sessionKey,
   });
-  const agentRuntime = agentRuntimeOverride ?? harnessPolicy.runtime;
-  const agentRuntimeSource = agentRuntimeOverride ? "model" : harnessPolicy.runtimeSource;
+  const agentRuntime = normalizedAgentRuntimeOverride ?? harnessPolicy.runtime;
+  const agentRuntimeSource = normalizedAgentRuntimeOverride ? "model" : harnessPolicy.runtimeSource;
   if (isCliAgentRuntime(agentRuntime, params.cfg)) {
     return;
   }

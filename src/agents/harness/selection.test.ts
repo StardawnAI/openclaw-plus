@@ -272,6 +272,38 @@ describe("runAgentHarnessAttempt", () => {
     expect(piRunAttempt).not.toHaveBeenCalled();
   });
 
+  it("rejects the candidate when the forced plugin harness does not support its provider", async () => {
+    registerFailingCodexHarness();
+
+    const params = createAttemptParams(
+      agentModelRuntimeConfig("9router/cc/claude-opus-4-6", "codex"),
+    );
+    params.provider = "9router";
+    params.modelId = "cc/claude-opus-4-6";
+    params.agentHarnessRuntimeOverride = "codex";
+
+    await expect(runAgentHarnessAttempt(params)).rejects.toThrow(
+      /Requested agent harness "codex" does not support 9router\/cc\/claude-opus-4-6/,
+    );
+    expect(piRunAttempt).not.toHaveBeenCalled();
+  });
+
+  it.each(["openai", "openai-codex"])(
+    "does not override forced Codex harness support rejection for %s",
+    (provider) => {
+      registerFailingCodexHarness();
+
+      expect(() =>
+        selectAgentHarness({
+          provider,
+          modelId: "gpt-5.4",
+          agentHarnessRuntimeOverride: "codex",
+        }),
+      ).toThrow(`Requested agent harness "codex" does not support ${provider}/gpt-5.4`);
+      expect(piRunAttempt).not.toHaveBeenCalled();
+    },
+  );
+
   it("uses the Codex harness by default for OpenAI agent model runs", async () => {
     registerSuccessfulCodexHarness();
 
@@ -554,6 +586,26 @@ describe("selectAgentHarness", () => {
     expect(result.sessionIdUsed).toBe("pi");
   });
 
+  it("treats explicit OpenClaw runtime overrides as the built-in PI harness", async () => {
+    registerSuccessfulCodexHarness();
+
+    const harness = selectAgentHarness({
+      provider: "openai",
+      modelId: "gpt-5.4",
+      agentHarnessRuntimeOverride: "openclaw",
+    });
+
+    expect(harness.id).toBe("pi");
+
+    const result = await runAgentHarnessAttempt({
+      ...createAttemptParams(),
+      provider: "openai",
+      modelId: "gpt-5.4",
+      agentHarnessRuntimeOverride: "openclaw",
+    });
+    expect(result.sessionIdUsed).toBe("pi");
+  });
+
   it("allows per-agent model runtime policy overrides", () => {
     const config = agentModelRuntimeConfig("anthropic/sonnet-4.6", "codex", "strict");
 
@@ -632,7 +684,7 @@ describe("selectAgentHarness", () => {
 
     expect(
       selectAgentHarness({
-        provider: "openai",
+        provider: "codex",
         modelId: "gpt-5.4",
         agentHarnessId: "codex",
       }).id,

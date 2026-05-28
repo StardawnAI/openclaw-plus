@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import {
   appendFileSync,
   chmodSync,
+  createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -19,6 +20,7 @@ import {
 import { mkdtempSync } from "node:fs";
 import { createServer } from "node:http";
 import { createConnection as createNetConnection, createServer as createNetServer } from "node:net";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, win32 as pathWin32 } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -976,6 +978,7 @@ async function runUpgradeLane(params) {
           env,
           packageSpec: params.candidateUrl,
           logPath: join(params.logsDir, "upgrade-update-fallback-install.log"),
+          ignoreScripts: true,
         });
       });
     } else {
@@ -3680,11 +3683,12 @@ async function runCommandInvocation(invocation, options) {
   });
 }
 
-async function startStaticFileServer(params) {
+export async function startStaticFileServer(params) {
   mkdirSync(dirname(params.logPath), { recursive: true });
   const logStream = createWriteStream(params.logPath, { flags: "a" });
   const fileName = String(params.filePath.split(/[/\\]/u).at(-1) ?? "artifact");
-  const fileBytes = readFileSync(params.filePath);
+  const fileStat = statSync(params.filePath);
+  const sockets = new Set<Socket>();
   const server = createServer((request, response) => {
     logStream.write(`${new Date().toISOString()} ${request.method} ${request.url}\n`);
     if (request.url !== `/${fileName}`) {
@@ -3694,8 +3698,26 @@ async function startStaticFileServer(params) {
     }
     response.statusCode = 200;
     response.setHeader("content-type", resolveStaticFileContentType(params.filePath));
-    response.setHeader("content-length", String(fileBytes.length));
-    response.end(fileBytes);
+    response.setHeader("content-length", String(fileStat.size));
+    response.setHeader("connection", "close");
+    const fileStream = createReadStream(params.filePath);
+    fileStream.once("error", (error) => {
+      logStream.write(`${new Date().toISOString()} static-file-read-error ${formatError(error)}\n`);
+      if (response.headersSent) {
+        response.destroy(error);
+        return;
+      }
+      response.removeHeader("content-length");
+      response.statusCode = 500;
+      response.end("failed to read file");
+    });
+    fileStream.pipe(response);
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => {
+      sockets.delete(socket);
+    });
   });
   await new Promise((resolvePromise, rejectPromise) => {
     server.once("error", rejectPromise);
@@ -3718,6 +3740,9 @@ async function startStaticFileServer(params) {
           }
           resolvePromise();
         });
+        for (const socket of sockets) {
+          socket.destroy();
+        }
       }),
   };
 }

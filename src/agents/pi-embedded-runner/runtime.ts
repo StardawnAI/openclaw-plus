@@ -1,11 +1,11 @@
-export type EmbeddedAgentRuntime = "pi" | "auto" | (string & {});
+export type EmbeddedAgentRuntime = "pi" | "openclaw" | "auto" | (string & {});
 
 export function normalizeEmbeddedAgentRuntime(raw: string | undefined): EmbeddedAgentRuntime {
   const value = raw?.trim();
   if (!value) {
     return "pi";
   }
-  if (value === "pi") {
+  if (value === "pi" || value === "openclaw") {
     return "pi";
   }
   if (value === "auto") {

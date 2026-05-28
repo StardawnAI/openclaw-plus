@@ -3,6 +3,8 @@ import {
   testing as sessionBindingServiceTesting,
   registerSessionBindingAdapter,
 } from "../infra/outbound/session-binding-service.js";
+import { setActivePluginRegistry } from "../plugins/runtime.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import type { AgentInternalEvent } from "./internal-events.js";
 import type {
   EmbeddedPiQueueFailureReason,
@@ -23,6 +25,7 @@ import { resolveAnnounceOrigin } from "./subagent-announce-origin.js";
 
 afterEach(() => {
   sessionBindingServiceTesting.resetSessionBindingAdaptersForTests();
+  setActivePluginRegistry(createTestRegistry());
   testing.setDepsForTest();
 });
 
@@ -133,6 +136,27 @@ function expectRecordFields(record: unknown, expected: Record<string, unknown>) 
 
 function asMock(fn: unknown) {
   return fn as ReturnType<typeof vi.fn>;
+}
+
+function registerDirectTargetTestChannel(channelId: string): void {
+  setActivePluginRegistry(
+    createTestRegistry([
+      {
+        pluginId: channelId,
+        source: "test",
+        plugin: {
+          ...createChannelTestPluginBase({
+            id: channelId,
+            capabilities: { chatTypes: ["direct", "channel"] },
+          }),
+          messaging: {
+            inferTargetChatType: ({ to }: { to: string }) =>
+              to.startsWith("channel:") || to.startsWith("thread:") ? "channel" : "direct",
+          },
+        },
+      },
+    ]),
+  );
 }
 
 function mockCallArg(fn: unknown, callIndex = 0, argIndex = 0) {
@@ -602,6 +626,7 @@ describe("resolveSubagentCompletionOrigin", () => {
 describe("deliverSubagentAnnouncement active requester steering", () => {
   async function deliverSteeredAnnouncement(params: {
     mode?: "followup" | "collect" | "interrupt";
+    announceTimeoutMs?: number;
     queueEmbeddedPiMessageWithOutcome?: QueueEmbeddedPiMessageWithOutcome;
     requesterOrigin?: {
       channel?: string;
@@ -622,6 +647,17 @@ describe("deliverSubagentAnnouncement active requester steering", () => {
         params.queueEmbeddedPiMessageWithOutcome ?? createQueueOutcomeMock(true),
       getRuntimeConfig: () =>
         ({
+          ...(params.announceTimeoutMs !== undefined
+            ? {
+                agents: {
+                  defaults: {
+                    subagents: {
+                      announceTimeoutMs: params.announceTimeoutMs,
+                    },
+                  },
+                },
+              }
+            : {}),
           messages: {
             queue: {
               mode: params.mode ?? "followup",
@@ -759,6 +795,165 @@ describe("deliverSubagentAnnouncement active requester steering", () => {
     );
   });
 
+  it("waits through compaction and re-steers the active requester (86566)", async () => {
+    const previousTestFast = process.env.OPENCLAW_TEST_FAST;
+    process.env.OPENCLAW_TEST_FAST = "1";
+    try {
+      // First steer attempt observes a compacting run; once compaction ends the
+      // same wake succeeds, so completion must stay on the steering path instead
+      // of falling back to the direct requester-agent handoff.
+      const queueEmbeddedPiMessageWithOutcome = createQueueOutcomeSequenceMock([
+        "compacting",
+        true,
+      ]);
+      const callGateway = await deliverSteeredAnnouncement({
+        queueEmbeddedPiMessageWithOutcome,
+        requesterOrigin: {
+          channel: "slack",
+          to: "channel:C123",
+          accountId: "acct-1",
+        },
+      });
+
+      expect(callGateway).not.toHaveBeenCalled();
+      expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenCalledTimes(2);
+      const retryOptions = mockCallArg(queueEmbeddedPiMessageWithOutcome, 1, 2);
+      expectRecordFields(retryOptions, {
+        steeringMode: "all",
+        debounceMs: 0,
+        waitForTranscriptCommit: true,
+      });
+      expect(retryOptions.deliveryTimeoutMs).toBeGreaterThan(0);
+      expect(retryOptions.deliveryTimeoutMs).toBeLessThan(120_000);
+    } finally {
+      if (previousTestFast === undefined) {
+        delete process.env.OPENCLAW_TEST_FAST;
+      } else {
+        process.env.OPENCLAW_TEST_FAST = previousTestFast;
+      }
+    }
+  });
+
+  it("keeps retrying compaction past the backoff schedule until the delivery timeout (86566)", async () => {
+    const previousTestFast = process.env.OPENCLAW_TEST_FAST;
+    process.env.OPENCLAW_TEST_FAST = "1";
+    try {
+      // The backoff schedule has four entries, but a compaction that only
+      // finishes after the schedule is exhausted should still be retried while
+      // the run stays within the delivery timeout (120s here). Five compacting
+      // outcomes (more than the schedule length) precede the queued success, so
+      // the wake must keep retrying past the schedule instead of falling back.
+      const queueEmbeddedPiMessageWithOutcome = createQueueOutcomeSequenceMock([
+        "compacting",
+        "compacting",
+        "compacting",
+        "compacting",
+        "compacting",
+        true,
+      ]);
+      const callGateway = await deliverSteeredAnnouncement({
+        queueEmbeddedPiMessageWithOutcome,
+        requesterOrigin: {
+          channel: "slack",
+          to: "channel:C123",
+          accountId: "acct-1",
+        },
+      });
+
+      expect(callGateway).not.toHaveBeenCalled();
+      expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenCalledTimes(6);
+    } finally {
+      if (previousTestFast === undefined) {
+        delete process.env.OPENCLAW_TEST_FAST;
+      } else {
+        process.env.OPENCLAW_TEST_FAST = previousTestFast;
+      }
+    }
+  });
+
+  it("passes the remaining delivery window into compaction retries (86566)", async () => {
+    const previousTestFast = process.env.OPENCLAW_TEST_FAST;
+    process.env.OPENCLAW_TEST_FAST = "1";
+    try {
+      const queueEmbeddedPiMessageWithOutcome = vi
+        .fn<QueueEmbeddedPiMessageWithOutcome>()
+        .mockImplementationOnce((sessionId: string) => ({
+          queued: false,
+          sessionId,
+          reason: "compacting",
+          gatewayHealth: "live",
+        }))
+        .mockImplementationOnce((sessionId: string) => ({
+          queued: true,
+          sessionId,
+          target: "embedded_run",
+          gatewayHealth: "live",
+        }));
+      const callGateway = await deliverSteeredAnnouncement({
+        announceTimeoutMs: 500,
+        queueEmbeddedPiMessageWithOutcome,
+        requesterOrigin: {
+          channel: "slack",
+          to: "channel:C123",
+          accountId: "acct-1",
+        },
+      });
+
+      expect(callGateway).not.toHaveBeenCalled();
+      expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenCalledTimes(2);
+      const retryOptions = mockCallArg(queueEmbeddedPiMessageWithOutcome, 1, 2);
+      expectRecordFields(retryOptions, {
+        steeringMode: "all",
+        debounceMs: 0,
+        waitForTranscriptCommit: true,
+      });
+      expect(retryOptions.deliveryTimeoutMs).toBeGreaterThan(0);
+      expect(retryOptions.deliveryTimeoutMs).toBeLessThan(500);
+    } finally {
+      if (previousTestFast === undefined) {
+        delete process.env.OPENCLAW_TEST_FAST;
+      } else {
+        process.env.OPENCLAW_TEST_FAST = previousTestFast;
+      }
+    }
+  });
+
+  it("does not retry non-compacting steer failures (86566)", async () => {
+    // Only compacting is treated as transient; other wake failures keep their
+    // existing single-attempt fallback behavior.
+    const queueEmbeddedPiMessageWithOutcome = createQueueOutcomeSequenceMock([
+      "no_active_run",
+      true,
+    ]);
+    const callGateway = createGatewayMock();
+    testing.setDepsForTest({
+      callGateway,
+      getRequesterSessionActivity: () => ({
+        sessionId: "paperclip-session",
+        isActive: true,
+      }),
+      queueEmbeddedPiMessageWithOutcome,
+      getRuntimeConfig: () =>
+        ({
+          messages: { queue: { mode: "steer", debounceMs: 0 } },
+        }) as never,
+    });
+
+    const result = await deliverSubagentAnnouncement({
+      requesterSessionKey: "agent:eng:paperclip:issue:123",
+      targetRequesterSessionKey: "agent:eng:paperclip:issue:123",
+      triggerMessage: "child done",
+      steerMessage: "child done",
+      requesterIsSubagent: false,
+      expectsCompletionMessage: false,
+      directIdempotencyKey: "announce-no-active-run-no-retry",
+    });
+
+    // Non-compacting failure is not retried: the steer is attempted once.
+    expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenCalledOnce();
+    expectRecordFields(result, { path: "none" });
+  });
+
   it("does not report delivery when active requester steering is rejected", async () => {
     const queueEmbeddedPiMessageWithOutcome = vi.fn(async (sessionId: string) => ({
       queued: false as const,
@@ -891,6 +1086,42 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
     expect(callGateway).not.toHaveBeenCalled();
   });
 
+  it("waits through compaction on the completion handoff wake (86566)", async () => {
+    const previousTestFast = process.env.OPENCLAW_TEST_FAST;
+    process.env.OPENCLAW_TEST_FAST = "1";
+    try {
+      // The generated-completion active wake (expectsCompletionMessage) must also
+      // wait through a compacting run and re-steer the same wake instead of
+      // falling back to direct delivery.
+      const callGateway = createGatewayMock();
+      const queueEmbeddedPiMessageWithOutcome = createQueueOutcomeSequenceMock([
+        "compacting",
+        true,
+      ]);
+      const result = await deliverSlackThreadAnnouncement({
+        callGateway,
+        sessionId: "requester-session-1",
+        isActive: true,
+        expectsCompletionMessage: true,
+        directIdempotencyKey: "announce-compaction-completion",
+        queueEmbeddedPiMessageWithOutcome,
+      });
+
+      expectRecordFields(result, {
+        delivered: true,
+        path: "steered",
+      });
+      expect(queueEmbeddedPiMessageWithOutcome).toHaveBeenCalledTimes(2);
+      expect(callGateway).not.toHaveBeenCalled();
+    } finally {
+      if (previousTestFast === undefined) {
+        delete process.env.OPENCLAW_TEST_FAST;
+      } else {
+        process.env.OPENCLAW_TEST_FAST = previousTestFast;
+      }
+    }
+  });
+
   it("does not also direct-run a queued active completion", async () => {
     const callGateway = createGatewayMock();
     const queueEmbeddedPiMessageWithOutcome = createQueueOutcomeMock(true);
@@ -935,6 +1166,223 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
       bestEffortDeliver: true,
     });
     expect(queueEmbeddedPiMessageWithOutcome).not.toHaveBeenCalled();
+  });
+
+  it("directly delivers direct-message subagent text when the announce agent returns no visible output", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverDiscordDirectMessageCompletion({
+      callGateway,
+      sendMessage,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "direct completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "discord",
+        accountId: "acct-1",
+        to: "dm:U123",
+        content: "child completion output",
+        idempotencyKey: "announce-dm-fallback-empty:text-direct",
+      }),
+    );
+  });
+
+  it("does not directly deliver failed subagent placeholder output", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverDiscordDirectMessageCompletion({
+      callGateway,
+      sendMessage,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "direct completion smoke",
+          status: "error",
+          statusLabel: "failed: all models failed",
+          result: "(no output)",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: false,
+      path: "direct",
+      error: "completion agent did not produce a visible reply",
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("directly delivers unprefixed direct targets recognized by the channel grammar", async () => {
+    registerDirectTargetTestChannel("qa-channel");
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverSlackChannelAnnouncement({
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-qa",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-qa-fallback-empty",
+      requesterSessionKey: "agent:qa:subagent-direct-fallback:1234",
+      requesterOrigin: {
+        channel: "qa-channel",
+        to: "qa-operator",
+        accountId: "default",
+      },
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "qa direct completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "qa-channel",
+        accountId: "default",
+        to: "qa-operator",
+        content: "child completion output",
+        idempotencyKey: "announce-qa-fallback-empty:text-direct",
+      }),
+    );
+  });
+
+  it("does not raw-send channel completions just because the requester key is direct", async () => {
+    const callGateway = createGatewayMock({
+      result: {
+        payloads: [],
+      },
+    });
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverSlackChannelAnnouncement({
+      callGateway,
+      sendMessage,
+      sessionId: "requester-session-channel",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-channel-direct-key-empty",
+      requesterSessionKey: "agent:main:discord:dm:U123",
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "channel completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expectGatewayAgentParams(callGateway, {
+      deliver: true,
+      channel: "slack",
+      accountId: "acct-1",
+      to: "channel:C123",
+    });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("directly delivers direct-message subagent text when the announce agent returns incomplete", async () => {
+    const callGateway = vi.fn(async () => {
+      throw new Error(
+        "FailoverError: mock-openai/gpt-5.5 ended with an incomplete terminal response: code=incomplete_result",
+      );
+    }) as unknown as typeof runtimeCallGateway;
+    const sendMessage = createSendMessageMock();
+
+    const result = await deliverDiscordDirectMessageCompletion({
+      callGateway,
+      sendMessage,
+      internalEvents: [
+        {
+          type: "task_completion",
+          source: "subagent",
+          childSessionKey: "agent:worker:subagent:child",
+          childSessionId: "child-session-id",
+          announceType: "subagent task",
+          taskLabel: "direct completion smoke",
+          status: "ok",
+          statusLabel: "completed successfully",
+          result: "child completion output",
+          replyInstruction: "Summarize the result.",
+        },
+      ],
+    });
+
+    expectRecordFields(result, {
+      delivered: true,
+      path: "direct",
+    });
+    expect(sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "discord",
+        accountId: "acct-1",
+        to: "dm:U123",
+        content: "child completion output",
+        idempotencyKey: "announce-dm-fallback-empty:text-direct",
+      }),
+    );
   });
 
   it("uses in-process agent dispatch for dormant completion requesters", async () => {

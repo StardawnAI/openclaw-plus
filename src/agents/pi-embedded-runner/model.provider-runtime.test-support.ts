@@ -14,6 +14,10 @@ const GOOGLE_GEMINI_CLI_BASE_URL = "https://cloudcode-pa.googleapis.com";
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const DEFAULT_MAX_TOKENS = 8192;
 const OPENROUTER_FALLBACK_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const OPENAI_GPT_55_COST = { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 };
+const OPENAI_GPT_55_MEDIA_INPUT = {
+  image: { maxSidePx: 6000, preferredSidePx: 2048, tokenMode: "detail" },
+};
 const ANTHROPIC_VISION_MODEL_PREFIXES = [
   "claude-opus-4-7",
   "claude-opus-4.7",
@@ -400,63 +404,78 @@ function buildDynamicModel(
     }
     case "openai": {
       const templateIds =
-        lower === "gpt-5.4"
-          ? ["gpt-5.4"]
-          : lower === "gpt-5.4-pro"
-            ? ["gpt-5.4-pro", "gpt-5.4"]
-            : lower === "gpt-5.4-mini"
-              ? ["gpt-5.4-mini"]
-              : lower === "gpt-5.4-nano"
-                ? ["gpt-5.4-nano", "gpt-5.4-mini"]
-                : undefined;
+        lower === "gpt-5.5"
+          ? ["gpt-5.5", "gpt-5.4"]
+          : lower === "gpt-5.4"
+            ? ["gpt-5.4"]
+            : lower === "gpt-5.4-pro"
+              ? ["gpt-5.4-pro", "gpt-5.4"]
+              : lower === "gpt-5.4-mini"
+                ? ["gpt-5.4-mini"]
+                : lower === "gpt-5.4-nano"
+                  ? ["gpt-5.4-nano", "gpt-5.4-mini"]
+                  : undefined;
       if (!templateIds) {
         return undefined;
       }
       const template = findTemplate(params, "openai", templateIds);
       const patch =
-        lower === "gpt-5.4"
+        lower === "gpt-5.5"
           ? {
               provider: "openai",
               api: "openai-responses",
               baseUrl: OPENAI_BASE_URL,
               reasoning: true,
               input: ["text", "image"],
-              cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
-              contextWindow: 272_000,
+              mediaInput: OPENAI_GPT_55_MEDIA_INPUT,
+              cost: OPENAI_GPT_55_COST,
+              contextWindow: 1_000_000,
+              contextTokens: 272_000,
               maxTokens: 128_000,
             }
-          : lower === "gpt-5.4-pro"
+          : lower === "gpt-5.4"
             ? {
                 provider: "openai",
                 api: "openai-responses",
                 baseUrl: OPENAI_BASE_URL,
                 reasoning: true,
                 input: ["text", "image"],
-                cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
-                contextWindow: 1_050_000,
+                cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 },
+                contextWindow: 272_000,
                 maxTokens: 128_000,
               }
-            : lower === "gpt-5.4-mini"
+            : lower === "gpt-5.4-pro"
               ? {
                   provider: "openai",
                   api: "openai-responses",
                   baseUrl: OPENAI_BASE_URL,
                   reasoning: true,
                   input: ["text", "image"],
-                  cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
-                  contextWindow: 400_000,
+                  cost: { input: 30, output: 180, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 1_050_000,
                   maxTokens: 128_000,
                 }
-              : {
-                  provider: "openai",
-                  api: "openai-responses",
-                  baseUrl: OPENAI_BASE_URL,
-                  reasoning: true,
-                  input: ["text", "image"],
-                  cost: { input: 0.2, output: 1.25, cacheRead: 0.02, cacheWrite: 0 },
-                  contextWindow: 400_000,
-                  maxTokens: 128_000,
-                };
+              : lower === "gpt-5.4-mini"
+                ? {
+                    provider: "openai",
+                    api: "openai-responses",
+                    baseUrl: OPENAI_BASE_URL,
+                    reasoning: true,
+                    input: ["text", "image"],
+                    cost: { input: 0.75, output: 4.5, cacheRead: 0.075, cacheWrite: 0 },
+                    contextWindow: 400_000,
+                    maxTokens: 128_000,
+                  }
+                : {
+                    provider: "openai",
+                    api: "openai-responses",
+                    baseUrl: OPENAI_BASE_URL,
+                    reasoning: true,
+                    input: ["text", "image"],
+                    cost: { input: 0.2, output: 1.25, cacheRead: 0.02, cacheWrite: 0 },
+                    contextWindow: 400_000,
+                    maxTokens: 128_000,
+                  };
       return cloneTemplate(template, modelId, patch, {
         provider: "openai",
         api: "openai-responses",

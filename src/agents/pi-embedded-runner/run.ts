@@ -36,6 +36,7 @@ import {
   markAuthProfileSuccess,
   resolveAuthProfileEligibility,
 } from "../auth-profiles.js";
+import { resolveExternalCliAuthOverlayScopeFromSelection } from "../auth-profiles/external-cli-auth-selection.js";
 import { listActiveProcessSessionReferences } from "../bash-process-references.js";
 import {
   resolveSessionKeyForRequest,
@@ -379,6 +380,7 @@ function backfillSessionKey(params: {
       : resolveSessionKeyForRequest({
           cfg: params.config,
           sessionId: params.sessionId,
+          clone: false,
         });
     return normalizeOptionalString(resolved.sessionKey);
   } catch (err) {
@@ -637,46 +639,68 @@ export async function runEmbeddedPiAgent(
         config: params.config,
         workspaceDir: resolvedWorkspace,
       });
-      const dynamicModelResolution = await resolveModelAsync(
-        provider,
-        modelId,
-        agentDir,
-        params.config,
-        {
-          // Plugin dynamic model hooks can resolve explicit model refs without
-          // first generating PI models.json. This keeps one-shot model runs from
-          // blocking on unrelated provider discovery.
-          skipPiDiscovery: true,
-          workspaceDir: resolvedWorkspace,
-        },
-      );
-      let modelResolution =
-        dynamicModelResolution.model || pluginHarnessOwnsTransport
-          ? dynamicModelResolution
-          : await (async () => {
-              await ensureOpenClawModelsJson(params.config, agentDir, {
-                workspaceDir: resolvedWorkspace,
-              });
-              return await resolveModelAsync(provider, modelId, agentDir, params.config, {
-                workspaceDir: resolvedWorkspace,
-              });
-            })();
-      if (selectedPiRuntimeProvider !== provider && modelResolution.model) {
-        const runtimeModelResolution = await resolveModelAsync(
-          selectedPiRuntimeProvider,
+      const modelResolutionProviders =
+        selectedPiRuntimeProvider !== provider ? [selectedPiRuntimeProvider, provider] : [provider];
+      let resolvedModelProvider = provider;
+      let firstModelResolution: Awaited<ReturnType<typeof resolveModelAsync>> | undefined;
+      let modelResolution: Awaited<ReturnType<typeof resolveModelAsync>> | undefined;
+      for (const candidateProvider of modelResolutionProviders) {
+        const candidateResolution = await resolveModelAsync(
+          candidateProvider,
           modelId,
           agentDir,
           params.config,
           {
+            // Plugin dynamic model hooks can resolve explicit model refs without
+            // first generating PI models.json. This keeps one-shot model runs from
+            // blocking on unrelated provider discovery.
             skipPiDiscovery: true,
             workspaceDir: resolvedWorkspace,
           },
         );
-        if (runtimeModelResolution.model) {
-          provider = selectedPiRuntimeProvider;
-          modelResolution = runtimeModelResolution;
+        firstModelResolution ??= candidateResolution;
+        if (candidateResolution.model) {
+          resolvedModelProvider = candidateProvider;
+          modelResolution = candidateResolution;
+          break;
         }
       }
+      if (!modelResolution && pluginHarnessOwnsTransport) {
+        modelResolution = firstModelResolution;
+      }
+      if (!modelResolution) {
+        await ensureOpenClawModelsJson(params.config, agentDir, {
+          workspaceDir: resolvedWorkspace,
+        });
+        for (const candidateProvider of modelResolutionProviders) {
+          const candidateResolution = await resolveModelAsync(
+            candidateProvider,
+            modelId,
+            agentDir,
+            params.config,
+            {
+              workspaceDir: resolvedWorkspace,
+            },
+          );
+          firstModelResolution ??= candidateResolution;
+          if (candidateResolution.model) {
+            resolvedModelProvider = candidateProvider;
+            modelResolution = candidateResolution;
+            break;
+          }
+        }
+      }
+      modelResolution ??= firstModelResolution;
+      if (!modelResolution) {
+        throw new FailoverError(`Unknown model: ${provider}/${modelId}`, {
+          reason: "model_not_found",
+          provider,
+          model: modelId,
+          sessionId: params.sessionId,
+          lane: globalLane,
+        });
+      }
+      provider = resolvedModelProvider;
       const { model, error, authStorage, modelRegistry } = modelResolution;
       if (!model) {
         throw new FailoverError(error ?? `Unknown model: ${provider}/${modelId}`, {
@@ -708,6 +732,37 @@ export async function runEmbeddedPiAgent(
         pluginHarnessOwnsTransport &&
         provider === OPENAI_CODEX_PROVIDER_ID &&
         effectiveModel.api === "openai-codex-responses";
+      let piExternalCliAuthScope = pluginHarnessOwnsTransport
+        ? { ignoreAutoPreferredProfile: false }
+        : resolveExternalCliAuthOverlayScopeFromSelection({
+            provider,
+            cfg: params.config,
+            agentId: params.agentId,
+            modelId,
+            workspaceDir: resolvedWorkspace,
+            userLockedAuthProfileId:
+              params.authProfileIdSource === "user" ? params.authProfileId : undefined,
+          });
+      let noExternalAuthStore: AuthProfileStore | undefined;
+      if (
+        !pluginHarnessOwnsTransport &&
+        !pluginHarnessNeedsOpenClawAuthBootstrap &&
+        !piExternalCliAuthScope.providerIds
+      ) {
+        noExternalAuthStore = ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+          allowKeychainPrompt: false,
+        });
+        piExternalCliAuthScope = resolveExternalCliAuthOverlayScopeFromSelection({
+          provider,
+          cfg: params.config,
+          agentId: params.agentId,
+          modelId,
+          workspaceDir: resolvedWorkspace,
+          store: noExternalAuthStore,
+          userLockedAuthProfileId:
+            params.authProfileIdSource === "user" ? params.authProfileId : undefined,
+        });
+      }
       const authStore =
         pluginHarnessOwnsTransport && !pluginHarnessNeedsOpenClawAuthBootstrap
           ? createEmptyAuthProfileStore()
@@ -716,9 +771,15 @@ export async function runEmbeddedPiAgent(
                 externalCliProviderIds: [OPENAI_CODEX_PROVIDER_ID],
                 allowKeychainPrompt: false,
               })
-            : ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
-                allowKeychainPrompt: false,
-              });
+            : piExternalCliAuthScope.providerIds
+              ? ensureAuthProfileStore(agentDir, {
+                  externalCliProviderIds: piExternalCliAuthScope.providerIds,
+                  allowKeychainPrompt: false,
+                })
+              : (noExternalAuthStore ??
+                ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+                  allowKeychainPrompt: false,
+                }));
       const attemptAuthProfileStore =
         pluginHarnessOwnsTransport && !pluginHarnessNeedsOpenClawAuthBootstrap
           ? ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
@@ -788,7 +849,9 @@ export async function runEmbeddedPiAgent(
         pluginHarnessProfileOrder[0];
       const preferredProfileId = pluginHarnessOwnsTransport
         ? resolvePluginHarnessPreferredProfileId()
-        : requestedProfileId;
+        : piExternalCliAuthScope.ignoreAutoPreferredProfile && !requestedProfileIsUserLocked
+          ? undefined
+          : requestedProfileId;
       let lockedProfileId = requestedProfileIsUserLocked ? preferredProfileId : undefined;
       if (lockedProfileId) {
         if (pluginHarnessOwnsTransport) {
@@ -1410,6 +1473,7 @@ export async function runEmbeddedPiAgent(
           const rawAttempt = await runEmbeddedAttemptWithBackend({
             sessionId: activeSessionId,
             sessionKey: resolvedSessionKey,
+            promptCacheKey: params.promptCacheKey,
             sandboxSessionKey: params.sandboxSessionKey,
             trigger: params.trigger,
             memoryFlushWritePath: params.memoryFlushWritePath,

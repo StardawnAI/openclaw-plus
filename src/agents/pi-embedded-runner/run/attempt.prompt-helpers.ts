@@ -16,6 +16,7 @@ import { isCronSessionKey, isSubagentSessionKey } from "../../../routing/session
 import { joinPresentTextSegments } from "../../../shared/text/join-segments.js";
 import { listActiveProcessSessionReferences } from "../../bash-process-references.js";
 import { resolveHeartbeatPromptForSystemPrompt } from "../../heartbeat-system-prompt.js";
+import { wrapPluginSystemContextSection } from "../../hook-system-context-boundary.js";
 import { buildActiveImageGenerationTaskPromptContextForSession } from "../../image-generation-task-status.js";
 import { buildActiveMusicGenerationTaskPromptContextForSession } from "../../music-generation-task-status.js";
 import { hasOpenAICompatibleConversationTurn } from "../../openai-compatible-conversation-turn.js";
@@ -198,12 +199,12 @@ export async function resolvePromptBuildHookResult(params: {
       legacyResult?.appendContext,
     ]),
     prependSystemContext: joinPresentTextSegments([
-      promptBuildResult?.prependSystemContext,
-      legacyResult?.prependSystemContext,
+      wrapPluginSystemContextSection(promptBuildResult?.prependSystemContext),
+      wrapPluginSystemContextSection(legacyResult?.prependSystemContext),
     ]),
     appendSystemContext: joinPresentTextSegments([
-      promptBuildResult?.appendSystemContext,
-      legacyResult?.appendSystemContext,
+      wrapPluginSystemContextSection(promptBuildResult?.appendSystemContext),
+      wrapPluginSystemContextSection(legacyResult?.appendSystemContext),
     ]),
   };
 }
