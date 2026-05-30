@@ -314,6 +314,14 @@ describe("qa mock openai server", () => {
     expect(telegramThreeChunkLongBody).toContain("TELEGRAM-LONG-FINAL-3CHUNK-END");
     expect(telegramThreeChunkLongBody.length).toBeGreaterThan(8_000);
 
+    const blockPrompt = [
+      "Block streaming QA check: complete this whole sequence in one turn.",
+      "Step 1: send an assistant text block containing only this exact marker: `BLOCK_ONE_OK`.",
+      "That first marker block must be emitted before any tool call.",
+      "Step 2: after the first marker block, use the read tool exactly once on `QA_KICKOFF_TASK.md`.",
+      "Step 3: after that read completes, send a final assistant text block containing only this exact marker: `BLOCK_TWO_OK`.",
+      "Never put both markers in the same assistant text block.",
+    ].join("\n");
     const blockResponse = await fetch(`${server.baseUrl}/v1/responses`, {
       method: "POST",
       headers: {
@@ -321,19 +329,39 @@ describe("qa mock openai server", () => {
       },
       body: JSON.stringify({
         stream: true,
-        input: [
-          makeUserInput(
-            "Block streaming QA check: emit exactly two assistant message blocks in order. First exact marker: `BLOCK_ONE_OK`. Second exact marker: `BLOCK_TWO_OK`.",
-          ),
-        ],
+        input: [makeUserInput(blockPrompt)],
       }),
     });
     expect(blockResponse.status).toBe(200);
     const blockBody = await blockResponse.text();
     expect(blockBody).toContain('"item_id":"msg_mock_block_1"');
-    expect(blockBody).toContain('"item_id":"msg_mock_block_2"');
+    expect(blockBody).toContain('"name":"read"');
+    expect(blockBody).toContain("QA_KICKOFF_TASK.md");
     expect(blockBody).toContain("BLOCK_ONE_OK");
-    expect(blockBody).toContain("BLOCK_TWO_OK");
+    expect(blockBody).not.toContain('"item_id":"msg_mock_block_2"');
+
+    const blockContinuation = await fetch(`${server.baseUrl}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        stream: true,
+        input: [
+          makeUserInput(blockPrompt),
+          {
+            type: "function_call_output",
+            call_id: "call_mock_read_fixture",
+            output: "QA kickoff task read",
+          },
+        ],
+      }),
+    });
+    expect(blockContinuation.status).toBe(200);
+    const blockContinuationBody = await blockContinuation.text();
+    expect(blockContinuationBody).toContain('"item_id":"msg_mock_block_2"');
+    expect(blockContinuationBody).toContain("BLOCK_TWO_OK");
+    expect(blockContinuationBody).not.toContain('"item_id":"msg_mock_block_1"');
   });
 
   it("plans deterministic tool-progress reads from prompt paths", async () => {
@@ -3436,7 +3464,7 @@ describe("qa mock openai server", () => {
     expect(outputText(await response.json())).toBe("NO_REPLY");
   });
 
-  it("advertises Anthropic claude-opus-4-7 baseline model on /v1/models", async () => {
+  it("advertises Anthropic claude-opus-4-8 baseline model on /v1/models", async () => {
     const server = await startQaMockOpenAiServer({
       host: "127.0.0.1",
       port: 0,
@@ -3449,7 +3477,7 @@ describe("qa mock openai server", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { data: Array<{ id: string }> };
     const ids = body.data.map((entry) => entry.id);
-    expect(ids).toContain("claude-opus-4-7");
+    expect(ids).toContain("claude-opus-4-8");
     expect(ids).toContain("gpt-5.5");
   });
 
@@ -3466,7 +3494,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         messages: [
           {
@@ -3491,7 +3519,7 @@ describe("qa mock openai server", () => {
     };
     expect(body.type).toBe("message");
     expect(body.role).toBe("assistant");
-    expect(body.model).toBe("claude-opus-4-7");
+    expect(body.model).toBe("claude-opus-4-8");
     expect(body.stop_reason).toBe("tool_use");
     const toolUseBlock = body.content.find((block) => block.type === "tool_use") as
       | { name: string; input: Record<string, unknown> }
@@ -3502,7 +3530,7 @@ describe("qa mock openai server", () => {
     const debugResponse = await fetch(`${server.baseUrl}/debug/last-request`);
     expect(debugResponse.status).toBe(200);
     const debugPayload = requireRecord(await debugResponse.json(), "debug request");
-    expect(debugPayload.model).toBe("claude-opus-4-7");
+    expect(debugPayload.model).toBe("claude-opus-4-8");
     expect(debugPayload.plannedToolName).toBe("read");
   });
 
@@ -3513,7 +3541,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         tools: [
           {
@@ -3553,7 +3581,7 @@ describe("qa mock openai server", () => {
     const debugResponse = await fetch(`${server.baseUrl}/debug/last-request`);
     expect(debugResponse.status).toBe(200);
     const debugPayload = requireRecord(await debugResponse.json(), "debug request");
-    expect(debugPayload.model).toBe("claude-opus-4-7");
+    expect(debugPayload.model).toBe("claude-opus-4-8");
     expect(debugPayload.plannedToolName).toBe("sessions_spawn");
   });
 
@@ -3577,7 +3605,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         messages: [
           {
@@ -3651,7 +3679,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         messages: [
           {
@@ -3732,7 +3760,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         stream: true,
         messages: [
@@ -3773,7 +3801,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         stream: true,
         messages: [
@@ -3832,7 +3860,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         stream: true,
         system: [
@@ -3875,7 +3903,7 @@ describe("qa mock openai server", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         stream: true,
         system: [
@@ -3920,7 +3948,7 @@ describe("qa mock openai server", () => {
     const response = await fetch(`${server.baseUrl}/v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: '{"model":"claude-opus-4-7","messages":[',
+      body: '{"model":"claude-opus-4-8","messages":[',
     });
 
     expect(response.status).toBe(400);
@@ -3933,12 +3961,12 @@ describe("qa mock openai server", () => {
     expect(body.error.message).toContain("Malformed JSON body");
   });
 
-  it("defaults empty-string Anthropic /v1/messages model to claude-opus-4-7", async () => {
+  it("defaults empty-string Anthropic /v1/messages model to claude-opus-4-8", async () => {
     // Regression for the loop-7 Copilot finding: a bare `typeof
     // body.model === "string"` check lets an empty-string model leak
     // through to `lastRequest.model` and `responseBody.model`. Empty
     // strings must be treated the same as absent and default to
-    // `"claude-opus-4-7"` so parity consumers can trust the echoed label.
+    // `"claude-opus-4-8"` so parity consumers can trust the echoed label.
     const server = await startQaMockOpenAiServer({
       host: "127.0.0.1",
       port: 0,
@@ -3963,12 +3991,12 @@ describe("qa mock openai server", () => {
     });
     expect(response.status).toBe(200);
     const body = (await response.json()) as { model: string };
-    expect(body.model).toBe("claude-opus-4-7");
+    expect(body.model).toBe("claude-opus-4-8");
 
     const debugResponse = await fetch(`${server.baseUrl}/debug/last-request`);
     expect(debugResponse.status).toBe(200);
     const debug = (await debugResponse.json()) as { model: string };
-    expect(debug.model).toBe("claude-opus-4-7");
+    expect(debug.model).toBe("claude-opus-4-8");
   });
 
   it("scripts a reasoning-only recovery sequence after a replay-safe read", async () => {
@@ -4219,9 +4247,9 @@ describe("resolveProviderVariant", () => {
   });
 
   it("tags prefix-qualified anthropic models", () => {
-    expect(resolveProviderVariant("anthropic/claude-opus-4-7")).toBe("anthropic");
-    expect(resolveProviderVariant("anthropic:claude-opus-4-7")).toBe("anthropic");
-    expect(resolveProviderVariant("claude-cli/claude-opus-4-7")).toBe("anthropic");
+    expect(resolveProviderVariant("anthropic/claude-opus-4-8")).toBe("anthropic");
+    expect(resolveProviderVariant("anthropic:claude-opus-4-8")).toBe("anthropic");
+    expect(resolveProviderVariant("claude-cli/claude-opus-4-8")).toBe("anthropic");
   });
 
   it("tags bare model names by prefix", () => {
@@ -4229,7 +4257,7 @@ describe("resolveProviderVariant", () => {
     expect(resolveProviderVariant("gpt-5.5-alt")).toBe("openai");
     expect(resolveProviderVariant("gpt-4.5")).toBe("openai");
     expect(resolveProviderVariant("o1-preview")).toBe("openai");
-    expect(resolveProviderVariant("claude-opus-4-7")).toBe("anthropic");
+    expect(resolveProviderVariant("claude-opus-4-8")).toBe("anthropic");
     expect(resolveProviderVariant("claude-sonnet-4-6")).toBe("anthropic");
   });
 
@@ -4265,7 +4293,7 @@ describe("qa mock openai server provider variant tagging", () => {
 
     const anthropicSourceServer = await startMockServer();
     const anthropicSource = await expectResponsesJson(anthropicSourceServer, {
-      model: "anthropic/claude-opus-4-7",
+      model: "anthropic/claude-opus-4-8",
       stream: false,
       input: [makeUserInput(sourcePrompt)],
     });
@@ -4284,7 +4312,7 @@ describe("qa mock openai server provider variant tagging", () => {
 
     const anthropicHandoffServer = await startMockServer();
     const anthropicHandoff = await expectResponsesJson(anthropicHandoffServer, {
-      model: "claude-opus-4-7",
+      model: "claude-opus-4-8",
       stream: false,
       input: [makeUserInput(handoffPrompt)],
     });
@@ -4307,7 +4335,7 @@ describe("qa mock openai server provider variant tagging", () => {
 
     const anthropicFanoutServer = await startMockServer();
     const anthropicFanout = await expectResponsesJson(anthropicFanoutServer, {
-      model: "anthropic/claude-opus-4-7",
+      model: "anthropic/claude-opus-4-8",
       stream: false,
       tools: [SESSIONS_SPAWN_TOOL],
       input: [makeUserInput(fanoutPrompt)],
@@ -4358,7 +4386,7 @@ describe("qa mock openai server provider variant tagging", () => {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        model: "claude-opus-4-7",
+        model: "claude-opus-4-8",
         max_tokens: 256,
         messages: [{ role: "user", content: "Heartbeat check" }],
       }),
@@ -4368,7 +4396,7 @@ describe("qa mock openai server provider variant tagging", () => {
       model: string;
       providerVariant: string;
     };
-    expect(debug.model).toBe("claude-opus-4-7");
+    expect(debug.model).toBe("claude-opus-4-8");
     expect(debug.providerVariant).toBe("anthropic");
   });
 

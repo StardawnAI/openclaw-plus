@@ -39,6 +39,7 @@
   "cron-store-runtime",
   "config-schema",
   "json-schema-runtime",
+  "json-unsafe-integers",
   "reply-runtime",
   "reply-dedupe",
   "reply-dispatch-runtime",
@@ -69,6 +70,7 @@
   "secure-random-runtime",
   "system-event-runtime",
   "transport-ready-runtime",
+  "exec-approvals-runtime",
   "infra-runtime",
   "runtime-config-snapshot",
   "runtime-group-policy",
@@ -136,6 +138,8 @@
   "logging-core",
   "migration",
   "migration-runtime",
+  "plugin-state-runtime",
+  "plugin-state-test-runtime",
   "markdown-table-runtime",
   "account-helpers",
   "account-core",
@@ -318,5 +322,8 @@
   "webhook-path",
   "web-media",
   "zalouser",
-  "zod"
+  "zod",
+  "agent-core",
+  "agent-sessions",
+  "llm"
 ]

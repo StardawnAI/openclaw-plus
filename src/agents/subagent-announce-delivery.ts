@@ -15,6 +15,7 @@ import {
 import { deriveSessionChatTypeFromKey } from "../sessions/session-chat-type-shared.js";
 import { isCronRunSessionKey, isCronSessionKey } from "../sessions/session-key-utils.js";
 import { isNonTerminalAgentRunStatus } from "../shared/agent-run-status.js";
+import { clampTimerTimeoutMs } from "../shared/number-coercion.js";
 import { normalizeOptionalLowercaseString } from "../shared/string-coerce.js";
 import { normalizeStringEntries, uniqueStrings } from "../shared/string-normalization.js";
 import { mergeDeliveryContext, normalizeDeliveryContext } from "../utils/delivery-context.js";
@@ -25,8 +26,6 @@ import {
   isInternalMessageChannel,
   normalizeMessageChannel,
 } from "../utils/message-channel.js";
-import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
-import type { AgentInternalEvent } from "./internal-events.js";
 import {
   collectMessagingToolDeliveredMediaUrls,
   getAgentCommandDeliveryFailure,
@@ -34,19 +33,23 @@ import {
   hasDeliveredExpectedMedia,
   hasMessagingToolDeliveryEvidence,
   hasVisibleAgentPayload,
-} from "./pi-embedded-runner/delivery-evidence.js";
-import type { EmbeddedPiQueueMessageOptions } from "./pi-embedded-runner/run-state.js";
-import type { EmbeddedPiQueueMessageOutcome } from "./pi-embedded-runner/runs.js";
+} from "./embedded-agent-runner/delivery-evidence.js";
+import type { EmbeddedAgentQueueMessageOptions } from "./embedded-agent-runner/run-state.js";
+import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/runs.js";
+import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
+import type { AgentInternalEvent } from "./internal-events.js";
+import { isSessionWriteLockTimeoutError } from "./session-write-lock-error.js";
 import {
   callGateway,
   createBoundDeliveryRouter,
   dispatchGatewayMethodInProcess,
   getGlobalHookRunner,
-  isEmbeddedPiRunActive,
+  isEmbeddedAgentRunActive,
+  isEmbeddedRunAbandoned,
   getRuntimeConfig,
-  formatEmbeddedPiQueueFailureSummary,
+  formatEmbeddedAgentQueueFailureSummary,
   loadSessionStore,
-  queueEmbeddedPiMessageWithOutcomeAsync,
+  queueEmbeddedAgentMessageWithOutcomeAsync,
   resolveActiveEmbeddedRunSessionId,
   resolveAgentIdFromSessionKey,
   resolveConversationIdFromTargets,
@@ -65,7 +68,6 @@ import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
 import type { SpawnSubagentMode } from "./subagent-spawn.types.js";
 
 const DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS = 120_000;
-const MAX_TIMER_SAFE_TIMEOUT_MS = 2_147_000_000;
 type SubagentAnnounceDeliveryDeps = {
   dispatchGatewayMethodInProcess: typeof dispatchGatewayMethodInProcess;
   getRuntimeConfig: typeof getRuntimeConfig;
@@ -73,11 +75,12 @@ type SubagentAnnounceDeliveryDeps = {
     sessionId?: string;
     isActive: boolean;
   };
-  queueEmbeddedPiMessageWithOutcome: (
+  isRequesterSessionAbandoned: (requesterSessionKey: string, sessionId?: string) => boolean;
+  queueEmbeddedAgentMessageWithOutcome: (
     sessionId: string,
     text: string,
-    options?: EmbeddedPiQueueMessageOptions,
-  ) => EmbeddedPiQueueMessageOutcome | Promise<EmbeddedPiQueueMessageOutcome>;
+    options?: EmbeddedAgentQueueMessageOptions,
+  ) => EmbeddedAgentQueueMessageOutcome | Promise<EmbeddedAgentQueueMessageOutcome>;
   sendMessage: typeof sendMessage;
 };
 
@@ -90,22 +93,24 @@ const defaultSubagentAnnounceDeliveryDeps: SubagentAnnounceDeliveryDeps = {
       loadRequesterSessionEntry(requesterSessionKey).entry?.sessionId;
     return {
       sessionId,
-      isActive: Boolean(sessionId && isEmbeddedPiRunActive(sessionId)),
+      isActive: Boolean(sessionId && isEmbeddedAgentRunActive(sessionId)),
     };
   },
-  queueEmbeddedPiMessageWithOutcome: queueEmbeddedPiMessageWithOutcomeAsync,
+  isRequesterSessionAbandoned: (requesterSessionKey, sessionId) =>
+    isEmbeddedRunAbandoned({ sessionKey: requesterSessionKey, sessionId }),
+  queueEmbeddedAgentMessageWithOutcome: queueEmbeddedAgentMessageWithOutcomeAsync,
   sendMessage,
 };
 
 let subagentAnnounceDeliveryDeps: SubagentAnnounceDeliveryDeps =
   defaultSubagentAnnounceDeliveryDeps;
 
-async function resolveQueueEmbeddedPiMessageOutcome(
+async function resolveQueueEmbeddedAgentMessageOutcome(
   sessionId: string,
   text: string,
-  options?: EmbeddedPiQueueMessageOptions,
-): Promise<EmbeddedPiQueueMessageOutcome> {
-  return await subagentAnnounceDeliveryDeps.queueEmbeddedPiMessageWithOutcome(
+  options?: EmbeddedAgentQueueMessageOptions,
+): Promise<EmbeddedAgentQueueMessageOutcome> {
+  return await subagentAnnounceDeliveryDeps.queueEmbeddedAgentMessageWithOutcome(
     sessionId,
     text,
     options,
@@ -132,9 +137,9 @@ async function runAnnounceAgentCall(params: {
 
 function formatQueueWakeFailureError(
   fallback: string,
-  outcome: EmbeddedPiQueueMessageOutcome,
+  outcome: EmbeddedAgentQueueMessageOutcome,
 ): string {
-  const summary = formatEmbeddedPiQueueFailureSummary(outcome);
+  const summary = formatEmbeddedAgentQueueFailureSummary(outcome);
   return summary ? `${fallback}: ${summary}` : fallback;
 }
 
@@ -202,7 +207,7 @@ function resolveRequesterSessionActivity(requesterSessionKey: string) {
   const sessionId = entry?.sessionId;
   return {
     sessionId,
-    isActive: Boolean(sessionId && isEmbeddedPiRunActive(sessionId)),
+    isActive: Boolean(sessionId && isEmbeddedAgentRunActive(sessionId)),
   };
 }
 
@@ -228,9 +233,9 @@ function resolveCompactionSteerRetryDelaysMs() {
 async function resolveActiveWakeWithRetries(
   sessionId: string,
   message: string,
-  wakeOptions: EmbeddedPiQueueMessageOptions,
+  wakeOptions: EmbeddedAgentQueueMessageOptions,
   signal?: AbortSignal,
-): Promise<EmbeddedPiQueueMessageOutcome> {
+): Promise<EmbeddedAgentQueueMessageOutcome> {
   // Bound the whole active wake by the caller's delivery window. Each retry
   // passes only the remaining window into transcript-commit waiting so a
   // near-deadline retry cannot add another full timeout.
@@ -239,7 +244,7 @@ async function resolveActiveWakeWithRetries(
       ? Date.now() + wakeOptions.deliveryTimeoutMs
       : undefined;
   let currentOptions = wakeOptions;
-  const resolveRetryOptions = (): EmbeddedPiQueueMessageOptions | undefined => {
+  const resolveRetryOptions = (): EmbeddedAgentQueueMessageOptions | undefined => {
     if (compactionDeadlineMs === undefined) {
       return currentOptions;
     }
@@ -252,7 +257,7 @@ async function resolveActiveWakeWithRetries(
       deliveryTimeoutMs: remainingDeliveryTimeoutMs,
     };
   };
-  let outcome = await resolveQueueEmbeddedPiMessageOutcome(sessionId, message, currentOptions);
+  let outcome = await resolveQueueEmbeddedAgentMessageOutcome(sessionId, message, currentOptions);
   const compactionRetryDelaysMs = resolveCompactionSteerRetryDelaysMs();
   let compactionRetryIndex = 0;
   for (;;) {
@@ -266,7 +271,7 @@ async function resolveActiveWakeWithRetries(
       const bestEffortOptions = { ...currentOptions };
       delete bestEffortOptions.waitForTranscriptCommit;
       currentOptions = bestEffortOptions;
-      outcome = await resolveQueueEmbeddedPiMessageOutcome(sessionId, message, currentOptions);
+      outcome = await resolveQueueEmbeddedAgentMessageOutcome(sessionId, message, currentOptions);
       continue;
     }
     if (outcome.reason === "compacting") {
@@ -304,7 +309,7 @@ async function resolveActiveWakeWithRetries(
       if (!retryOptions) {
         break;
       }
-      outcome = await resolveQueueEmbeddedPiMessageOutcome(sessionId, message, retryOptions);
+      outcome = await resolveQueueEmbeddedAgentMessageOutcome(sessionId, message, retryOptions);
       continue;
     }
     break;
@@ -314,10 +319,7 @@ async function resolveActiveWakeWithRetries(
 
 export function resolveSubagentAnnounceTimeoutMs(cfg: OpenClawConfig): number {
   const configured = cfg.agents?.defaults?.subagents?.announceTimeoutMs;
-  if (typeof configured !== "number" || !Number.isFinite(configured)) {
-    return DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS;
-  }
-  return Math.min(Math.max(1, Math.floor(configured)), MAX_TIMER_SAFE_TIMEOUT_MS);
+  return clampTimerTimeoutMs(configured) ?? DEFAULT_SUBAGENT_ANNOUNCE_TIMEOUT_MS;
 }
 
 export function isInternalAnnounceRequesterSession(sessionKey: string | undefined): boolean {
@@ -388,6 +390,16 @@ function isPermanentAnnounceDeliveryError(error: unknown): boolean {
 function isIncompleteAnnounceAgentResultError(error: unknown): boolean {
   const message = summarizeDeliveryError(error);
   return /(?:incomplete terminal response|code=incomplete_result)\b/i.test(message);
+}
+
+function isSessionWriteLockAnnounceAgentError(error: unknown): boolean {
+  if (isSessionWriteLockTimeoutError(error)) {
+    return true;
+  }
+  const message = summarizeDeliveryError(error);
+  return (
+    /\bSessionWriteLockTimeoutError\b/.test(message) || /\bsession file locked\b/i.test(message)
+  );
 }
 
 async function waitForAnnounceRetryDelay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -569,6 +581,9 @@ async function maybeSteerSubagentAnnounce(params: {
   const { cfg, entry } = loadRequesterSessionEntry(params.requesterSessionKey);
   const canonicalKey = resolveRequesterStoreKey(cfg, params.requesterSessionKey);
   const { sessionId, isActive } = resolveRequesterSessionActivity(canonicalKey);
+  if (subagentAnnounceDeliveryDeps.isRequesterSessionAbandoned(canonicalKey, sessionId)) {
+    return { status: "none" };
+  }
   if (!sessionId || !isActive) {
     return { status: "none" };
   }
@@ -581,7 +596,7 @@ async function maybeSteerSubagentAnnounce(params: {
 
   // Subagent announcements are internal handoffs into an active requester turn.
   // Queue modes such as followup/collect apply to user prompts, not this path.
-  const queueOptions: EmbeddedPiQueueMessageOptions = {
+  const queueOptions: EmbeddedAgentQueueMessageOptions = {
     deliveryTimeoutMs: params.deliveryTimeoutMs,
     steeringMode: "all",
     ...(queueSettings.debounceMs !== undefined ? { debounceMs: queueSettings.debounceMs } : {}),
@@ -1051,10 +1066,29 @@ async function sendSubagentAnnounceDirectly(params: {
         directOrigin: effectiveDirectOrigin,
         requesterSessionOrigin,
       });
+    const subagentDirectMessageCompletionRequiresMessageTool =
+      params.expectsCompletionMessage &&
+      isSubagentCompletion &&
+      deliveryTarget.deliver &&
+      isDirectMessageDeliveryTarget(deliveryTarget, canonicalRequesterSessionKey);
     const requiresMessageToolDelivery =
       completionRouteRequiresMessageToolDelivery ||
-      (agentMediatedCompletion && expectedMediaUrls.length > 0);
+      (agentMediatedCompletion && expectedMediaUrls.length > 0) ||
+      subagentDirectMessageCompletionRequiresMessageTool;
     const requesterActivity = resolveRequesterSessionActivity(canonicalRequesterSessionKey);
+    if (
+      params.expectsCompletionMessage &&
+      subagentAnnounceDeliveryDeps.isRequesterSessionAbandoned(
+        canonicalRequesterSessionKey,
+        requesterActivity.sessionId,
+      )
+    ) {
+      return {
+        delivered: false,
+        path: "none",
+        error: "requester session abandoned after timeout",
+      };
+    }
     let activeRequesterWakeFailed = false;
     const tryGeneratedMediaDirectDelivery = async (announceResponse?: unknown) => {
       if (requesterActivity.isActive && !activeRequesterWakeFailed) {
@@ -1093,7 +1127,7 @@ async function sendSubagentAnnounceDirectly(params: {
       requesterActivity.sessionId &&
       requesterActivity.isActive
     ) {
-      const wakeOptions: EmbeddedPiQueueMessageOptions = {
+      const wakeOptions: EmbeddedAgentQueueMessageOptions = {
         deliveryTimeoutMs: announceTimeoutMs,
         steeringMode: "all",
         ...(completionSourceReplyDeliveryMode
@@ -1205,7 +1239,7 @@ async function sendSubagentAnnounceDirectly(params: {
       }
       if (
         params.expectsCompletionMessage &&
-        shouldDeliverAgentFinal &&
+        (shouldDeliverAgentFinal || subagentDirectMessageCompletionRequiresMessageTool) &&
         isSubagentCompletion &&
         isIncompleteAnnounceAgentResultError(err)
       ) {
@@ -1218,6 +1252,17 @@ async function sendSubagentAnnounceDirectly(params: {
         });
         if (textDelivery) {
           return textDelivery;
+        }
+      }
+      if (
+        activeRequesterWakeFailed &&
+        agentMediatedCompletion &&
+        expectedMediaUrls.length > 0 &&
+        isSessionWriteLockAnnounceAgentError(err)
+      ) {
+        const generatedMediaDelivery = await tryGeneratedMediaDirectDelivery();
+        if (generatedMediaDelivery) {
+          return generatedMediaDelivery;
         }
       }
       // The requester-agent handoff is the delivery contract for background
@@ -1245,6 +1290,10 @@ async function sendSubagentAnnounceDirectly(params: {
       };
     }
 
+    const directDeliveryFailure =
+      shouldDeliverAgentFinal || requiresMessageToolDelivery
+        ? getGatewayAgentCommandDeliveryFailure(directAnnounceResponse)
+        : undefined;
     if (
       agentMediatedCompletion &&
       expectedMediaUrls.length > 0 &&
@@ -1265,9 +1314,6 @@ async function sendSubagentAnnounceDirectly(params: {
         error: "completion agent did not deliver generated media",
       };
     }
-    const directDeliveryFailure = shouldDeliverAgentFinal
-      ? getGatewayAgentCommandDeliveryFailure(directAnnounceResponse)
-      : undefined;
     if (directDeliveryFailure) {
       return {
         delivered: false,
@@ -1307,6 +1353,25 @@ async function sendSubagentAnnounceDirectly(params: {
       !hasGatewayAgentMessagingToolDeliveryEvidence(directAnnounceResponse) &&
       !hasIntentionalSilentGatewayAgentPayload(directAnnounceResponse)
     ) {
+      if (hasFailedSubagentNoOutputCompletion(params.internalEvents)) {
+        return {
+          delivered: false,
+          path: "direct",
+          error: "completion agent did not produce a visible reply",
+        };
+      }
+      if (subagentDirectMessageCompletionRequiresMessageTool) {
+        const textDelivery = await deliverTextCompletionDirect({
+          cfg,
+          requesterSessionKey: canonicalRequesterSessionKey,
+          directIdempotencyKey: params.directIdempotencyKey,
+          deliveryTarget,
+          internalEvents: params.internalEvents,
+        });
+        if (textDelivery) {
+          return textDelivery;
+        }
+      }
       return {
         delivered: false,
         path: "direct",

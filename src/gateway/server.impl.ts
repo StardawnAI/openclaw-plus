@@ -1,5 +1,5 @@
 import { monitorEventLoopDelay, performance } from "node:perf_hooks";
-import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/run-state.js";
+import { getActiveEmbeddedRunCount } from "../agents/embedded-agent-runner/run-state.js";
 import { getTotalPendingReplies } from "../auto-reply/reply/dispatcher-registry.js";
 import type { ChannelRuntimeSurface } from "../channels/plugins/channel-runtime-surface.types.js";
 import {
@@ -676,6 +676,7 @@ export async function startGatewayServer(
       minimalTestGateway,
       log,
       loadRuntimePlugins: false,
+      loadSetupRuntimePlugins: true,
     }),
   );
   const {
@@ -841,7 +842,6 @@ export async function startGatewayServer(
       const runtimeConfig = getRuntimeConfig();
       return resolveGatewayPluginConfig({
         config: runtimeConfig,
-        env: process.env,
       });
     },
     channelLogs,
@@ -1407,6 +1407,7 @@ export async function startGatewayServer(
           chatDeltaLastBroadcastText: chatRunState.deltaLastBroadcastText,
           agentDeltaSentAt: chatRunState.agentDeltaSentAt,
           bufferedAgentEvents: chatRunState.bufferedAgentEvents,
+          clearChatRunState: chatRunState.clearRun,
           addChatRun,
           removeChatRun,
           subscribeSessionEvents: sessionEventSubscribers.subscribe,

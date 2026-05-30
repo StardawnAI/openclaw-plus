@@ -20,6 +20,7 @@ import { resolveEnvApiKey } from "../agents/model-auth-env.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
 import { loadJsonFile, saveJsonFile } from "../infra/json-file.js";
+import { parseStrictNonNegativeInteger } from "../infra/parse-finite-number.js";
 import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import { resolveProviderEndpoint } from "./provider-model-shared.js";
 
@@ -114,7 +115,6 @@ export {
 } from "../agents/copilot-dynamic-headers.js";
 
 const COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token";
-const COPILOT_TOKEN_REQUEST_TIMEOUT_MS = 30_000;
 
 /** @deprecated GitHub Copilot provider-owned helper; do not use from third-party plugins. */
 export const DEFAULT_COPILOT_API_BASE_URL = "https://api.individual.githubcopilot.com";
@@ -153,8 +153,8 @@ function parseCopilotTokenResponse(value: unknown): {
   if (typeof expiresAt === "number" && Number.isFinite(expiresAt)) {
     expiresAtMs = expiresAt < 100_000_000_000 ? expiresAt * 1000 : expiresAt;
   } else if (typeof expiresAt === "string" && expiresAt.trim().length > 0) {
-    const parsed = Number.parseInt(expiresAt, 10);
-    if (!Number.isFinite(parsed)) {
+    const parsed = parseStrictNonNegativeInteger(expiresAt);
+    if (parsed === undefined) {
       throw new Error("Copilot token response has invalid expires_at");
     }
     expiresAtMs = parsed < 100_000_000_000 ? parsed * 1000 : parsed;
@@ -163,61 +163,6 @@ function parseCopilotTokenResponse(value: unknown): {
   }
 
   return { token, expiresAt: expiresAtMs };
-}
-
-function createCopilotTokenRequestAbort(params: { signal?: AbortSignal; timeoutMs?: number }): {
-  signal: AbortSignal;
-  cleanup: () => void;
-  timedOut: () => boolean;
-} {
-  const timeoutMs = params.timeoutMs ?? COPILOT_TOKEN_REQUEST_TIMEOUT_MS;
-  const controller = new AbortController();
-  let timedOut = false;
-  const abortFromParent = () => controller.abort(params.signal?.reason);
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new DOMException("GitHub Copilot token exchange timed out", "TimeoutError"));
-  }, timeoutMs);
-  timeout.unref?.();
-  if (params.signal?.aborted) {
-    abortFromParent();
-  } else {
-    params.signal?.addEventListener("abort", abortFromParent, { once: true });
-  }
-  return {
-    signal: controller.signal,
-    cleanup: () => {
-      clearTimeout(timeout);
-      params.signal?.removeEventListener("abort", abortFromParent);
-    },
-    timedOut: () => timedOut,
-  };
-}
-
-function formatCopilotTokenRequestError(
-  error: unknown,
-  params: {
-    signal?: AbortSignal;
-    timeoutMs?: number;
-    timedOut?: boolean;
-  },
-): Error {
-  if (params.timedOut) {
-    return new Error(
-      `GitHub Copilot token exchange timed out after ${params.timeoutMs ?? COPILOT_TOKEN_REQUEST_TIMEOUT_MS}ms`,
-    );
-  }
-  if (params.signal?.aborted) {
-    return new Error("GitHub Copilot token exchange cancelled");
-  }
-  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
-    return new Error(
-      `GitHub Copilot token exchange timed out after ${params.timeoutMs ?? COPILOT_TOKEN_REQUEST_TIMEOUT_MS}ms`,
-    );
-  }
-  return error instanceof Error
-    ? error
-    : new Error(`GitHub Copilot token exchange failed: ${String(error)}`);
 }
 
 function resolveCopilotProxyHost(proxyEp: string): string | null {
@@ -269,8 +214,6 @@ export async function resolveCopilotApiToken(params: {
   cachePath?: string;
   loadJsonFileImpl?: (path: string) => unknown;
   saveJsonFileImpl?: (path: string, value: CachedCopilotToken) => void;
-  signal?: AbortSignal;
-  timeoutMs?: number;
 }): Promise<{
   token: string;
   expiresAt: number;
@@ -294,24 +237,15 @@ export async function resolveCopilotApiToken(params: {
   }
 
   const fetchImpl = params.fetchImpl ?? fetch;
-  let res: Response;
-  const abort = createCopilotTokenRequestAbort(params);
-  try {
-    res = await fetchImpl(COPILOT_TOKEN_URL, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${params.githubToken}`,
-        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-        ...buildCopilotIdeHeaders({ includeApiVersion: true }),
-      },
-      signal: abort.signal,
-    });
-  } catch (error) {
-    throw formatCopilotTokenRequestError(error, { ...params, timedOut: abort.timedOut() });
-  } finally {
-    abort.cleanup();
-  }
+  const res = await fetchImpl(COPILOT_TOKEN_URL, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${params.githubToken}`,
+      "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+      ...buildCopilotIdeHeaders({ includeApiVersion: true }),
+    },
+  });
 
   if (!res.ok) {
     throw new Error(`Copilot token exchange failed: HTTP ${res.status}`);

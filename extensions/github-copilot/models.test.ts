@@ -4,17 +4,6 @@ import { buildCopilotModelDefinition, getDefaultCopilotModelIds } from "./models
 import { deriveCopilotApiBaseUrlFromToken, resolveCopilotApiToken } from "./token.js";
 import { fetchCopilotUsage } from "./usage.js";
 
-vi.mock("@earendil-works/pi-ai/oauth", async () => {
-  const actual = await vi.importActual<typeof import("@earendil-works/pi-ai/oauth")>(
-    "@earendil-works/pi-ai/oauth",
-  );
-  return {
-    ...actual,
-    getOAuthApiKey: vi.fn(),
-    getOAuthProviders: vi.fn(() => []),
-  };
-});
-
 vi.mock("openclaw/plugin-sdk/provider-model-shared", () => ({
   normalizeModelCompat: (model: Record<string, unknown>) => model,
   resolveProviderEndpoint: (baseUrl: string) => ({
@@ -398,33 +387,10 @@ describe("github-copilot token", () => {
     expect(res.token).toBe("fresh;proxy-ep=https://proxy.contoso.test;");
     expect(res.baseUrl).toBe("https://api.contoso.test");
     const [, calledInit] = fetchImpl.mock.calls[0] ?? [];
-    expect((calledInit as RequestInit).signal).toBeInstanceOf(AbortSignal);
     expect(((calledInit as RequestInit).headers as Record<string, string>)["Accept-Encoding"]).toBe(
       "identity",
     );
     expect(jsonStoreMocks.saveJsonFile).toHaveBeenCalledTimes(1);
-  });
-
-  it("bounds token exchange requests", async () => {
-    jsonStoreMocks.loadJsonFile.mockReturnValue(undefined);
-    const timeoutError = new Error("timeout");
-    timeoutError.name = "TimeoutError";
-    const fetchImpl = vi.fn().mockRejectedValue(timeoutError);
-
-    await expect(
-      resolveCopilotApiToken({
-        githubToken: "gh",
-        cachePath,
-        loadJsonFileImpl: jsonStoreMocks.loadJsonFile,
-        saveJsonFileImpl: jsonStoreMocks.saveJsonFile,
-        fetchImpl: fetchImpl as unknown as typeof fetch,
-        timeoutMs: 5,
-      }),
-    ).rejects.toThrow("GitHub Copilot token exchange timed out after 5ms");
-
-    const [, calledInit] = fetchImpl.mock.calls[0] ?? [];
-    expect((calledInit as RequestInit).signal).toBeInstanceOf(AbortSignal);
-    expect(jsonStoreMocks.saveJsonFile).not.toHaveBeenCalled();
   });
 });
 
@@ -643,6 +609,59 @@ describe("fetchCopilotModelCatalog", () => {
 
     expect(out).toHaveLength(1);
     expect(out[0].name).toBe("GPT-5.5");
+  });
+
+  it("falls back from malformed live token limits", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        data: [
+          {
+            id: "gpt-bad-window",
+            name: "GPT Bad Window",
+            object: "model",
+            capabilities: {
+              type: "chat",
+              limits: {
+                max_context_window_tokens: -1,
+                max_output_tokens: 128000.5,
+              },
+            },
+          },
+          {
+            id: "gpt-bad-output",
+            name: "GPT Bad Output",
+            object: "model",
+            capabilities: {
+              type: "chat",
+              limits: {
+                max_context_window_tokens: Number.POSITIVE_INFINITY,
+                max_output_tokens: 0,
+              },
+            },
+          },
+        ],
+      }),
+    });
+
+    const out = await fetchCopilotModelCatalog({
+      copilotApiToken: "tid=test",
+      baseUrl: "https://api.githubcopilot.com",
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({
+      id: "gpt-bad-window",
+      contextWindow: 128000,
+      maxTokens: 8192,
+    });
+    expect(out[1]).toMatchObject({
+      id: "gpt-bad-output",
+      contextWindow: 128000,
+      maxTokens: 8192,
+    });
   });
 
   it("throws on non-2xx HTTP responses so the caller can fall back to the static catalog", async () => {

@@ -33,7 +33,10 @@ vi.mock("../config/config.js", () => ({
 
 import "./test-helpers/fast-openclaw-tools-sessions.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { testing as embeddedRunsTesting, setActiveEmbeddedRun } from "./pi-embedded-runner/runs.js";
+import {
+  testing as embeddedRunsTesting,
+  setActiveEmbeddedRun,
+} from "./embedded-agent-runner/runs.js";
 import { testing as agentStepTesting } from "./tools/agent-step.js";
 import { createSessionsHistoryTool } from "./tools/sessions-history-tool.js";
 import { createSessionsListTool } from "./tools/sessions-list-tool.js";
@@ -244,7 +247,7 @@ describe("sessions tools", () => {
     });
   });
 
-  it("uses number (not integer) in tool schemas for Gemini compatibility", () => {
+  it("uses integer schemas for session count and window parameters", () => {
     const tools = createOpenClawTools();
     const byName = (name: string) => {
       const tool = tools.find((candidate) => candidate.name === name);
@@ -272,16 +275,16 @@ describe("sessions tools", () => {
       return value;
     };
 
-    expect(schemaProp("sessions_history", "limit").type).toBe("number");
-    expect(schemaProp("sessions_list", "limit").type).toBe("number");
-    expect(schemaProp("sessions_list", "activeMinutes").type).toBe("number");
-    expect(schemaProp("sessions_list", "messageLimit").type).toBe("number");
+    expect(schemaProp("sessions_history", "limit").type).toBe("integer");
+    expect(schemaProp("sessions_list", "limit").type).toBe("integer");
+    expect(schemaProp("sessions_list", "activeMinutes").type).toBe("integer");
+    expect(schemaProp("sessions_list", "messageLimit").type).toBe("integer");
     expect(schemaProp("sessions_list", "label").type).toBe("string");
     expect(schemaProp("sessions_list", "agentId").type).toBe("string");
     expect(schemaProp("sessions_list", "search").type).toBe("string");
     expect(schemaProp("sessions_list", "includeDerivedTitles").type).toBe("boolean");
     expect(schemaProp("sessions_list", "includeLastMessage").type).toBe("boolean");
-    expect(schemaProp("sessions_send", "timeoutSeconds").type).toBe("number");
+    expect(schemaProp("sessions_send", "timeoutSeconds").type).toBe("integer");
   });
 
   it("sessions_list forwards mailbox filters and includes messages", async () => {

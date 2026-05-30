@@ -32,10 +32,8 @@ import {
   normalizeMainKey,
   parseAgentSessionKey,
 } from "../routing/session-key.js";
-import {
-  normalizeLowercaseStringOrEmpty,
-  normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
+import { normalizeSessionKeyPreservingOpaquePeerIds } from "../sessions/session-key-utils.js";
+import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
 import { expandHomePrefix } from "./home-dir.js";
 import { isWithinDir } from "./path-safety.js";
 import {
@@ -212,7 +210,11 @@ async function runLegacyMigrationPlans(
             break;
           }
           try {
-            await store.register(targetKey, entry.value);
+            await store.register(
+              targetKey,
+              entry.value,
+              entry.ttlMs != null ? { ttlMs: entry.ttlMs } : undefined,
+            );
             const nextExpectedKeys = new Set(expectedKeys);
             nextExpectedKeys.add(targetKey);
             const liveKeys = new Set((await store.entries()).map(({ key }) => key));
@@ -303,6 +305,7 @@ function canonicalizeSessionKeyForAgent(params: {
     return raw;
   }
   const rawLower = normalizeLowercaseStringOrEmpty(raw);
+  const normalized = normalizeSessionKeyPreservingOpaquePeerIds(raw);
   if (rawLower === "global" || rawLower === "unknown") {
     return rawLower;
   }
@@ -315,7 +318,7 @@ function canonicalizeSessionKeyForAgent(params: {
   if (params.skipCrossAgentRemap) {
     const parsed = parseAgentSessionKey(raw);
     if (parsed && normalizeAgentId(parsed.agentId) !== agentId) {
-      return rawLower;
+      return normalized;
     }
     if (
       agentId !== DEFAULT_AGENT_ID &&
@@ -359,7 +362,7 @@ function canonicalizeSessionKeyForAgent(params: {
   }
 
   if (rawLower.startsWith("agent:")) {
-    return rawLower;
+    return normalized;
   }
   if (rawLower.startsWith("subagent:")) {
     const rest = raw.slice("subagent:".length);
@@ -373,7 +376,7 @@ function canonicalizeSessionKeyForAgent(params: {
       key: raw,
       agentId,
     });
-    const normalizedCanonicalized = normalizeOptionalLowercaseString(canonicalized);
+    const normalizedCanonicalized = normalizeSessionKeyPreservingOpaquePeerIds(canonicalized);
     if (normalizedCanonicalized) {
       return normalizedCanonicalized;
     }
@@ -382,9 +385,9 @@ function canonicalizeSessionKeyForAgent(params: {
     return normalizeLowercaseStringOrEmpty(`agent:${agentId}:unknown:${raw}`);
   }
   if (isSurfaceGroupKey(raw)) {
-    return normalizeLowercaseStringOrEmpty(`agent:${agentId}:${raw}`);
+    return `agent:${agentId}:${normalized}`;
   }
-  return normalizeLowercaseStringOrEmpty(`agent:${agentId}:${raw}`);
+  return normalizeSessionKeyPreservingOpaquePeerIds(`agent:${agentId}:${raw}`);
 }
 
 function pickLatestLegacyDirectEntry(

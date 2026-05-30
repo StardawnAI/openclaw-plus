@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import {
+  MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
   createPluginStateKeyedStore,
   resetPluginStateStoreForTests,
 } from "../plugin-state/plugin-state-store.js";
@@ -650,7 +651,7 @@ describe("doctor legacy state migrations", () => {
         maxEntries: 4,
         scopeKey: "",
         cleanupSource: "rename",
-        readEntries: () => [{ key: "default", value: { body: "global" } }],
+        readEntries: () => [{ key: "default", value: { body: "global" }, ttlMs: 60_000 }],
       },
     ];
 
@@ -709,6 +710,8 @@ describe("doctor legacy state migrations", () => {
       expect(Object.fromEntries(globalValuesByKey)).toEqual({
         default: "global",
       });
+      const globalEntries = await globalStore.entries();
+      expect(globalEntries[0]?.expiresAt).toBeGreaterThan(Date.now());
     });
   });
 
@@ -724,7 +727,7 @@ describe("doctor legacy state migrations", () => {
         targetPath: "plugin state:test.capped-cache",
         pluginId: "telegram",
         namespace: "test.capped-cache",
-        maxEntries: 6_000,
+        maxEntries: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
         scopeKey: "scope",
         cleanupSource: "rename",
         readEntries: () => [
@@ -736,7 +739,7 @@ describe("doctor legacy state migrations", () => {
 
     await withStateDir(root, async () => {
       seedPluginStateEntriesForTests(
-        Array.from({ length: 5_999 }, (_, index) => ({
+        Array.from({ length: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN - 1 }, (_, index) => ({
           pluginId: "telegram",
           namespace: "test.sibling-cache",
           key: `sibling-${index}`,
@@ -765,7 +768,7 @@ describe("doctor legacy state migrations", () => {
     await withStateDir(root, async () => {
       const store = createPluginStateKeyedStore<{ body: string }>("telegram", {
         namespace: "test.capped-cache",
-        maxEntries: 6_000,
+        maxEntries: MAX_PLUGIN_STATE_ENTRIES_PER_PLUGIN,
       });
       const valuesByKey = new Map(
         (await store.entries()).map(({ key, value }) => [key, value.body]),
@@ -872,6 +875,47 @@ describe("doctor legacy state migrations", () => {
     });
     expect(store["agent:main:slack:channel:c123"]?.sessionId).toBe("legacy");
     expect(store["agent:main:slack:channel:C123"]).toBeUndefined();
+  });
+
+  it("preserves Matrix room and thread casing during canonicalization", async () => {
+    const root = await makeTempRoot();
+    const cfg: OpenClawConfig = {};
+    const targetDir = path.join(root, "agents", "main", "sessions");
+    writeJson5(path.join(targetDir, "sessions.json"), {
+      "agent:main:Matrix:Channel:!Mixed:Example.Org:Thread:$EventABC": {
+        sessionId: "matrix",
+        updatedAt: 10,
+      },
+    });
+
+    const store = await runAndReadSessionsStore({
+      root,
+      cfg,
+      targetDir,
+      now: () => 123,
+    });
+    expect(store["agent:main:matrix:channel:!Mixed:Example.Org:thread:$EventABC"]?.sessionId).toBe(
+      "matrix",
+    );
+    expect(store["agent:main:matrix:channel:!mixed:example.org:thread:$eventabc"]).toBeUndefined();
+  });
+
+  it("preserves unscoped legacy Matrix room casing when scoping to an agent", async () => {
+    const root = await makeTempRoot();
+    const cfg: OpenClawConfig = {};
+    const targetDir = path.join(root, "agents", "main", "sessions");
+    writeJson5(path.join(targetDir, "sessions.json"), {
+      "Matrix:Channel:!Mixed:Example.Org": { sessionId: "matrix", updatedAt: 10 },
+    });
+
+    const store = await runAndReadSessionsStore({
+      root,
+      cfg,
+      targetDir,
+      now: () => 123,
+    });
+    expect(store["agent:main:matrix:channel:!Mixed:Example.Org"]?.sessionId).toBe("matrix");
+    expect(store["agent:main:matrix:channel:!mixed:example.org"]).toBeUndefined();
   });
 
   it("auto-migrates when only target sessions contain legacy keys", async () => {

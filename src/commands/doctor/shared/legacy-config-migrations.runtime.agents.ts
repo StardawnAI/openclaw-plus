@@ -1,4 +1,3 @@
-import { listLegacyRuntimeModelProviderAliases } from "../../../agents/model-runtime-aliases.js";
 import { normalizeProviderId } from "../../../agents/provider-id.js";
 import { isKnownCoreToolId } from "../../../agents/tool-catalog.js";
 import { isToolAllowedByPolicyName } from "../../../agents/tool-policy-match.js";
@@ -14,6 +13,7 @@ import {
 } from "../../../config/legacy.shared.js";
 import { isBlockedObjectKey } from "../../../config/prototype-keys.js";
 import { uniqueStrings } from "../../../shared/string-normalization.js";
+import { listLegacyRuntimeModelProviderAliases } from "./legacy-runtime-model-providers.js";
 
 const AGENT_HEARTBEAT_KEYS = new Set([
   "every",
@@ -119,6 +119,21 @@ const LEGACY_AGENT_RUNTIME_POLICY_RULES: LegacyConfigRule[] = [
   },
 ];
 
+const DEPRECATED_EMBEDDED_AGENT_KEY_RULES: LegacyConfigRule[] = [
+  {
+    path: ["agents", "defaults", "embeddedPi"],
+    message:
+      'agents.defaults.embeddedPi is legacy; use agents.defaults.embeddedAgent instead. Run "openclaw doctor --fix".',
+    match: (value) => getRecord(value) !== null,
+  },
+  {
+    path: ["agents", "list"],
+    message:
+      'agents.list[].embeddedPi is legacy; use agents.list[].embeddedAgent instead. Run "openclaw doctor --fix".',
+    match: (value) => hasLegacyAgentListEmbeddedAgentKey(value),
+  },
+];
+
 const LEGACY_AGENT_LLM_TIMEOUT_RULES: LegacyConfigRule[] = [
   {
     path: ["agents", "defaults", "llm"],
@@ -208,6 +223,20 @@ const SILENT_REPLY_LEGACY_RULES: LegacyConfigRule[] = [
   },
 ];
 
+const SYSTEM_PROMPT_OVERRIDE_LEGACY_RULES: LegacyConfigRule[] = [
+  {
+    path: ["agents", "defaults", "systemPromptOverride"],
+    message:
+      'agents.defaults.systemPromptOverride was removed; OpenClaw owns the generated system prompt. Run "openclaw doctor --fix" to remove it.',
+  },
+  {
+    path: ["agents", "list"],
+    message:
+      'agents.list[].systemPromptOverride was removed; OpenClaw owns the generated system prompt. Run "openclaw doctor --fix" to remove it.',
+    match: (value) => hasAgentListSystemPromptOverride(value),
+  },
+];
+
 function sandboxScopeFromPerSession(perSession: boolean): "session" | "shared" {
   return perSession ? "session" : "shared";
 }
@@ -285,11 +314,27 @@ function hasLegacyAgentListEmbeddedHarness(value: unknown): boolean {
   return value.some((agent) => getRecord(getRecord(agent)?.embeddedHarness) !== null);
 }
 
+function hasLegacyAgentListEmbeddedAgentKey(value: unknown): boolean {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  return value.some((agent) => getRecord(getRecord(agent)?.embeddedPi) !== null);
+}
+
 function hasAgentListRuntimePolicy(value: unknown): boolean {
   if (!Array.isArray(value)) {
     return false;
   }
   return value.some((agent) => getRecord(getRecord(agent)?.agentRuntime) !== null);
+}
+
+function hasAgentListSystemPromptOverride(value: unknown): boolean {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  return value.some((agent) =>
+    Object.prototype.hasOwnProperty.call(getRecord(agent) ?? {}, "systemPromptOverride"),
+  );
 }
 
 function hasOwnTimeoutMs(value: unknown): boolean {
@@ -308,6 +353,30 @@ function hasAgentListModelTimeout(value: unknown): boolean {
       hasOwnTimeoutMs(getRecord(agentRecord?.subagents)?.model)
     );
   });
+}
+
+function migrateLegacyEmbeddedAgentKey(
+  container: Record<string, unknown>,
+  pathLabel: string,
+  changes: string[],
+): void {
+  const legacy = getRecord(container.embeddedPi);
+  if (!legacy) {
+    return;
+  }
+  const existing = getRecord(container.embeddedAgent);
+  if (!existing) {
+    container.embeddedAgent = legacy;
+    changes.push(`Moved ${pathLabel}.embeddedPi → ${pathLabel}.embeddedAgent.`);
+  } else {
+    const merged = structuredClone(existing);
+    mergeMissing(merged, legacy);
+    container.embeddedAgent = merged;
+    changes.push(
+      `Merged ${pathLabel}.embeddedPi → ${pathLabel}.embeddedAgent (filled missing fields from legacy; kept explicit embeddedAgent values).`,
+    );
+  }
+  delete container.embeddedPi;
 }
 
 function isLegacyMemorySearchAutoProvider(value: unknown): boolean {
@@ -378,7 +447,7 @@ function resolveLegacyAgentRuntimeIntent(raw: unknown): LegacyAgentRuntimeIntent
     return undefined;
   }
   const runtime = typeof record.id === "string" ? record.id.trim().toLowerCase() : "";
-  if (!runtime || runtime === "auto" || runtime === "pi") {
+  if (!runtime || runtime === "auto" || runtime === "openclaw") {
     return undefined;
   }
   const alias = listLegacyRuntimeModelProviderAliases().find(
@@ -553,6 +622,30 @@ function removeLegacySilentReplyConfig(raw: Record<string, unknown>, changes: st
       delete surface.silentReplyRewrite;
       changes.push(`Removed surfaces.${surfaceId}.silentReplyRewrite.`);
     }
+  }
+}
+
+function removeLegacySystemPromptOverride(raw: Record<string, unknown>, changes: string[]): void {
+  const agents = getRecord(raw.agents);
+  const defaults = getRecord(agents?.defaults);
+  if (defaults && Object.prototype.hasOwnProperty.call(defaults, "systemPromptOverride")) {
+    delete defaults.systemPromptOverride;
+    changes.push("Removed agents.defaults.systemPromptOverride.");
+  }
+
+  if (!Array.isArray(agents?.list)) {
+    return;
+  }
+  for (const [index, agent] of agents.list.entries()) {
+    const agentRecord = getRecord(agent);
+    if (
+      !agentRecord ||
+      !Object.prototype.hasOwnProperty.call(agentRecord, "systemPromptOverride")
+    ) {
+      continue;
+    }
+    delete agentRecord.systemPromptOverride;
+    changes.push(`Removed agents.list.${index}.systemPromptOverride.`);
   }
 }
 
@@ -1105,6 +1198,12 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_AGENTS: LegacyConfigMigrationSpec[
     apply: removeLegacySilentReplyConfig,
   }),
   defineLegacyConfigMigration({
+    id: "agents.systemPromptOverride-removed",
+    describe: "Remove legacy agent system prompt override config",
+    legacyRules: SYSTEM_PROMPT_OVERRIDE_LEGACY_RULES,
+    apply: removeLegacySystemPromptOverride,
+  }),
+  defineLegacyConfigMigration({
     id: "agents.defaults.llm->models.providers.timeoutSeconds",
     describe: "Remove legacy agents.defaults.llm timeout config",
     legacyRules: LEGACY_AGENT_LLM_TIMEOUT_RULES,
@@ -1149,6 +1248,29 @@ export const LEGACY_CONFIG_MIGRATIONS_RUNTIME_AGENTS: LegacyConfigMigrationSpec[
           `agents.list.${index}.subagents.model`,
           changes,
         );
+      }
+    },
+  }),
+  defineLegacyConfigMigration({
+    id: "agents.embeddedPi->embeddedAgent",
+    describe: "Move legacy embedded agent config key to embeddedAgent",
+    legacyRules: DEPRECATED_EMBEDDED_AGENT_KEY_RULES,
+    apply: (raw, changes) => {
+      const agents = getRecord(raw.agents);
+      const defaults = getRecord(agents?.defaults);
+      if (defaults) {
+        migrateLegacyEmbeddedAgentKey(defaults, "agents.defaults", changes);
+      }
+
+      if (!Array.isArray(agents?.list)) {
+        return;
+      }
+      for (const [index, agent] of agents.list.entries()) {
+        const agentRecord = getRecord(agent);
+        if (!agentRecord) {
+          continue;
+        }
+        migrateLegacyEmbeddedAgentKey(agentRecord, `agents.list.${index}`, changes);
       }
     },
   }),

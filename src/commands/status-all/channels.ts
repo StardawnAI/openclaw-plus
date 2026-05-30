@@ -517,7 +517,7 @@ export async function buildChannelsTable(
           label: sanitizeForLog(channelId).trim() || "configured-channel",
           enabled: true,
           state: "setup",
-          detail: "configured; details skipped in fast status",
+          detail: "configured; status unavailable in fast mode",
         });
         visibleChannelIds.add(channelId);
       }
@@ -531,6 +531,24 @@ export async function buildChannelsTable(
       detail: `plugin not installed - run ${hint.installCommand} or ${hint.doctorFixCommand}`,
     });
     visibleChannelIds.add(channelId);
+  }
+
+  if (!includeSetupFallbackPlugins) {
+    for (const channelId of readOnlyPlugins.missingConfiguredChannelIds.toSorted((left, right) =>
+      left.localeCompare(right),
+    )) {
+      if (visibleChannelIds.has(channelId)) {
+        continue;
+      }
+      rows.push({
+        id: channelId,
+        label: sanitizeForLog(channelId).trim() || "configured-channel",
+        enabled: true,
+        state: "setup",
+        detail: "configured; status unavailable in fast mode",
+      });
+      visibleChannelIds.add(channelId);
+    }
   }
 
   return {
