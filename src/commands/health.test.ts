@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { stripAnsi } from "../terminal/ansi.js";
+import { stripAnsi } from "../../packages/terminal-core/src/ansi.js";
 import { formatHealthCheckFailure } from "./health-format.js";
 import type { HealthSummary } from "./health.js";
 import {
@@ -61,12 +61,15 @@ const buildGatewayConnectionDetailsMock = vi.fn(() => ({
   message: "Gateway mode: local\nGateway target: ws://127.0.0.1:18789",
 }));
 const formatGatewayTransportErrorJsonMock = vi.fn();
+const isGatewayCredentialsRequiredErrorMock = vi.fn<(value: unknown) => boolean>(() => false);
 vi.mock("../gateway/call.js", () => ({
   callGateway: (...args: unknown[]) => callGatewayMock(...args),
   buildGatewayConnectionDetails: (...args: [unknown, ...unknown[]]) =>
     Reflect.apply(buildGatewayConnectionDetailsMock, undefined, args),
   formatGatewayTransportErrorJson: (...args: unknown[]) =>
     formatGatewayTransportErrorJsonMock(...args),
+  isGatewayCredentialsRequiredError: (value: unknown) =>
+    isGatewayCredentialsRequiredErrorMock(value),
 }));
 
 vi.mock("../channels/plugins/read-only.js", () => ({
@@ -104,6 +107,7 @@ describe("healthCommand", () => {
       message: "Gateway mode: local\nGateway target: ws://127.0.0.1:18789",
     });
     formatGatewayTransportErrorJsonMock.mockReturnValue(null);
+    isGatewayCredentialsRequiredErrorMock.mockReturnValue(false);
   });
 
   it("outputs JSON from gateway", async () => {

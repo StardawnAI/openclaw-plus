@@ -1,6 +1,11 @@
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { type Mock, vi } from "vitest";
 import type { ThinkLevel } from "../../auto-reply/thinking.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import type {
+  PluginHookBeforeAgentFinalizeEvent,
+  PluginHookBeforeAgentFinalizeResult,
+} from "../../plugins/hook-types.js";
 import type {
   PluginHookAgentContext,
   PluginHookBeforeAgentReplyResult,
@@ -8,7 +13,6 @@ import type {
   PluginHookBeforeModelResolveResult,
   PluginHookBeforePromptBuildResult,
 } from "../../plugins/types.js";
-import { normalizeLowercaseStringOrEmpty } from "../../shared/string-coerce.js";
 import type { FailoverReason } from "../embedded-agent-helpers/types.js";
 import { clearAgentHarnesses, registerAgentHarness } from "../harness/registry.js";
 import type { buildEmbeddedRunPayloads } from "./run/payloads.js";
@@ -54,6 +58,12 @@ export const mockedGlobalHookRunner = {
       _eventValue: { prompt: string; messages?: unknown[] },
       _ctx: PluginHookAgentContext,
     ): Promise<PluginHookBeforeAgentStartResult | undefined> => undefined,
+  ),
+  runBeforeAgentFinalize: vi.fn(
+    async (
+      _eventValue: PluginHookBeforeAgentFinalizeEvent,
+      _ctx: PluginHookAgentContext,
+    ): Promise<PluginHookBeforeAgentFinalizeResult | undefined> => undefined,
   ),
   runBeforePromptBuild: vi.fn(
     async (
@@ -254,7 +264,7 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
     id: "codex",
     label: "Codex",
     supports: (ctx) =>
-      ctx.provider === "codex" || ctx.provider === "openai-codex" || ctx.provider === "openai"
+      ctx.provider === "codex" || ctx.provider === "openai" || ctx.provider === "openai"
         ? { supported: true, priority: 100 }
         : { supported: false },
     runAttempt: async (params) => await mockedRunEmbeddedAttempt(params),
@@ -266,6 +276,8 @@ export function resetRunOverflowCompactionHarnessMocks(): void {
   mockedGlobalHookRunner.runBeforeAgentReply.mockResolvedValue(undefined);
   mockedGlobalHookRunner.runBeforeAgentStart.mockReset();
   mockedGlobalHookRunner.runBeforeAgentStart.mockResolvedValue(undefined);
+  mockedGlobalHookRunner.runBeforeAgentFinalize.mockReset();
+  mockedGlobalHookRunner.runBeforeAgentFinalize.mockResolvedValue(undefined);
   mockedGlobalHookRunner.runBeforePromptBuild.mockReset();
   mockedGlobalHookRunner.runBeforePromptBuild.mockResolvedValue(undefined);
   mockedGlobalHookRunner.runBeforeModelResolve.mockReset();

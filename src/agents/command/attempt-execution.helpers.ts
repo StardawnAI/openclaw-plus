@@ -258,6 +258,7 @@ export async function claudeCliSessionTranscriptHasOrphanedToolUse(params: {
   }
   return await jsonlFileHasOrphanedTrailingToolUse(expectedPath);
 }
+
 export function resolveFallbackRetryPrompt(params: {
   body: string;
   isFallbackRetry: boolean;

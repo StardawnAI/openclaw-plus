@@ -1,5 +1,10 @@
+import { sanitizeForLog } from "../../../packages/terminal-core/src/ansi.js";
 import { applyPluginAutoEnable } from "../../config/plugin-auto-enable.js";
-import { sanitizeForLog } from "../../terminal/ansi.js";
+import {
+  collectOpenAICodexAuthProfileStoreIdMap,
+  maybeRepairOpenAICodexAuthConfig,
+  maybeRepairOpenAICodexAuthProfileStores,
+} from "../doctor-auth-flat-profiles.js";
 import { maybeRepairLegacyOAuthSidecarProfiles } from "../doctor-auth-oauth-sidecar.js";
 import {
   maybeRepairManagedNpmOpenClawPeerLinks,
@@ -39,6 +44,7 @@ export async function runDoctorRepairSequence(params: {
   state: DoctorConfigMutationState;
   changeNotes: string[];
   warningNotes: string[];
+  authProfilesRepaired: boolean;
 }> {
   let state = params.state;
   const changeNotes: string[] = [];
@@ -92,6 +98,14 @@ export async function runDoctorRepairSequence(params: {
     changes: codexRouteRepair.changes,
     warnings: codexRouteRepair.warnings,
   });
+  applyMutation(
+    maybeRepairOpenAICodexAuthConfig(state.candidate, {
+      profileIdMap: collectOpenAICodexAuthProfileStoreIdMap({
+        cfg: state.candidate,
+        env,
+      }),
+    }),
+  );
   applyMutation(
     await maybeRepairContextEngineHostCompatibility({
       cfg: state.candidate,
@@ -155,6 +169,16 @@ export async function runDoctorRepairSequence(params: {
   if (legacyOAuthSidecarRepair.warnings.length > 0) {
     warningNotes.push(sanitizeLines(legacyOAuthSidecarRepair.warnings));
   }
+  const openAIAuthProviderRepair = await maybeRepairOpenAICodexAuthProfileStores({
+    cfg: state.candidate,
+    env,
+  });
+  if (openAIAuthProviderRepair.changes.length > 0) {
+    changeNotes.push(sanitizeLines(openAIAuthProviderRepair.changes));
+  }
+  if (openAIAuthProviderRepair.warnings.length > 0) {
+    warningNotes.push(sanitizeLines(openAIAuthProviderRepair.warnings));
+  }
   const staleOAuthShadowRepair = await repairStaleOAuthProfileShadows({
     cfg: state.candidate,
     env,
@@ -165,6 +189,10 @@ export async function runDoctorRepairSequence(params: {
   if (staleOAuthShadowRepair.warnings.length > 0) {
     warningNotes.push(sanitizeLines(staleOAuthShadowRepair.warnings));
   }
+  const authProfilesRepaired =
+    legacyOAuthSidecarRepair.changes.length > 0 ||
+    openAIAuthProviderRepair.changes.length > 0 ||
+    staleOAuthShadowRepair.changes.length > 0;
 
   const activeToolSchemaWarnings = collectActiveToolSchemaProjectionWarnings({
     cfg: state.candidate,
@@ -174,5 +202,5 @@ export async function runDoctorRepairSequence(params: {
     warningNotes.push(sanitizeLines(activeToolSchemaWarnings));
   }
 
-  return { state, changeNotes, warningNotes };
+  return { state, changeNotes, warningNotes, authProfilesRepaired };
 }
