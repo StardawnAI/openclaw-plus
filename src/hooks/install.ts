@@ -1,10 +1,11 @@
 // Hook install service installs hook packages from archives and local sources.
-import fs from "node:fs/promises";
+
 import path from "node:path";
 import { normalizeTrimmedStringList } from "@openclaw/normalization-core/string-normalization";
 import { MANIFEST_KEY } from "../compat/legacy-names.js";
 import { resolveSafeInstallDir, unscopedPackageName } from "../infra/install-safe-path.js";
 import type { NpmIntegrityDrift, NpmSpecResolution } from "../infra/install-source-utils.js";
+import { readRegularFile } from "../infra/regular-file.js";
 import { detectBundleManifestFormat } from "../plugins/bundle-manifest.js";
 import {
   scanPackageInstallSource,
@@ -15,12 +16,16 @@ import { PLUGIN_MANIFEST_FILENAME } from "../plugins/manifest.js";
 import type { InstallPolicySource } from "../security/install-policy.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { CONFIG_DIR, resolveUserPath } from "../utils.js";
-import { parseFrontmatter } from "./frontmatter.js";
+import { parseHookFrontmatter } from "./frontmatter.js";
+
+// HOOK.md is only parsed for frontmatter; a small cap prevents a malicious or
+// malformed hook package from OOMing the install path.
+const HOOK_MD_MAX_BYTES = 1024 * 1024;
 
 const loadHookInstallRuntime = createLazyRuntimeModule(() => import("./install.runtime.js"));
 
 /** Logger contract used by hook install and update operations. */
-export type HookInstallLogger = {
+type HookInstallLogger = {
   info?: (message: string) => void;
   warn?: (message: string) => void;
 };
@@ -89,6 +94,7 @@ function buildHookInstallForwardParams(params: HookInstallForwardParams): HookIn
   return {
     config: params.config,
     dangerouslyForceUnsafeInstall: params.dangerouslyForceUnsafeInstall,
+    onInstallPolicyWarning: params.onInstallPolicyWarning,
     trustedSourceLinkedOfficialInstall: params.trustedSourceLinkedOfficialInstall,
     hooksDir: params.hooksDir,
     timeoutMs: params.timeoutMs,
@@ -151,6 +157,7 @@ async function runHookInstallPolicy(params: {
       await scanPackageInstallSource({
         config: params.forward.config,
         dangerouslyForceUnsafeInstall: params.forward.dangerouslyForceUnsafeInstall,
+        onInstallPolicyWarning: params.forward.onInstallPolicyWarning,
         trustedSourceLinkedOfficialInstall: params.forward.trustedSourceLinkedOfficialInstall,
         packageDir: params.packageDir,
         pluginId: params.hookPackId,
@@ -182,7 +189,7 @@ async function runHookInstalledDependencyPolicy(params: {
     scan: async () =>
       await scanInstalledPackageDependencyTree({
         config: params.forward.config,
-        dangerouslyForceUnsafeInstall: params.forward.dangerouslyForceUnsafeInstall,
+        onInstallPolicyWarning: params.forward.onInstallPolicyWarning,
         trustedSourceLinkedOfficialInstall: params.forward.trustedSourceLinkedOfficialInstall,
         packageDir: params.installedDir,
         pluginId: params.hookPackId,
@@ -358,8 +365,8 @@ async function resolveHookNameFromDir(hookDir: string): Promise<string> {
   if (!(await runtime.fileExists(hookMdPath))) {
     throw new Error(`HOOK.md missing in ${hookDir}`);
   }
-  const raw = await fs.readFile(hookMdPath, "utf-8");
-  const frontmatter = parseFrontmatter(raw);
+  const { buffer } = await readRegularFile({ filePath: hookMdPath, maxBytes: HOOK_MD_MAX_BYTES });
+  const frontmatter = parseHookFrontmatter(buffer.toString("utf-8"));
   return frontmatter.name || path.basename(hookDir);
 }
 
@@ -429,7 +436,7 @@ async function installHookPackageFromDir(
     };
   }
 
-  const resolvedHooks = [] as string[];
+  const resolvedHooks = new Set<string>();
   for (const entry of hookEntries) {
     const hookDir = path.resolve(params.packageDir, entry);
     // Validate both lexical containment and realpath containment so archive
@@ -452,8 +459,12 @@ async function installHookPackageFromDir(
       };
     }
     const hookName = await resolveHookNameFromDir(hookDir);
-    resolvedHooks.push(hookName);
+    if (resolvedHooks.has(hookName)) {
+      return { ok: false, error: `duplicate hook name "${hookName}" in hook package` };
+    }
+    resolvedHooks.add(hookName);
   }
+  const hookNames = [...resolvedHooks];
 
   if (params.inspection === "package-kind") {
     const targetDirResult = resolveHookInstallTargetPath(hookPackId, params.hooksDir);
@@ -463,7 +474,7 @@ async function installHookPackageFromDir(
     return {
       ok: true,
       hookPackId,
-      hooks: resolvedHooks,
+      hooks: hookNames,
       packageKind,
       targetDir: targetDirResult.targetDir,
       version: typeof manifest.version === "string" ? manifest.version : undefined,
@@ -499,7 +510,7 @@ async function installHookPackageFromDir(
     return {
       ok: true,
       hookPackId,
-      hooks: resolvedHooks,
+      hooks: hookNames,
       packageKind,
       targetDir,
       version: typeof manifest.version === "string" ? manifest.version : undefined,
@@ -533,7 +544,7 @@ async function installHookPackageFromDir(
   return {
     ok: true,
     hookPackId,
-    hooks: resolvedHooks,
+    hooks: hookNames,
     packageKind,
     targetDir,
     version: typeof manifest.version === "string" ? manifest.version : undefined,
@@ -651,7 +662,7 @@ async function installHookFromDir(
 }
 
 /** Install hooks from an archive after extracting and validating the archive root. */
-export async function installHooksFromArchive(
+async function installHooksFromArchive(
   params: HookArchiveInstallParams,
 ): Promise<InstallHooksResult> {
   const runtime = await loadHookInstallRuntime();
@@ -768,3 +779,4 @@ export async function installHooksFromPath(
     ...forwardParams,
   });
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

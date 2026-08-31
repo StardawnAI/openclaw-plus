@@ -2,7 +2,10 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { runTasksWithConcurrency } from "openclaw/plugin-sdk/concurrency-runtime";
+import { isPathInside } from "openclaw/plugin-sdk/file-access-runtime";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { walkMemoryWikiDirectory } from "./bounded-walk.js";
 import type { BridgeMemoryWikiResult } from "./bridge.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import { appendMemoryWikiLog } from "./log.js";
@@ -29,7 +32,13 @@ type UnsafeLocalArtifact = {
   relativePath: string;
 };
 
+type UnsafeLocalArtifactCollection = {
+  artifacts: UnsafeLocalArtifact[];
+  unavailableConfiguredPaths: string[];
+};
+
 const DIRECTORY_TEXT_EXTENSIONS = new Set([".json", ".jsonl", ".md", ".txt", ".yaml", ".yml"]);
+const UNSAFE_LOCAL_SYNC_CONCURRENCY = 16;
 
 function detectFenceLanguage(filePath: string): string {
   const ext = normalizeLowercaseStringOrEmpty(path.extname(filePath));
@@ -46,61 +55,62 @@ function detectFenceLanguage(filePath: string): string {
 }
 
 async function listAllowedFilesRecursive(rootDir: string): Promise<string[]> {
-  const entries = await fs.readdir(rootDir, { withFileTypes: true }).catch(() => []);
-  const files: string[] = [];
-  for (const entry of entries) {
-    const fullPath = path.join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await listAllowedFilesRecursive(fullPath)));
-      continue;
-    }
-    if (
-      entry.isFile() &&
-      DIRECTORY_TEXT_EXTENSIONS.has(normalizeLowercaseStringOrEmpty(path.extname(entry.name)))
-    ) {
-      files.push(fullPath);
-    }
-  }
-  return files.toSorted((left, right) => left.localeCompare(right));
+  const entries = await walkMemoryWikiDirectory(rootDir, "", {
+    entryFilter: (entry) =>
+      entry.kind === "directory" ||
+      (entry.kind === "file" &&
+        DIRECTORY_TEXT_EXTENSIONS.has(
+          normalizeLowercaseStringOrEmpty(path.extname(entry.relativePath)),
+        ))
+        ? "include"
+        : "skip",
+  });
+  return entries
+    .filter((entry) => entry.kind === "file")
+    .map((entry) => path.join(rootDir, entry.relativePath))
+    .toSorted((left, right) => left.localeCompare(right));
 }
 
 async function collectUnsafeLocalArtifacts(
   configuredPaths: string[],
-): Promise<UnsafeLocalArtifact[]> {
+): Promise<UnsafeLocalArtifactCollection> {
   const artifacts: UnsafeLocalArtifact[] = [];
+  const unavailableConfiguredPaths: string[] = [];
   for (const configuredPath of configuredPaths) {
     const absoluteConfiguredPath = path.resolve(configuredPath);
-    const stat = await fs.stat(absoluteConfiguredPath).catch(() => null);
-    if (!stat) {
-      continue;
-    }
-    if (stat.isDirectory()) {
-      const files = await listAllowedFilesRecursive(absoluteConfiguredPath);
-      for (const absolutePath of files) {
-        artifacts.push({
-          syncKey: await resolveArtifactKey(absolutePath),
+    const scopedArtifacts: UnsafeLocalArtifact[] = [];
+    try {
+      const stat = await fs.stat(absoluteConfiguredPath);
+      if (stat.isDirectory()) {
+        const files = await listAllowedFilesRecursive(absoluteConfiguredPath);
+        for (const absolutePath of files) {
+          scopedArtifacts.push({
+            syncKey: await resolveArtifactKey(absolutePath),
+            configuredPath: absoluteConfiguredPath,
+            absolutePath,
+            relativePath: path.relative(absoluteConfiguredPath, absolutePath).replace(/\\/g, "/"),
+          });
+        }
+      } else if (stat.isFile()) {
+        scopedArtifacts.push({
+          syncKey: await resolveArtifactKey(absoluteConfiguredPath),
           configuredPath: absoluteConfiguredPath,
-          absolutePath,
-          relativePath: path.relative(absoluteConfiguredPath, absolutePath).replace(/\\/g, "/"),
+          absolutePath: absoluteConfiguredPath,
+          relativePath: path.basename(absoluteConfiguredPath),
         });
       }
+    } catch {
+      unavailableConfiguredPaths.push(absoluteConfiguredPath);
       continue;
     }
-    if (stat.isFile()) {
-      artifacts.push({
-        syncKey: await resolveArtifactKey(absoluteConfiguredPath),
-        configuredPath: absoluteConfiguredPath,
-        absolutePath: absoluteConfiguredPath,
-        relativePath: path.basename(absoluteConfiguredPath),
-      });
-    }
+    artifacts.push(...scopedArtifacts);
   }
 
   const deduped = new Map<string, UnsafeLocalArtifact>();
   for (const artifact of artifacts) {
     deduped.set(artifact.syncKey, artifact);
   }
-  return [...deduped.values()];
+  return { artifacts: [...deduped.values()], unavailableConfiguredPaths };
 }
 
 function resolveUnsafeLocalPagePath(params: { configuredPath: string; absolutePath: string }): {
@@ -136,6 +146,7 @@ async function writeUnsafeLocalSourcePage(params: {
   sourceUpdatedAtMs: number;
   sourceSize: number;
   state: Awaited<ReturnType<typeof readMemoryWikiSourceSyncState>>;
+  prepareWrite: () => Promise<unknown>;
 }): Promise<{ pagePath: string; changed: boolean; created: boolean }> {
   const { pageId, pagePath } = resolveUnsafeLocalPagePath({
     configuredPath: params.artifact.configuredPath,
@@ -160,6 +171,7 @@ async function writeUnsafeLocalSourcePage(params: {
     pagePath,
     group: "unsafe-local",
     state: params.state,
+    prepareWrite: params.prepareWrite,
     buildRendered: (raw, updatedAt) =>
       renderWikiMarkdown({
         frontmatter: {
@@ -196,8 +208,8 @@ async function writeUnsafeLocalSourcePage(params: {
 
 export async function syncMemoryWikiUnsafeLocalSources(
   config: ResolvedMemoryWikiConfig,
+  options: { signal?: AbortSignal } = {},
 ): Promise<BridgeMemoryWikiResult> {
-  await initializeMemoryWikiVault(config);
   if (
     config.vaultMode !== "unsafe-local" ||
     !config.unsafeLocal.allowPrivateMemoryCoreAccess ||
@@ -214,16 +226,40 @@ export async function syncMemoryWikiUnsafeLocalSources(
     };
   }
 
-  const artifacts = await collectUnsafeLocalArtifacts(config.unsafeLocal.paths);
+  const { artifacts, unavailableConfiguredPaths } = await collectUnsafeLocalArtifacts(
+    config.unsafeLocal.paths,
+  );
   const state = await readMemoryWikiSourceSyncState(config.vault.path);
+  let initializePromise: ReturnType<typeof initializeMemoryWikiVault> | undefined;
+  const prepareWrite = async () => {
+    options.signal?.throwIfAborted();
+    const result = await (initializePromise ??= initializeMemoryWikiVault(
+      config,
+      options.signal ? { signal: options.signal } : undefined,
+    ));
+    options.signal?.throwIfAborted();
+    return result;
+  };
+  const activeKeys = new Set<string>();
+  for (const [syncKey, entry] of Object.entries(state.entries)) {
+    if (
+      entry.group === "unsafe-local" &&
+      unavailableConfiguredPaths.some((configuredPath) =>
+        isPathInside(configuredPath, entry.sourcePath),
+      )
+    ) {
+      // A configured source scope remains authoritative until it is readable again or removed
+      // from config. Treating an unreadable mount as empty would permanently delete human notes.
+      activeKeys.add(syncKey);
+    }
+  }
   assertMemoryWikiSourceSyncStateCapacity({
     state,
     group: "unsafe-local",
-    incomingCount: artifacts.length,
+    incomingCount: new Set([...artifacts.map((artifact) => artifact.syncKey), ...activeKeys]).size,
   });
-  const activeKeys = new Set<string>();
-  const results = await Promise.all(
-    artifacts.map(async (artifact) => {
+  const { results } = await runTasksWithConcurrency({
+    tasks: artifacts.map((artifact) => async () => {
       const stats = await fs.stat(artifact.absolutePath);
       activeKeys.add(artifact.syncKey);
       return await writeUnsafeLocalSourcePage({
@@ -232,15 +268,20 @@ export async function syncMemoryWikiUnsafeLocalSources(
         sourceUpdatedAtMs: stats.mtimeMs,
         sourceSize: stats.size,
         state,
+        prepareWrite,
       });
     }),
-  );
+    limit: UNSAFE_LOCAL_SYNC_CONCURRENCY,
+    errorMode: "stop",
+    throwOnError: true,
+  });
 
   const removedCount = await pruneImportedSourceEntries({
     vaultRoot: config.vault.path,
     group: "unsafe-local",
     activeKeys,
     state,
+    prepareWrite,
   });
   await writeMemoryWikiSourceSyncState(config.vault.path, state);
   const importedCount = results.filter((result) => result.changed && result.created).length;

@@ -1,4 +1,4 @@
-import { isFailoverError } from "./failover-error.js";
+import { isFailoverError, isTimeoutError } from "./failover-error.js";
 import type { AgentRunTimeoutPhase } from "./run-timeout-attribution.js";
 
 /**
@@ -12,8 +12,18 @@ const AGENT_RUN_ABORTED_STOP_REASON = "aborted" as const;
 /** Error text used for aborted agent runs. */
 export const AGENT_RUN_ABORTED_ERROR = "agent run aborted" as const;
 export const AGENT_RUN_RESTART_ABORT_STOP_REASON = "restart" as const;
+export const AGENT_RUN_SUPERSEDED_STOP_REASON = "superseded" as const;
+/** Error text used for agent runs aborted by a gateway restart. */
+export const AGENT_RUN_RESTART_ABORT_ERROR = "agent run aborted for restart" as const;
+export const AGENT_RUN_SUPERSEDED_ERROR = "agent run superseded by a newer session writer" as const;
 
-const AGENT_RUN_RESTART_ABORT_ERROR_CODE = "OPENCLAW_RESTART_ABORT";
+/**
+ * Transports copy this code onto the persisted assistant message via
+ * `errorCode`, so restart recovery can recognize its own abort without matching
+ * free-form provider error text.
+ */
+export const AGENT_RUN_RESTART_ABORT_ERROR_CODE = "OPENCLAW_RESTART_ABORT";
+const AGENT_RUN_SUPERSEDED_ABORT_ERROR_CODE = "AGENT_RUN_SUPERSEDED_ABORT";
 const AGENT_RUN_DIRECT_ABORT_ERROR_CODE = "OPENCLAW_DIRECT_ABORT";
 
 export function createAgentRunDirectAbortError(): Error {
@@ -30,9 +40,16 @@ export function isAgentRunDirectAbortReason(value: unknown): boolean {
 }
 
 export function createAgentRunRestartAbortError(): Error {
-  const error = new Error("agent run aborted for restart") as Error & { code: string };
+  const error = new Error(AGENT_RUN_RESTART_ABORT_ERROR) as Error & { code: string };
   error.name = "AbortError";
   error.code = AGENT_RUN_RESTART_ABORT_ERROR_CODE;
+  return error;
+}
+
+export function createAgentRunSupersededAbortError(): Error {
+  const error = new Error(AGENT_RUN_SUPERSEDED_ERROR) as Error & { code: string };
+  error.name = "AbortError";
+  error.code = AGENT_RUN_SUPERSEDED_ABORT_ERROR_CODE;
   return error;
 }
 
@@ -43,6 +60,24 @@ export function isAgentRunRestartAbortReason(value: unknown): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+export function isAgentRunSupersededAbortReason(value: unknown): boolean {
+  try {
+    return (
+      value instanceof Error &&
+      "code" in value &&
+      value.code === AGENT_RUN_SUPERSEDED_ABORT_ERROR_CODE
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function throwAgentRunRestartAbortReason(value: unknown): void {
+  if (isAgentRunRestartAbortReason(value)) {
+    throw value;
   }
 }
 
@@ -123,4 +158,32 @@ export function isAbortedAgentStopReason(
   value: unknown,
 ): value is typeof AGENT_RUN_ABORTED_STOP_REASON | typeof AGENT_RUN_RESTART_ABORT_STOP_REASON {
   return value === AGENT_RUN_ABORTED_STOP_REASON || value === AGENT_RUN_RESTART_ABORT_STOP_REASON;
+}
+
+/**
+ * CLI tool terminal reason for one-shot and live runners.
+ * Abort-signal lifecycle is authoritative so a timeout abort stays timed_out
+ * even when the delivered error is a generic AbortError.
+ */
+export function resolveCliToolTerminalReason(params: {
+  error?: unknown;
+  abortSignal?: AbortSignal;
+}): "timed_out" | "cancelled" | "failed" {
+  const abortFields = resolveAgentRunAbortLifecycleFields(params.abortSignal);
+  if (abortFields.aborted) {
+    return abortFields.stopReason === "timeout" ? "timed_out" : "cancelled";
+  }
+  const { error } = params;
+  try {
+    if (isTimeoutError(error) || (isFailoverError(error) && error.reason === "timeout")) {
+      return "timed_out";
+    }
+    if (error instanceof Error && error.name === "AbortError") {
+      return "cancelled";
+    }
+  } catch {
+    // Run errors may expose hostile getters. Classification must not replace
+    // the original failure or suppress its terminal event.
+  }
+  return "failed";
 }

@@ -34,7 +34,7 @@ export function normalizeSkillIndexName(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-export function isSkillRuntimeVisible(entry: SkillEntry): boolean {
+function isSkillRuntimeVisible(entry: SkillEntry): boolean {
   return entry.exposure?.includeInRuntimeRegistry ?? true;
 }
 
@@ -48,7 +48,7 @@ export function isSkillPromptVisible(entry: SkillEntry): boolean {
   return !entry.skill.disableModelInvocation;
 }
 
-export function isSkillUserInvocable(entry: SkillEntry): boolean {
+function isSkillUserInvocable(entry: SkillEntry): boolean {
   if (entry.exposure) {
     return entry.exposure.userInvocable ?? true;
   }
@@ -92,6 +92,7 @@ function createSkillIndexEntry(
     source,
     bundled:
       source === "openclaw-bundled" ||
+      source === "openclaw-custodian" ||
       (source === "unknown" && opts?.bundledNames?.has(name) === true),
     agentAllowed: agentSkillSet === undefined || agentSkillSet.has(name),
     runtimeVisible: isSkillRuntimeVisible(entry),

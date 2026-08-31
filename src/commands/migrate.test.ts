@@ -1,5 +1,6 @@
 // Top-level migrate command tests cover provider planning, interactive selection, apply flow, and JSON output.
 import fs from "node:fs/promises";
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MigrationApplyResult, MigrationPlan } from "../plugins/types.js";
 import type { RuntimeEnv } from "../runtime.js";
@@ -36,8 +37,18 @@ vi.mock("../config/config.js", () => ({
   loadConfig: () => ({}),
 }));
 
+// Per-run unique + realpath'd state dir: the apply flow writes real report dirs under it and
+// the suite rm -rf's it, so concurrent runs on one machine must never share the root (macOS
+// os.tmpdir() is a /var -> /private/var symlink).
+const testStateDir = await vi.hoisted(async () => {
+  const { mkdtemp, realpath } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  return await realpath(await mkdtemp(join(tmpdir(), "openclaw-migrate-command-test-")));
+});
+
 vi.mock("../config/paths.js", () => ({
-  resolveStateDir: () => "/tmp/openclaw-migrate-command-test",
+  resolveStateDir: () => testStateDir,
 }));
 
 vi.mock("../cli/prompt.js", () => ({
@@ -70,9 +81,9 @@ vi.mock("./backup.js", () => ({
 }));
 
 const {
-  MIGRATION_SKILL_SELECTION_ACCEPT,
-  MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF,
-  MIGRATION_SKILL_SELECTION_TOGGLE_ALL_ON,
+  MIGRATION_SELECTION_ACCEPT,
+  MIGRATION_SELECTION_TOGGLE_ALL_OFF,
+  MIGRATION_SELECTION_TOGGLE_ALL_ON,
 } = await import("./migrate/selection.js");
 const { migrateApplyCommand, migrateDefaultCommand, migratePlanCommand } =
   await import("./migrate.js");
@@ -289,7 +300,7 @@ describe("migrateApplyCommand", () => {
   const originalIsTty = process.stdin.isTTY;
 
   beforeEach(async () => {
-    await fs.rm("/tmp/openclaw-migrate-command-test", { force: true, recursive: true });
+    await fs.rm(testStateDir, { force: true, recursive: true });
     Object.defineProperty(process.stdin, "isTTY", {
       configurable: true,
       value: false,
@@ -316,7 +327,7 @@ describe("migrateApplyCommand", () => {
       configurable: true,
       value: originalIsTty,
     });
-    await fs.rm("/tmp/openclaw-migrate-command-test", { force: true, recursive: true });
+    await fs.rm(testStateDir, { force: true, recursive: true });
     vi.clearAllMocks();
   });
 
@@ -329,7 +340,7 @@ describe("migrateApplyCommand", () => {
 
   it("requires --yes in non-interactive apply mode", async () => {
     await expect(migrateApplyCommand(runtime, { provider: "hermes" })).rejects.toThrow(
-      "requires --yes",
+      "requires --yes in non-interactive mode. Preview first with openclaw migrate plan 'hermes'.",
     );
     expect(mocks.provider.plan).not.toHaveBeenCalled();
   });
@@ -682,13 +693,12 @@ describe("migrateApplyCommand", () => {
     const selectionPrompt = multiselectPrompt();
     expect(String(selectionPrompt.message)).toContain("Select Codex skills");
     expect(selectionPrompt.initialValues).toStrictEqual(["skill:alpha", "skill:beta"]);
-    expect(selectionPrompt.required).toBe(false);
     expect(selectionPrompt.options?.map(({ label, value }) => ({ label, value }))).toStrictEqual([
-      { value: MIGRATION_SKILL_SELECTION_ACCEPT, label: "Accept recommended" },
+      { value: MIGRATION_SELECTION_ACCEPT, label: "Accept recommended" },
       { value: "skill:alpha", label: "alpha" },
       { value: "skill:beta", label: "beta" },
-      { value: MIGRATION_SKILL_SELECTION_TOGGLE_ALL_ON, label: "Toggle all on" },
-      { value: MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF, label: "Toggle all off" },
+      { value: MIGRATION_SELECTION_TOGGLE_ALL_ON, label: "Toggle all on" },
+      { value: MIGRATION_SELECTION_TOGGLE_ALL_OFF, label: "Toggle all off" },
     ]);
     expect(mocks.promptYesNo).toHaveBeenCalledWith("Apply this migration now?", false);
     const appliedPlan = firstAppliedPlan();
@@ -742,13 +752,12 @@ describe("migrateApplyCommand", () => {
     const pluginPrompt = multiselectPrompt(1);
     expect(String(pluginPrompt.message)).toContain("Select native Codex plugins");
     expect(pluginPrompt.initialValues).toStrictEqual(["plugin:google-calendar", "plugin:gmail"]);
-    expect(pluginPrompt.required).toBe(false);
     expect(pluginPrompt.options?.map(({ label, value }) => ({ label, value }))).toStrictEqual([
-      { value: MIGRATION_SKILL_SELECTION_ACCEPT, label: "Accept recommended" },
+      { value: MIGRATION_SELECTION_ACCEPT, label: "Accept recommended" },
       { value: "plugin:google-calendar", label: "google-calendar" },
       { value: "plugin:gmail", label: "gmail" },
-      { value: MIGRATION_SKILL_SELECTION_TOGGLE_ALL_ON, label: "Toggle all on" },
-      { value: MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF, label: "Toggle all off" },
+      { value: MIGRATION_SELECTION_TOGGLE_ALL_ON, label: "Toggle all on" },
+      { value: MIGRATION_SELECTION_TOGGLE_ALL_OFF, label: "Toggle all off" },
     ]);
     expect(mocks.promptYesNo).toHaveBeenCalledWith("Apply this migration now?", false);
     const appliedPlan = firstAppliedPlan();
@@ -798,7 +807,7 @@ describe("migrateApplyCommand", () => {
     });
     mocks.provider.plan.mockResolvedValue(planned);
     mocks.multiselect
-      .mockResolvedValueOnce([MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF])
+      .mockResolvedValueOnce([MIGRATION_SELECTION_TOGGLE_ALL_OFF])
       .mockResolvedValueOnce(["plugin:google-calendar", "plugin:gmail"]);
     mocks.promptYesNo.mockResolvedValue(true);
     mocks.provider.apply.mockImplementation(async (_ctx, selectedPlan: MigrationPlan) => ({
@@ -856,8 +865,8 @@ describe("migrateApplyCommand", () => {
             pluginName: "google-calendar",
           },
         },
-        codexPluginPlan().items[1],
-        codexPluginPlan().items[2],
+        expectDefined(codexPluginPlan().items[1], "codexPluginPlan().items[1] test invariant"),
+        expectDefined(codexPluginPlan().items[2], "codexPluginPlan().items[2] test invariant"),
       ],
     });
     mocks.provider.plan.mockResolvedValue(planned);
@@ -899,7 +908,7 @@ describe("migrateApplyCommand", () => {
     });
     const planned = codexPluginPlan();
     mocks.provider.plan.mockResolvedValue(planned);
-    mocks.multiselect.mockResolvedValue([MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF]);
+    mocks.multiselect.mockResolvedValue([MIGRATION_SELECTION_TOGGLE_ALL_OFF]);
 
     const result = await migrateDefaultCommand(runtime, { provider: "codex" });
 
@@ -1015,7 +1024,7 @@ describe("migrateApplyCommand", () => {
     });
     const planned = codexSkillPlan();
     mocks.provider.plan.mockResolvedValue(planned);
-    mocks.multiselect.mockResolvedValue([MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF]);
+    mocks.multiselect.mockResolvedValue([MIGRATION_SELECTION_TOGGLE_ALL_OFF]);
 
     const result = await migrateDefaultCommand(runtime, { provider: "codex" });
 
@@ -1043,7 +1052,7 @@ describe("migrateApplyCommand", () => {
     });
     const planned = codexSkillPlan();
     mocks.provider.plan.mockResolvedValue(planned);
-    mocks.multiselect.mockResolvedValue([MIGRATION_SKILL_SELECTION_TOGGLE_ALL_ON]);
+    mocks.multiselect.mockResolvedValue([MIGRATION_SELECTION_TOGGLE_ALL_ON]);
     mocks.promptYesNo.mockResolvedValue(true);
     mocks.provider.apply.mockImplementation(async (_ctx, selectedPlan: MigrationPlan) => ({
       ...selectedPlan,
@@ -1062,8 +1071,8 @@ describe("migrateApplyCommand", () => {
 
     mocks.provider.plan.mockResolvedValue(planned);
     mocks.multiselect.mockResolvedValue([
-      MIGRATION_SKILL_SELECTION_TOGGLE_ALL_ON,
-      MIGRATION_SKILL_SELECTION_TOGGLE_ALL_OFF,
+      MIGRATION_SELECTION_TOGGLE_ALL_ON,
+      MIGRATION_SELECTION_TOGGLE_ALL_OFF,
     ]);
     mocks.promptYesNo.mockResolvedValue(true);
     mocks.provider.apply.mockClear();
@@ -1544,3 +1553,4 @@ describe("migrateApplyCommand", () => {
     expect(logPayload.warnings).toEqual([warning]);
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

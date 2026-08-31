@@ -7,9 +7,17 @@ import {
   type HarnessContextEngine as ContextEngine,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  consumeCodexAppServerLiveThread,
+  ensureCodexAppServerClientRuntime,
+  retainCodexAppServerLiveThread,
+} from "./client-runtime.js";
 import { CodexAppServerRpcError, type CodexAppServerClient } from "./client.js";
 import { maybeCompactCodexAppServerSession as maybeCompactCodexAppServerSessionImpl } from "./compact.js";
+import { resolveCodexSupervisionAppServerRuntimeOptions } from "./config.js";
+import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
 import type { CodexServerNotification } from "./protocol.js";
+import { createSandboxContext } from "./sandbox-exec-server.test-helpers.js";
 import { sessionBindingIdentity } from "./session-binding.js";
 import {
   clearCodexAppServerBindingForThread,
@@ -21,6 +29,7 @@ import {
   writeCodexAppServerBinding,
 } from "./session-binding.test-helpers.js";
 import type { CodexAppServerClientFactory } from "./shared-client.js";
+import { CODEX_APP_SERVER_VERSION } from "./version.js";
 
 let tempDir: string;
 let codexAppServerClientFactoryForTest: CodexAppServerClientFactory | undefined;
@@ -81,7 +90,32 @@ async function writeTestBinding(
   return sessionFile;
 }
 
-function startCompaction(sessionFile: string, options: { currentTokenCount?: number } = {}) {
+async function writeSupervisedTestBinding(
+  options: Partial<Parameters<typeof writeCodexAppServerBinding>[1]> = {},
+): Promise<string> {
+  return writeTestBinding({
+    connectionScope: "supervision",
+    supervisionSourceThreadId: "source-thread-1",
+    preserveNativeModel: true,
+    conversationSourceTransferComplete: true,
+    model: "gpt-5.4",
+    modelProvider: "openai",
+    appServerRuntimeFingerprint: buildCodexAppServerConnectionFingerprint(
+      resolveCodexSupervisionAppServerRuntimeOptions({
+        pluginConfig: { supervision: { enabled: true } },
+      }),
+    ),
+    ...options,
+  });
+}
+
+function startCompaction(
+  sessionFile: string,
+  options: {
+    currentTokenCount?: number;
+    nativeToolSurface?: "unrestricted" | "host-isolated";
+  } = {},
+) {
   return maybeCompactCodexAppServerSession({
     sessionId: "session-1",
     sessionKey: "agent:main:session-1",
@@ -101,6 +135,25 @@ function startSandboxedCompaction(sessionFile: string) {
     trigger: "manual",
     config: { agents: { defaults: { sandbox: { mode: "all" } } } },
   });
+}
+
+function startRemoteExecCompaction(sessionFile: string) {
+  const params: Parameters<typeof maybeCompactCodexAppServerSession>[0] & {
+    sandbox: ReturnType<typeof createSandboxContext> & {
+      placementExecutionMode: "remote-exec";
+    };
+  } = {
+    sessionId: "session-1",
+    sessionKey: "agent:main:session-1",
+    sessionFile,
+    workspaceDir: tempDir,
+    trigger: "manual",
+    sandbox: {
+      ...createSandboxContext({}),
+      placementExecutionMode: "remote-exec",
+    },
+  };
+  return maybeCompactCodexAppServerSession(params);
 }
 
 function startNodeExecCompaction(sessionFile: string) {
@@ -181,6 +234,307 @@ describe("maybeCompactCodexAppServerSession", () => {
     expect(details.completed).toBe(true);
   });
 
+  it("does not compact a thread created with restricted native authority", async () => {
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding({ nativeToolPolicyRestricted: true });
+
+    await expect(startCompaction(sessionFile)).resolves.toMatchObject({
+      ok: true,
+      compacted: false,
+      reason: "native compaction is unavailable for a host-isolated Codex session",
+      result: {
+        details: {
+          backend: "codex-app-server",
+          skipped: true,
+          reason: "native_tool_policy_restricted",
+          expectedThreadId: "thread-1",
+        },
+      },
+    });
+    expect(fake.request).not.toHaveBeenCalled();
+  });
+
+  it("does not compact an unrestricted binding during a host-isolated operation", async () => {
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+
+    await expect(
+      startCompaction(sessionFile, { nativeToolSurface: "host-isolated" }),
+    ).resolves.toMatchObject({
+      ok: true,
+      compacted: false,
+      result: { details: { reason: "native_tool_policy_restricted" } },
+    });
+    expect(fake.request).not.toHaveBeenCalled();
+  });
+
+  it("compacts a warm session without displacing its independently retained sibling", async () => {
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+
+    await fake.client.request("thread/resume", { threadId: "thread-2", excludeTurns: true });
+    await retainCodexAppServerLiveThread(
+      fake.client,
+      "thread-2",
+      async (threadId) => {
+        await fake.client.request("thread/unsubscribe", { threadId });
+      },
+      "config-thread-2",
+    );
+    fake.request.mockClear();
+
+    await expect(startCompaction(sessionFile)).resolves.toMatchObject({
+      ok: true,
+      compacted: true,
+    });
+
+    expect(fake.request.mock.calls.map(([method]) => method)).toEqual(["thread/compact/start"]);
+    await expect(
+      consumeCodexAppServerLiveThread(fake.client, "thread-1", "config-thread-1"),
+    ).resolves.toEqual(expect.objectContaining({ configFingerprint: "config-thread-1" }));
+    await expect(
+      consumeCodexAppServerLiveThread(fake.client, "thread-2", "config-thread-2"),
+    ).resolves.toEqual(expect.objectContaining({ configFingerprint: "config-thread-2" }));
+  });
+
+  it("keeps an owned thread subscribed when a sibling finishes during compaction", async () => {
+    const fake = createFakeCodexClient({ autoCompleteCompaction: false });
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+    const pending = startCompaction(sessionFile);
+    await vi.waitFor(() => {
+      expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
+    });
+
+    await fake.client.request("thread/resume", { threadId: "thread-2", excludeTurns: true });
+    await retainCodexAppServerLiveThread(fake.client, "thread-2", undefined, "config-thread-2");
+    fake.completeCompaction();
+
+    await expect(pending).resolves.toMatchObject({ ok: true, compacted: true });
+    expect(fake.request).not.toHaveBeenCalledWith(
+      "thread/unsubscribe",
+      { threadId: "thread-1" },
+      expect.anything(),
+    );
+    await expect(
+      consumeCodexAppServerLiveThread(fake.client, "thread-1", "config-thread-1"),
+    ).resolves.toEqual(expect.objectContaining({ configFingerprint: "config-thread-1" }));
+    await expect(
+      consumeCodexAppServerLiveThread(fake.client, "thread-2", "config-thread-2"),
+    ).resolves.toEqual(expect.objectContaining({ configFingerprint: "config-thread-2" }));
+  });
+
+  it("releases an obsolete physical owner when compaction migrates the same native thread", async () => {
+    const fake = createFakeCodexClient({ autoCompleteCompaction: false });
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding({ clientId: "client-before-compaction" });
+    const pending = startCompaction(sessionFile);
+    await vi.waitFor(() => {
+      expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
+    });
+
+    seedCodexTestBinding(sessionFile, {
+      threadId: "thread-1",
+      clientId: "client-after-compaction",
+      cwd: tempDir,
+    });
+    fake.completeCompaction();
+
+    await expect(pending).resolves.toMatchObject({ ok: true, compacted: true });
+    expect(fake.request.mock.calls.filter(([method]) => method === "thread/unsubscribe")).toEqual([
+      [
+        "thread/unsubscribe",
+        { threadId: "thread-1" },
+        expect.objectContaining({ timeoutMs: expect.any(Number) }),
+      ],
+    ]);
+    await expect(consumeCodexAppServerLiveThread(fake.client, "thread-1")).resolves.toBeUndefined();
+    await expect(readCodexAppServerBinding(sessionFile)).resolves.toMatchObject({
+      threadId: "thread-1",
+      clientId: "client-after-compaction",
+    });
+  });
+
+  it("preserves an incognito thread's separately owned live subscription", async () => {
+    const fake = createFakeCodexClient({
+      retainedThreadId: null,
+      subscribedThreadIds: ["thread-1"],
+    });
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionKey = "agent:main:dashboard:incognito-compact";
+    const sessionFile = await writeTestBinding({}, sessionKey);
+
+    await expect(
+      maybeCompactCodexAppServerSession({
+        sessionId: "session-1",
+        sessionKey,
+        sessionFile,
+        workspaceDir: tempDir,
+        trigger: "manual",
+      }),
+    ).resolves.toMatchObject({ ok: true, compacted: true });
+
+    expect(fake.request.mock.calls.map(([method]) => method)).toEqual(["thread/compact/start"]);
+  });
+
+  it("uses the exact prepared Platform key for native compaction", async () => {
+    const fake = createFakeCodexClient();
+    const factory = vi.fn<CodexAppServerClientFactory>(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "manual",
+          provider: "openai",
+          model: "gpt-5.5",
+          resolvedApiKey: "prepared-platform-key",
+          runtimeAuthPlan: {
+            providerForAuth: "openai",
+            authProfileProviderForAuth: "openai",
+            harnessAuthProvider: "openai",
+            selectedAuthMode: "api-key",
+            modelRoute: {
+              provider: "openai",
+              modelId: "gpt-5.5",
+              api: "openai-responses",
+              baseUrl: "https://api.openai.com/v1",
+              authRequirement: "api-key",
+              requestTransportOverrides: "none",
+            },
+          },
+        },
+        { clientFactory: factory },
+      ),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(factory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        preparedAuth: { kind: "api-key", apiKey: "prepared-platform-key" },
+      }),
+    );
+    expect(factory.mock.calls[0]?.[0]).not.toHaveProperty("authProfileId");
+  });
+
+  it("fails closed when prepared Platform compaction has no key", async () => {
+    const fake = createFakeCodexClient();
+    const factory = vi.fn(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "manual",
+          provider: "openai",
+          model: "gpt-5.5",
+          runtimeAuthPlan: {
+            providerForAuth: "openai",
+            authProfileProviderForAuth: "openai",
+            harnessAuthProvider: "openai",
+            selectedAuthMode: "api-key",
+            modelRoute: {
+              provider: "openai",
+              modelId: "gpt-5.5",
+              api: "openai-responses",
+              baseUrl: "https://api.openai.com/v1",
+              authRequirement: "api-key",
+              requestTransportOverrides: "none",
+            },
+          },
+        },
+        { clientFactory: factory },
+      ),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      compacted: false,
+      reason: "Prepared Codex Platform compaction route is missing its resolved API key.",
+    });
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it("uses the native supervision runtime and auth for supervised bindings", async () => {
+    const fake = createFakeCodexClient({ retainedThreadId: null });
+    const factory = vi.fn(async () => fake.client);
+    const sessionFile = await writeSupervisedTestBinding({
+      authProfileId: "openai:binding-profile",
+    });
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "manual",
+          authProfileId: "openai:outer-profile",
+        },
+        {
+          clientFactory: factory,
+          pluginConfig: { supervision: { enabled: true } },
+        },
+      ),
+    );
+
+    expect(result.ok).toBe(true);
+    expect(factory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authProfileId: null,
+        startOptions: expect.objectContaining({ homeScope: "user" }),
+      }),
+    );
+    expect(fake.request.mock.calls.map(([method]) => method)).toEqual([
+      "thread/resume",
+      "thread/compact/start",
+      "thread/unsubscribe",
+    ]);
+  });
+
+  it("fails closed when a supervised binding is no longer enabled", async () => {
+    const fake = createFakeCodexClient();
+    const factory = vi.fn(async () => fake.client);
+    const sessionFile = await writeSupervisedTestBinding();
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "manual",
+        },
+        { clientFactory: factory, pluginConfig: { supervision: { enabled: false } } },
+      ),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      compacted: false,
+      reason:
+        "Codex supervision is disabled; refusing to open a native user-home supervised session",
+    });
+    expect(factory).not.toHaveBeenCalled();
+    await expect(readCodexAppServerBinding(sessionFile)).resolves.toMatchObject({
+      threadId: "thread-1",
+      connectionScope: "supervision",
+    });
+  });
+
   it("skips native app-server compaction for automatic budget triggers", async () => {
     const fake = createFakeCodexClient();
     setCodexAppServerClientFactoryForTest(async () => fake.client);
@@ -211,7 +565,7 @@ describe("maybeCompactCodexAppServerSession", () => {
   });
 
   it("starts native app-server compaction for post-context-engine budget requests", async () => {
-    const fake = createFakeCodexClient();
+    const fake = createFakeCodexClient({ retainedThreadId: null });
     setCodexAppServerClientFactoryForTest(async () => fake.client);
     const sessionFile = await writeTestBinding({
       contextEngine: {
@@ -246,6 +600,11 @@ describe("maybeCompactCodexAppServerSession", () => {
       { threadId: "thread-1" },
       { timeoutMs: 60_000 },
     );
+    expect(fake.request.mock.calls.map(([method]) => method)).toEqual([
+      "thread/resume",
+      "thread/compact/start",
+      "thread/unsubscribe",
+    ]);
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
     expect(result.reason).toBeUndefined();
@@ -270,6 +629,123 @@ describe("maybeCompactCodexAppServerSession", () => {
     expect(
       (await readCodexAppServerBinding(sessionFile))?.contextEngine?.projection,
     ).toBeUndefined();
+  });
+
+  it("clears bootstrap projection before manual native compaction rewrites thread history", async () => {
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding({
+      contextEngine: {
+        schemaVersion: 1,
+        engineId: "lossless-claw",
+        policyFingerprint: "policy-1",
+        projection: {
+          schemaVersion: 1,
+          mode: "thread_bootstrap",
+          epoch: "epoch-1",
+          fingerprint: "fingerprint-1",
+        },
+      },
+    });
+
+    await expect(startCompaction(sessionFile)).resolves.toMatchObject({
+      ok: true,
+      compacted: true,
+    });
+    expect(
+      (await readCodexAppServerBinding(sessionFile))?.contextEngine?.projection,
+    ).toBeUndefined();
+  });
+
+  it("preserves projected context and warm ownership when native compaction is rejected", async () => {
+    const fake = createFakeCodexClient();
+    fake.request.mockRejectedValueOnce(
+      new CodexAppServerRpcError(
+        { code: -32_600, message: "compaction temporarily unavailable" },
+        "thread/compact/start",
+      ),
+    );
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const projection = {
+      schemaVersion: 1 as const,
+      mode: "thread_bootstrap" as const,
+      epoch: "epoch-1",
+      fingerprint: "fingerprint-1",
+    };
+    const sessionFile = await writeTestBinding({
+      contextEngine: {
+        schemaVersion: 1,
+        engineId: "lossless-claw",
+        policyFingerprint: "policy-1",
+        projection,
+      },
+    });
+
+    await expect(startCompaction(sessionFile)).resolves.toMatchObject({
+      ok: false,
+      compacted: false,
+      reason: "compaction temporarily unavailable",
+    });
+    expect((await readCodexAppServerBinding(sessionFile))?.contextEngine?.projection).toEqual(
+      projection,
+    );
+    expect(fake.request.mock.calls.map(([method]) => method)).toEqual(["thread/compact/start"]);
+    await expect(consumeCodexAppServerLiveThread(fake.client, "thread-1")).resolves.toEqual(
+      expect.objectContaining({ release: expect.any(Function) }),
+    );
+  });
+
+  it("records the required-preflight origin on native app-server compaction requests", async () => {
+    const fake = createFakeCodexClient({ retainedThreadId: null });
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding({
+      contextEngine: {
+        schemaVersion: 1,
+        engineId: "lossless-claw",
+        policyFingerprint: "policy-1",
+        projection: {
+          schemaVersion: 1,
+          mode: "thread_bootstrap",
+          epoch: "epoch-1",
+          fingerprint: "fingerprint-1",
+        },
+      },
+    });
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "budget",
+          preflightRequired: true,
+          currentTokenCount: 456,
+        },
+        {
+          allowNonManualNativeRequest: true,
+          nativeCompactionRequest: "required_preflight",
+        },
+      ),
+    );
+
+    expect(fake.request).toHaveBeenCalledWith(
+      "thread/compact/start",
+      { threadId: "thread-1" },
+      { timeoutMs: 60_000 },
+    );
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(compactDetails(result)).toMatchObject({
+      backend: "codex-app-server",
+      threadId: "thread-1",
+      signal: "thread/compact/start",
+      pending: false,
+      completed: true,
+      request: "required_preflight",
+      trigger: "budget",
+    });
   });
 
   it("preserves projection when aborted before guarded native compaction", async () => {
@@ -409,6 +885,76 @@ describe("maybeCompactCodexAppServerSession", () => {
     });
   });
 
+  it("reports a recoverable stale-binding failure when a required-preflight native request sees the binding change", async () => {
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const originalContextEngine = {
+      schemaVersion: 1 as const,
+      engineId: "lossless-claw",
+      policyFingerprint: "policy-1",
+      projection: {
+        schemaVersion: 1 as const,
+        mode: "thread_bootstrap" as const,
+        epoch: "epoch-1",
+        fingerprint: "fingerprint-1",
+      },
+    };
+    const sessionFile = await writeTestBinding({
+      contextEngine: originalContextEngine,
+    });
+    let bindingReads = 0;
+    const bindingStore = {
+      ...testCodexAppServerBindingStore,
+      read: vi.fn(async (...args: Parameters<typeof testCodexAppServerBindingStore.read>) => {
+        const result = await testCodexAppServerBindingStore.read(...args);
+        if (bindingReads++ === 0) {
+          seedCodexTestBinding(sessionFile, {
+            threadId: "thread-2",
+            cwd: tempDir,
+            contextEngine: {
+              ...originalContextEngine,
+              projection: {
+                schemaVersion: 1,
+                mode: "thread_bootstrap",
+                epoch: "epoch-2",
+                fingerprint: "fingerprint-2",
+              },
+            },
+          });
+        }
+        return result;
+      }),
+    };
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "budget",
+          preflightRequired: true,
+          currentTokenCount: 456,
+        },
+        {
+          allowNonManualNativeRequest: true,
+          nativeCompactionRequest: "required_preflight",
+          bindingStore,
+        },
+      ),
+    );
+
+    // A required-preflight request has not compacted yet, so a binding change
+    // must surface as the recoverable failure rather than a benign ok:true skip,
+    // letting the queued harness fall back to the context engine.
+    expect(fake.request).not.toHaveBeenCalled();
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toBe("codex app-server binding changed before native compaction");
+    expect(result.failure?.reason).toBe("stale_thread_binding");
+  });
+
   it("blocks same-process binding writes until guarded native compaction starts", async () => {
     let releaseExternalWrite!: () => void;
     const externalWriteGate = new Promise<void>((resolve) => {
@@ -417,7 +963,10 @@ describe("maybeCompactCodexAppServerSession", () => {
     let externalWriteStarted = false;
     let externalWriteFinished = false;
     const fake = createFakeCodexClient();
-    fake.request.mockImplementation(async () => {
+    fake.request.mockImplementation(async (method) => {
+      if (method === "thread/unsubscribe") {
+        return {};
+      }
       const response = await expectExternalMutationBlockedDuringNativeRequest({
         releaseExternalMutation: releaseExternalWrite,
         isExternalMutationStarted: () => externalWriteStarted,
@@ -501,7 +1050,10 @@ describe("maybeCompactCodexAppServerSession", () => {
     let externalClearStarted = false;
     let externalClearFinished = false;
     const fake = createFakeCodexClient();
-    fake.request.mockImplementation(async () => {
+    fake.request.mockImplementation(async (method) => {
+      if (method === "thread/unsubscribe") {
+        return {};
+      }
       const response = await expectExternalMutationBlockedDuringNativeRequest({
         releaseExternalMutation: releaseExternalClear,
         isExternalMutationStarted: () => externalClearStarted,
@@ -585,18 +1137,21 @@ describe("maybeCompactCodexAppServerSession", () => {
     });
   });
 
-  it("blocks native app-server compaction when the current OpenClaw session is sandboxed", async () => {
+  it("blocks native app-server compaction for configured and remote-exec sandboxes", async () => {
     const fake = createFakeCodexClient();
     setCodexAppServerClientFactoryForTest(async () => fake.client);
     const sessionFile = await writeTestBinding();
 
-    const result = requireCompactResult(await startSandboxedCompaction(sessionFile));
-
-    expect(result.ok).toBe(false);
-    expect(result.compacted).toBe(false);
-    expect(result.reason).toContain(
-      "Codex-native native compaction is unavailable because OpenClaw sandboxing is active for this session.",
-    );
+    for (const result of [
+      requireCompactResult(await startSandboxedCompaction(sessionFile)),
+      requireCompactResult(await startRemoteExecCompaction(sessionFile)),
+    ]) {
+      expect(result.ok).toBe(false);
+      expect(result.compacted).toBe(false);
+      expect(result.reason).toContain(
+        "Codex-native native compaction is unavailable because OpenClaw sandboxing is active for this session.",
+      );
+    }
     expect(fake.request).not.toHaveBeenCalled();
   });
 
@@ -606,6 +1161,39 @@ describe("maybeCompactCodexAppServerSession", () => {
     const sessionFile = await writeTestBinding();
 
     const result = requireCompactResult(await startNodeExecCompaction(sessionFile));
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(false);
+    expect(result.reason).toContain(
+      "Codex-native native compaction is unavailable because OpenClaw exec host=node is active for this session.",
+    );
+    expect(fake.request).not.toHaveBeenCalled();
+  });
+
+  it("uses the retained agent for unscoped explicit-roster compaction", async () => {
+    const fake = createFakeCodexClient();
+    setCodexAppServerClientFactoryForTest(async () => fake.client);
+    const sessionFile = await writeTestBinding();
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession({
+        sessionId: "session-1",
+        sessionKey: "node-session",
+        sessionFile,
+        workspaceDir: tempDir,
+        trigger: "manual",
+        agentId: "alpha",
+        config: {
+          tools: { exec: { host: "gateway" } },
+          agents: {
+            entries: {
+              alpha: { tools: { exec: { host: "node", node: "worker-1" } } },
+              beta: {},
+            },
+          },
+        },
+      }),
+    );
 
     expect(result.ok).toBe(false);
     expect(result.compacted).toBe(false);
@@ -639,6 +1227,22 @@ describe("maybeCompactCodexAppServerSession", () => {
       },
     });
     fake.emit({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tokenUsage: { last: { totalTokens: 999 } },
+      },
+    });
+    fake.emit({
+      method: "thread/tokenUsage/updated",
+      params: {
+        threadId: "thread-1",
+        turnId: "turn-1",
+        tokenUsage: { last: { totalTokens: 321 } },
+      },
+    });
+    fake.emit({
       method: "item/completed",
       params: {
         threadId: "thread-1",
@@ -659,8 +1263,7 @@ describe("maybeCompactCodexAppServerSession", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-    expect(result.result?.tokensAfter).toBeUndefined();
-    expect(compactDetails(result).tokenUsageSource).toBeUndefined();
+    expect(result.result?.tokensAfter).toBe(321);
     expect(compactDetails(result).signal).toBe("thread/compact/start");
   });
 
@@ -734,7 +1337,7 @@ describe("maybeCompactCodexAppServerSession", () => {
     });
   });
 
-  it("accepts the terminal interrupt response when its notification is missing", async () => {
+  it("holds interrupted compaction until its matching terminal notification", async () => {
     const fake = createFakeCodexClient({ autoCompleteCompaction: false });
     const sessionFile = await writeTestBinding();
 
@@ -746,7 +1349,11 @@ describe("maybeCompactCodexAppServerSession", () => {
         workspaceDir: tempDir,
         trigger: "manual",
       },
-      { clientFactory: async () => fake.client, nativeCompletionTimeoutMs: 10 },
+      {
+        clientFactory: async () => fake.client,
+        nativeCompletionTimeoutMs: 10,
+        nativeInterruptGraceMs: 250,
+      },
     );
     await vi.waitFor(() => expect(fake.request).toHaveBeenCalledOnce());
     fake.emit({
@@ -763,16 +1370,30 @@ describe("maybeCompactCodexAppServerSession", () => {
           threadId: "thread-1",
           turnId: "compact-turn-stalled",
         },
-        { timeoutMs: 30_000 },
+        { timeoutMs: 250 },
       );
     });
     expect(fake.close).not.toHaveBeenCalled();
     expect(fake.closeAndWait).not.toHaveBeenCalled();
 
+    let settled = false;
+    void pendingResult.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    fake.emit({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "compact-turn-stalled", threadId: "thread-1", status: "interrupted" },
+      },
+    });
+
     await expect(pendingResult).resolves.toMatchObject({
       ok: false,
       compacted: false,
-      reason: "codex app-server confirmed native compaction interruption",
+      reason: "codex app-server compaction turn ended with status interrupted",
     });
   });
 
@@ -972,6 +1593,54 @@ describe("maybeCompactCodexAppServerSession", () => {
     await expect(readCodexAppServerBinding(sessionFile)).resolves.toBeUndefined();
   });
 
+  it("never detaches an unconfirmed remote supervised thread", async () => {
+    const fake = createFakeCodexClient({
+      autoCompleteCompaction: false,
+      rejectInterrupt: true,
+    });
+    fake.closeAndWait.mockResolvedValueOnce(false);
+    const pluginConfig = {
+      supervision: { enabled: true },
+      appServer: { transport: "websocket" as const, url: "ws://127.0.0.1:45001" },
+    };
+    const sessionFile = await writeSupervisedTestBinding({
+      threadId: "thread-stuck-supervision",
+      appServerRuntimeFingerprint: buildCodexAppServerConnectionFingerprint(
+        resolveCodexSupervisionAppServerRuntimeOptions({ pluginConfig }),
+      ),
+    });
+
+    const pendingResult = maybeCompactCodexAppServerSession(
+      {
+        sessionId: "session-1",
+        sessionKey: "agent:main:session-1",
+        sessionFile,
+        workspaceDir: tempDir,
+        trigger: "manual",
+      },
+      {
+        clientFactory: async () => fake.client,
+        pluginConfig,
+        nativeCompletionTimeoutMs: 10,
+        nativeInterruptGraceMs: 10,
+      },
+    );
+
+    const outcome = await Promise.race([
+      pendingResult.then(() => "settled" as const),
+      new Promise<"pending">((resolve) => {
+        setTimeout(() => resolve("pending"), 100);
+      }),
+    ]);
+
+    expect(outcome).toBe("pending");
+    expect(fake.closeAndWait).toHaveBeenCalledOnce();
+    await expect(readCodexAppServerBinding(sessionFile)).resolves.toMatchObject({
+      threadId: "thread-stuck-supervision",
+      connectionScope: "supervision",
+    });
+  });
+
   it("cancels a native compaction after the start request", async () => {
     const fake = createFakeCodexClient({ autoCompleteCompaction: false });
     setCodexAppServerClientFactoryForTest(async () => fake.client);
@@ -1014,10 +1683,19 @@ describe("maybeCompactCodexAppServerSession", () => {
       );
     });
 
+    expect(settled).toBe(false);
+    fake.emit({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "compact-turn-aborted", threadId: "thread-1", status: "interrupted" },
+      },
+    });
+
     await expect(pendingResult).resolves.toMatchObject({
       ok: false,
       compacted: false,
-      reason: "codex app-server confirmed native compaction interruption",
+      reason: "codex app-server compaction turn ended with status interrupted",
     });
   });
 
@@ -1047,7 +1725,9 @@ describe("maybeCompactCodexAppServerSession", () => {
     fake.completeCompaction();
     await expect(first).resolves.toMatchObject({ ok: true, compacted: true });
     await vi.waitFor(() => {
-      expect(fake.request).toHaveBeenCalledTimes(2);
+      expect(
+        fake.request.mock.calls.filter(([method]) => method === "thread/compact/start"),
+      ).toHaveLength(2);
     });
 
     fake.completeCompaction();
@@ -1147,7 +1827,9 @@ describe("maybeCompactCodexAppServerSession", () => {
     fake.completeCompaction();
     await expect(first).resolves.toMatchObject({ ok: true, compacted: true });
     await vi.waitFor(() => {
-      expect(fake.request).toHaveBeenCalledTimes(2);
+      expect(
+        fake.request.mock.calls.filter(([method]) => method === "thread/compact/start"),
+      ).toHaveLength(2);
     });
 
     fake.completeCompaction();
@@ -1183,11 +1865,40 @@ describe("maybeCompactCodexAppServerSession", () => {
     expect(result.result).toBeUndefined();
   });
 
+  it("reports required-preflight missing binding as a recoverable native failure", async () => {
+    const sessionFile = path.join(tempDir, "required-preflight-missing-binding.jsonl");
+
+    const result = requireCompactResult(
+      await maybeCompactCodexAppServerSession(
+        {
+          sessionId: "session-1",
+          sessionKey: "agent:main:session-1",
+          sessionFile,
+          workspaceDir: tempDir,
+          trigger: "budget",
+          preflightRequired: true,
+        },
+        {
+          allowNonManualNativeRequest: true,
+          nativeCompactionRequest: "required_preflight",
+        },
+      ),
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      compacted: false,
+      failure: {
+        reason: "missing_thread_binding",
+      },
+    });
+  });
+
   it("preserves stale thread binding metadata for recovery and reports failed native compaction", async () => {
     const fake = createFakeCodexClient();
     fake.request.mockRejectedValueOnce(
       new CodexAppServerRpcError(
-        { code: -32_602, message: "thread not found: thread-1" },
+        { code: -32_600, message: "thread not found: thread-1" },
         "thread/compact/start",
       ),
     );
@@ -1241,7 +1952,7 @@ describe("maybeCompactCodexAppServerSession", () => {
   });
 
   it("keeps the lifecycle fence when an unconfirmed stdio process does not stop", async () => {
-    const fake = createFakeCodexClient();
+    const fake = createFakeCodexClient({ retainedThreadId: "thread-stuck-stdio" });
     fake.request.mockRejectedValueOnce(new Error("thread/compact/start timed out"));
     fake.closeAndWait.mockResolvedValueOnce(false);
     setCodexAppServerClientFactoryForTest(async () => fake.client);
@@ -1335,6 +2046,7 @@ describe("maybeCompactCodexAppServerSession", () => {
             compaction: {
               model: "openai/gpt-5.4",
               provider: "custom-summary",
+              thinkingLevel: "ultra",
             },
           },
         },
@@ -1347,98 +2059,17 @@ describe("maybeCompactCodexAppServerSession", () => {
       {
         sessionId: "session-1",
         sessionKey: "agent:main:session-1",
-        ignoredConfig: ["agents.defaults.compaction.model", "agents.defaults.compaction.provider"],
-      },
-    );
-    warn.mockRestore();
-  });
-
-  it("warns when active agent compaction overrides are ignored", async () => {
-    const warn = vi.spyOn(embeddedAgentLog, "warn").mockImplementation(() => undefined);
-    const fake = createFakeCodexClient();
-    setCodexAppServerClientFactoryForTest(async () => fake.client);
-    const sessionFile = await writeTestBinding({}, "agent:sara:session-1");
-
-    await maybeCompactCodexAppServerSession({
-      sessionId: "session-1",
-      sessionKey: "agent:sara:session-1",
-      sessionFile,
-      workspaceDir: tempDir,
-      trigger: "manual",
-      config: {
-        agents: {
-          list: [
-            {
-              id: "sara",
-              compaction: {
-                model: "openai/gpt-5.4-mini",
-                provider: "openai",
-              },
-            },
-          ],
-        },
-      },
-    });
-
-    expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
-    expect(warn).toHaveBeenCalledWith(
-      "ignoring OpenClaw compaction overrides for Codex app-server compaction; Codex uses native server-side compaction",
-      {
-        sessionId: "session-1",
-        sessionKey: "agent:sara:session-1",
         ignoredConfig: [
-          "agents.list.sara.compaction.model",
-          "agents.list.sara.compaction.provider",
+          "agents.defaults.compaction.model",
+          "agents.defaults.compaction.thinkingLevel",
+          "agents.defaults.compaction.provider",
         ],
       },
     );
     warn.mockRestore();
   });
 
-  it("reports inherited compaction providers at the source path", async () => {
-    const warn = vi.spyOn(embeddedAgentLog, "warn").mockImplementation(() => undefined);
-    const fake = createFakeCodexClient();
-    setCodexAppServerClientFactoryForTest(async () => fake.client);
-    const sessionFile = await writeTestBinding({}, "agent:nik:session-1");
-
-    await maybeCompactCodexAppServerSession({
-      sessionId: "session-1",
-      sessionKey: "agent:nik:session-1",
-      sessionFile,
-      workspaceDir: tempDir,
-      trigger: "manual",
-      config: {
-        agents: {
-          defaults: {
-            compaction: {
-              provider: "custom-summary",
-            },
-          },
-          list: [
-            {
-              id: "nik",
-              compaction: {
-                model: "openai/gpt-5.4-mini",
-              },
-            },
-          ],
-        },
-      },
-    });
-
-    expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
-    expect(warn).toHaveBeenCalledWith(
-      "ignoring OpenClaw compaction overrides for Codex app-server compaction; Codex uses native server-side compaction",
-      {
-        sessionId: "session-1",
-        sessionKey: "agent:nik:session-1",
-        ignoredConfig: ["agents.defaults.compaction.provider", "agents.list.nik.compaction.model"],
-      },
-    );
-    warn.mockRestore();
-  });
-
-  it("warns for legacy Lossless config even when the Lossless context engine slot is active", async () => {
+  it("warns for a legacy Lossless default when the Lossless slot is active", async () => {
     const warn = vi.spyOn(embeddedAgentLog, "warn").mockImplementation(() => undefined);
     const fake = createFakeCodexClient();
     setCodexAppServerClientFactoryForTest(async () => fake.client);
@@ -1464,15 +2095,11 @@ describe("maybeCompactCodexAppServerSession", () => {
           },
         },
         agents: {
-          list: [
-            {
-              id: "lossless",
-              compaction: {
-                model: "openai/gpt-5.4",
-                provider: "lossless-claw",
-              },
+          defaults: {
+            compaction: {
+              provider: "lossless-claw",
             },
-          ],
+          },
         },
       },
     });
@@ -1483,68 +2110,7 @@ describe("maybeCompactCodexAppServerSession", () => {
       {
         sessionId: "session-1",
         sessionKey: "agent:lossless:session-1",
-        ignoredConfig: [
-          "agents.list.lossless.compaction.model",
-          "agents.list.lossless.compaction.provider",
-        ],
-      },
-    );
-    warn.mockRestore();
-  });
-
-  it("warns for inherited legacy Lossless provider when the Lossless slot is active", async () => {
-    const warn = vi.spyOn(embeddedAgentLog, "warn").mockImplementation(() => undefined);
-    const fake = createFakeCodexClient();
-    setCodexAppServerClientFactoryForTest(async () => fake.client);
-    const sessionFile = await writeTestBinding({}, "agent:lossless-child:session-1");
-    const contextEngine: ContextEngine = {
-      info: { id: "lcm", name: "Lossless Context Manager", ownsCompaction: true },
-      assemble: vi.fn() as never,
-      ingest: vi.fn() as never,
-      compact: vi.fn(async () => ({ ok: true, compacted: false, reason: "below threshold" })),
-    };
-
-    await maybeCompactCodexAppServerSession({
-      sessionId: "session-1",
-      sessionKey: "agent:lossless-child:session-1",
-      sessionFile,
-      workspaceDir: tempDir,
-      trigger: "manual",
-      contextEngine,
-      config: {
-        plugins: {
-          slots: {
-            contextEngine: "lossless-claw",
-          },
-        },
-        agents: {
-          defaults: {
-            compaction: {
-              provider: "lossless-claw",
-            },
-          },
-          list: [
-            {
-              id: "lossless-child",
-              compaction: {
-                model: "openai/gpt-5.4-mini",
-              },
-            },
-          ],
-        },
-      },
-    });
-
-    expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
-    expect(warn).toHaveBeenCalledWith(
-      "ignoring OpenClaw compaction overrides for Codex app-server compaction; Codex uses native server-side compaction",
-      {
-        sessionId: "session-1",
-        sessionKey: "agent:lossless-child:session-1",
-        ignoredConfig: [
-          "agents.defaults.compaction.provider",
-          "agents.list.lossless-child.compaction.model",
-        ],
+        ignoredConfig: ["agents.defaults.compaction.provider"],
       },
     );
     warn.mockRestore();
@@ -1580,7 +2146,7 @@ describe("maybeCompactCodexAppServerSession", () => {
   });
 
   it("forwards compaction to native Codex even when a context engine owns compaction", async () => {
-    const fake = createFakeCodexClient();
+    const fake = createFakeCodexClient({ retainedThreadId: null });
     setCodexAppServerClientFactoryForTest(async () => fake.client);
     const sessionFile = await writeTestBinding();
     const compact = vi.fn(async () => ({
@@ -1621,6 +2187,11 @@ describe("maybeCompactCodexAppServerSession", () => {
     );
 
     expect(fake.request).toHaveBeenCalledWith("thread/compact/start", { threadId: "thread-1" });
+    expect(fake.request.mock.calls.map(([method]) => method)).toEqual([
+      "thread/resume",
+      "thread/compact/start",
+      "thread/unsubscribe",
+    ]);
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
     expect(compactDetails(result)).toMatchObject({
@@ -1677,6 +2248,8 @@ function createFakeCodexClient(
     autoCompleteCompaction?: boolean;
     interruptError?: Error;
     rejectInterrupt?: boolean;
+    retainedThreadId?: string | null;
+    subscribedThreadIds?: readonly string[];
   } = {},
 ): {
   client: CodexAppServerClient;
@@ -1688,7 +2261,16 @@ function createFakeCodexClient(
 } {
   const handlers = new Set<(notification: CodexServerNotification) => void>();
   const closeHandlers = new Set<() => void>();
+  const retainedThreadId =
+    options.retainedThreadId === undefined ? "thread-1" : options.retainedThreadId;
+  const subscribedThreadIds = new Set(
+    options.subscribedThreadIds ?? (retainedThreadId ? [retainedThreadId] : []),
+  );
   const emit = (notification: CodexServerNotification): void => {
+    const threadId = (notification.params as { threadId?: string } | undefined)?.threadId;
+    if (threadId && !subscribedThreadIds.has(threadId)) {
+      return;
+    }
     for (const handler of handlers) {
       handler(notification);
     }
@@ -1727,6 +2309,47 @@ function createFakeCodexClient(
   };
   const request = vi.fn<CodexAppServerClient["request"]>(
     async (method: string, params?: unknown) => {
+      const threadId = (params as { threadId?: string } | undefined)?.threadId;
+      if (method === "thread/resume" && threadId) {
+        subscribedThreadIds.add(threadId);
+        return {
+          thread: {
+            id: threadId,
+            sessionId: "session-1",
+            forkedFromId: null,
+            preview: "",
+            ephemeral: false,
+            modelProvider: "openai",
+            createdAt: 1,
+            updatedAt: 1,
+            status: { type: "idle" },
+            path: null,
+            cwd: tempDir,
+            projectId: null,
+            cliVersion: CODEX_APP_SERVER_VERSION,
+            source: "unknown",
+            agentNickname: null,
+            agentRole: null,
+            gitInfo: null,
+            name: null,
+            turns: [],
+          },
+          model: "gpt-5.5-codex",
+          modelProvider: "openai",
+          serviceTier: null,
+          cwd: tempDir,
+          instructionSources: [],
+          approvalPolicy: "never",
+          approvalsReviewer: "user",
+          sandbox: { type: "dangerFullAccess" },
+          permissionProfile: null,
+          reasoningEffort: null,
+        };
+      }
+      if (method === "thread/unsubscribe" && threadId) {
+        subscribedThreadIds.delete(threadId);
+        return {};
+      }
       if (method === "turn/interrupt" && options.interruptError) {
         throw options.interruptError;
       }
@@ -1734,7 +2357,6 @@ function createFakeCodexClient(
         throw new Error("interrupt unavailable");
       }
       if (method === "thread/compact/start" && options.autoCompleteCompaction !== false) {
-        const threadId = (params as { threadId?: unknown }).threadId;
         if (typeof threadId !== "string") {
           throw new Error("thread/compact/start requires threadId");
         }
@@ -1788,17 +2410,29 @@ function createFakeCodexClient(
       return () => handlers.delete(handler);
     },
   );
+  const client = {
+    request,
+    close,
+    closeAndWait,
+    addNotificationHandler,
+    addRequestHandler: vi.fn(() => () => undefined),
+    addCloseHandler: vi.fn((handler: () => void) => {
+      closeHandlers.add(handler);
+      return () => closeHandlers.delete(handler);
+    }),
+  } as unknown as CodexAppServerClient;
+  ensureCodexAppServerClientRuntime(client, { agentDir: tempDir });
+  addNotificationHandler.mockClear();
+  if (retainedThreadId) {
+    void retainCodexAppServerLiveThread(
+      client,
+      retainedThreadId,
+      undefined,
+      `config-${retainedThreadId}`,
+    );
+  }
   return {
-    client: {
-      request,
-      close,
-      closeAndWait,
-      addNotificationHandler,
-      addCloseHandler: vi.fn((handler: () => void) => {
-        closeHandlers.add(handler);
-        return () => closeHandlers.delete(handler);
-      }),
-    } as unknown as CodexAppServerClient,
+    client,
     request,
     close,
     closeAndWait,
@@ -1806,3 +2440,4 @@ function createFakeCodexClient(
     completeCompaction,
   };
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

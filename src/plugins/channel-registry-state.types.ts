@@ -8,12 +8,16 @@ export type ActiveChannelPluginRuntimeShape = {
   } | null;
   messaging?: {
     targetPrefixes?: readonly string[];
+    resolveConversationRouteOwner?: (...args: never[]) => unknown;
   } | null;
   capabilities?: {
     nativeCommands?: boolean;
   } | null;
   conversationBindings?: {
     supportsCurrentConversationBinding?: boolean;
+    isCurrentConversationBindingSupported?: (params: { accountId: string }) => boolean;
+    bindingStore?: "adapter";
+    createManager?: unknown;
   } | null;
 };
 
@@ -21,7 +25,8 @@ export type ActiveChannelPluginRuntimeShape = {
 export type ActivePluginChannelRegistration = {
   plugin: ActiveChannelPluginRuntimeShape;
   pluginId?: string | null;
-  origin?: string | null;
+  origin?: import("./plugin-origin.types.js").PluginOrigin | null;
+  resolveChannelRuntime?: () => import("./runtime/types-channel.js").PluginRuntimeChannel;
 };
 
 /** Active runtime channel registry snapshot. */

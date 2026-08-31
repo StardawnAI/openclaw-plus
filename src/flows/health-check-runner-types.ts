@@ -10,7 +10,7 @@ import type {
 } from "./health-checks.js";
 
 // Runnable health-check contracts used by doctor lint/fix orchestration.
-export interface HealthCheckRunContext extends HealthCheckContext {
+interface HealthCheckRunContext extends HealthCheckContext {
   readonly repair: boolean;
   readonly diff?: boolean;
   readonly previewRepair?: boolean;
@@ -26,22 +26,31 @@ export interface HealthCheckRunResult extends Omit<HealthRepairResult, "changes"
 }
 
 /** Internal runner selection metadata. This is intentionally not part of the public SDK type. */
-export interface HealthCheckSelectionOptions {
+interface HealthCheckSelectionOptions {
   readonly defaultEnabled?: boolean;
 }
 
-export type SplitHealthCheckInput = HealthCheck & HealthCheckSelectionOptions;
+export type SplitHealthCheckDefinition = HealthCheck & HealthCheckSelectionOptions;
+export type SplitHealthCheckInput = SplitHealthCheckDefinition & {
+  readonly sourceContract: "split";
+};
 
 /** Health-check implementation that owns its own detect/repair orchestration. */
 export interface RunnableHealthCheck
   extends Pick<HealthCheck, "id" | "kind" | "description" | "source">, HealthCheckSelectionOptions {
+  readonly sourceContract: "run";
   run(ctx: HealthCheckRunContext, scope?: HealthCheckScope): Promise<HealthCheckRunResult>;
 }
 
 export type HealthCheckInput = SplitHealthCheckInput | RunnableHealthCheck;
 
 /** Normalized check contract consumed by lint and repair runners. */
-export interface RegisteredHealthCheck extends HealthCheck, HealthCheckSelectionOptions {
-  readonly sourceContract: "split" | "run";
-  run(ctx: HealthCheckRunContext, scope?: HealthCheckScope): Promise<HealthCheckRunResult>;
-}
+type RegisteredHealthCheckBase = HealthCheck &
+  HealthCheckSelectionOptions & {
+    run(ctx: HealthCheckRunContext, scope?: HealthCheckScope): Promise<HealthCheckRunResult>;
+  };
+
+export type RegisteredHealthCheck = RegisteredHealthCheckBase &
+  ({ readonly sourceContract: "split" } | { readonly sourceContract: "run" });
+
+export type DetectableHealthCheckInput = SplitHealthCheckInput | RegisteredHealthCheck;

@@ -5,7 +5,10 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
+// This zero-install hook runs on Node 22.22.3+, where native TypeScript stripping is enabled.
+import { truncateUtf16Safe } from "../../packages/normalization-core/src/utf16-slice.ts";
 import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "../lib/bounded-response.mjs";
+import { pnpmLockfileDocuments } from "../lib/pnpm-lockfile-documents.mjs";
 
 const DEFAULT_REGISTRY = "https://registry.npmjs.org";
 const BULK_ADVISORY_PATH = "/-/npm/v1/security/advisories/bulk";
@@ -40,6 +43,16 @@ const AUDIT_ADVISORY_VERSION_OVERRIDES = [
     unaffectedVersions: new Set(["2.2.1", "2.2.5"]),
   },
 ];
+
+/** @typedef {{ write: (chunk: string) => boolean }} AuditOutput */
+/**
+ * @typedef {object} PnpmAuditOptions
+ * @property {string} [rootDir]
+ * @property {typeof fetch} [fetchImpl]
+ * @property {AuditOutput} [stdout]
+ * @property {AuditOutput} [stderr]
+ * @property {string} [minSeverity]
+ */
 
 function normalizeAuditLevel(level) {
   const normalized = String(level ?? "").toLowerCase();
@@ -362,7 +375,7 @@ function parsePnpmLockfileSections(lockfileText) {
   let hasImportersSection = false;
   let hasSnapshotsSection = false;
 
-  for (let index = 0; index < lines.length; ) {
+  for (let index = 0; index < lines.length;) {
     const line = lines[index];
     const trimmed = line.trim();
     const indentation = countIndentation(line);
@@ -500,7 +513,7 @@ function resolveSnapshot({ dependencyName, reference, snapshots }) {
 }
 
 export function collectProdResolvedPackagesFromLockfile(lockfileText) {
-  const lockfile = parsePnpmLockfileSections(lockfileText);
+  const lockfile = parsePnpmLockfileSections(pnpmLockfileDocuments(lockfileText).dependencies);
   if (!lockfile.hasImportersSection) {
     throw new Error("pnpm-lock.yaml is missing the importers section.");
   }
@@ -560,20 +573,25 @@ export function collectProdResolvedPackagesFromLockfile(lockfileText) {
 }
 
 export function collectAllResolvedPackagesFromLockfile(lockfileText) {
-  const lockfile = parsePnpmLockfileSections(lockfileText);
-  if (!lockfile.hasSnapshotsSection) {
-    throw new Error("pnpm-lock.yaml is missing the snapshots section.");
-  }
-
   const versionsByPackage = new Map();
-  for (const snapshotKey of Object.keys(lockfile.snapshots)) {
-    const resolved = parseSnapshotKey(snapshotKey);
-    let versions = versionsByPackage.get(resolved.packageName);
-    if (!versions) {
-      versions = new Set();
-      versionsByPackage.set(resolved.packageName, versions);
+  for (const document of Object.values(pnpmLockfileDocuments(lockfileText))) {
+    if (document === null) {
+      continue;
     }
-    versions.add(resolved.version);
+    const lockfile = parsePnpmLockfileSections(document);
+    if (!lockfile.hasSnapshotsSection) {
+      throw new Error("pnpm-lock.yaml is missing the snapshots section.");
+    }
+
+    for (const snapshotKey of Object.keys(lockfile.snapshots)) {
+      const resolved = parseSnapshotKey(snapshotKey);
+      let versions = versionsByPackage.get(resolved.packageName);
+      if (!versions) {
+        versions = new Set();
+        versionsByPackage.set(resolved.packageName, versions);
+      }
+      versions.add(resolved.version);
+    }
   }
 
   return versionsByPackage;
@@ -696,7 +714,7 @@ function parsePositiveIntegerEnv(name, fallback) {
 }
 
 function resolveBulkAdvisoryRequestTimeoutMs() {
-  return clampTimerTimeoutMs(
+  return clampBulkAdvisoryTimeoutMs(
     parsePositiveIntegerEnv(
       "OPENCLAW_PNPM_AUDIT_BULK_TIMEOUT_MS",
       BULK_ADVISORY_REQUEST_TIMEOUT_MS,
@@ -711,13 +729,13 @@ function resolveBulkAdvisoryResponseBodyMaxBytes() {
   );
 }
 
-function clampTimerTimeoutMs(valueMs) {
+function clampBulkAdvisoryTimeoutMs(valueMs) {
   const value = Number.isFinite(valueMs) ? valueMs : BULK_ADVISORY_REQUEST_TIMEOUT_MS;
   return Math.min(Math.max(Math.floor(value), 1), MAX_TIMER_TIMEOUT_MS);
 }
 
 async function withBulkAdvisoryTimeout({ label, timeoutMs, run }) {
-  const resolvedTimeoutMs = clampTimerTimeoutMs(timeoutMs);
+  const resolvedTimeoutMs = clampBulkAdvisoryTimeoutMs(timeoutMs);
   const controller = new AbortController();
   let timeout;
   const timeoutPromise = new Promise((_resolve, reject) => {
@@ -783,7 +801,7 @@ export async function readBoundedBulkAdvisoryErrorText(
 
       text += decoder.decode(value, { stream: true });
       if (text.length > maxChars) {
-        text = text.slice(0, maxChars);
+        text = truncateUtf16Safe(text, maxChars);
         truncated = true;
         break;
       }
@@ -851,6 +869,7 @@ export async function fetchBulkAdvisories({
   });
 }
 
+/** @param {PnpmAuditOptions} [options] */
 export async function runPnpmAuditProd({
   rootDir = process.cwd(),
   fetchImpl = fetch,

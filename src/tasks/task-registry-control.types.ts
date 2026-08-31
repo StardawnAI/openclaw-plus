@@ -7,13 +7,16 @@ type KillSubagentTargetState =
   | { state: "terminal"; task: DetachedTaskTerminalState };
 
 /** Admin cancellation hook for ACP sessions owned by task records. */
-export type CancelAcpSessionAdmin = (params: {
+type CancelAcpSessionAdmin = (params: {
   cfg: OpenClawConfig;
   sessionKey: string;
   reason: string;
+  expectedRunId?: string;
+  expectedInstanceId?: string;
+  expectedOwnerKey?: string;
 }) => Promise<void>;
 
-export type KillSubagentRunAdminResult =
+type KillSubagentRunAdminResult =
   | { found: false; killed: false }
   | {
       found: true;
@@ -25,12 +28,17 @@ export type KillSubagentRunAdminResult =
       cascadeLabels?: string[];
     };
 
-export type KillSubagentRunAdmin = (params: {
+type KillSubagentRunAdmin = (params: {
   cfg: OpenClawConfig;
   sessionKey: string;
+  expectedRunId?: string;
+  expectedGeneration?: number;
+  expectedOwnerKey?: string;
 }) => Promise<KillSubagentRunAdminResult>;
 
 export type TaskRegistryControlRuntime = {
+  cancelBackgroundExecSession?: (sessionId: string) => boolean;
+  cancelActiveCronTaskRun: (params: { runId: string | undefined; reason?: string }) => boolean;
   getAcpSessionManager: () => {
     cancelSession: CancelAcpSessionAdmin;
   };

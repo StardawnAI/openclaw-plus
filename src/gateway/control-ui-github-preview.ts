@@ -1,14 +1,33 @@
-// Same-origin GitHub metadata adapter for Control UI link previews.
-import { readResponseWithLimit } from "../infra/http-body.js";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
 import type { ControlUiGitHubPreview } from "./control-ui-contract.js";
+// Same-origin GitHub metadata adapter for Control UI link previews.
+import {
+  ControlUiGitHubError,
+  discardResponse,
+  fetchGitHubApi,
+  GITHUB_API_ORIGIN,
+  GITHUB_REQUEST_TIMEOUT_MS,
+  isRecord,
+  optionalNumber,
+  readOptionalGitHubString,
+  readBoundedResponse,
+  readGitHubJsonResponse,
+  resolveGitHubApiCredentialScope,
+  requiredString,
+  withOptionalGitHubAuth,
+} from "./control-ui-github-api.js";
 
-const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_AVATAR_HOST = "avatars.githubusercontent.com";
-const GITHUB_API_VERSION = "2022-11-28";
-const GITHUB_JSON_MAX_BYTES = 256 * 1024;
 const GITHUB_AVATAR_MAX_BYTES = 256 * 1024;
-const GITHUB_REQUEST_TIMEOUT_MS = 8_000;
-const GITHUB_API_MAX_REDIRECTS = 3;
+// One commits page bounds the extra request; the card only renders three faces,
+// so deeper paging would spend quota on people it can never show.
+const GITHUB_COMMITS_PAGE_SIZE = 100;
+const GITHUB_COMMITS_MAX_BYTES = 1024 * 1024;
+const CO_AUTHOR_FACE_LIMIT = 3;
+// GitHub's noreply form is the only trailer that yields a login and an avatar
+// without a lookup per person: `<accountId>+<login>@users.noreply.github.com`.
+const CO_AUTHOR_TRAILER =
+  /^co-authored-by:\s*[^<]*<(?<id>\d{1,12})\+(?<login>[a-z\d](?:[a-z\d-]{0,38}))@users\.noreply\.github\.com>\s*$/gimu;
 const AUTHENTICATED_SUCCESS_CACHE_MS = 5 * 60_000;
 const ANONYMOUS_SUCCESS_CACHE_MS = 60 * 60_000;
 const FAILURE_CACHE_MS = 30_000;
@@ -30,44 +49,21 @@ type CacheEntry<T> = {
 
 const previewCache = new Map<string, CacheEntry<ControlUiGitHubPreview>>();
 
-export class ControlUiGitHubPreviewError extends Error {
-  readonly statusCode: number;
-
-  constructor(statusCode: number, message: string) {
-    super(message);
-    this.name = "ControlUiGitHubPreviewError";
-    this.statusCode = statusCode;
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function requiredString(record: Record<string, unknown>, key: string): string {
-  const value = record[key];
-  if (typeof value !== "string" || !value.trim()) {
-    throw new ControlUiGitHubPreviewError(502, `GitHub response omitted ${key}`);
-  }
-  return value;
-}
-
-function optionalString(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" && value.trim() ? value : undefined;
-}
-
-function optionalNumber(record: Record<string, unknown>, key: string): number | undefined {
-  const value = record[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
 function isValidOwner(value: string): boolean {
   return /^(?=.{1,39}$)[a-z\d](?:[a-z\d-]*[a-z\d])?$/iu.test(value);
 }
 
 function isValidRepo(value: string): boolean {
-  return value !== "." && value !== ".." && /^[a-z\d_.-]{1,100}$/iu.test(value);
+  if (value.length < 1 || value.length > 100) {
+    return false;
+  }
+  const lower = value.toLowerCase();
+  // GitHub accepts dot/underscore/hyphen edge names, including consecutive
+  // periods; only reject standalone path-confusion segments before visibility.
+  if (!/^[a-z\d._-]+$/iu.test(value) || lower === "." || lower === "..") {
+    return false;
+  }
+  return !lower.endsWith(".git") && !lower.endsWith(".atom");
 }
 
 export function parseControlUiGitHubPreviewTarget(
@@ -94,6 +90,12 @@ export function parseControlUiGitHubPreviewTarget(
   return { kind, number, owner, repo };
 }
 
+function commitsApiUrl(target: ControlUiGitHubPreviewTarget): string {
+  const owner = encodeURIComponent(target.owner);
+  const repo = encodeURIComponent(target.repo);
+  return `${GITHUB_API_ORIGIN}/repos/${owner}/${repo}/pulls/${target.number}/commits?per_page=${GITHUB_COMMITS_PAGE_SIZE}`;
+}
+
 function previewApiUrl(target: ControlUiGitHubPreviewTarget): string {
   const collection = target.kind === "pull" ? "pulls" : "issues";
   const owner = encodeURIComponent(target.owner);
@@ -107,104 +109,6 @@ function repositoryApiUrl(target: ControlUiGitHubPreviewTarget): string {
   return `${GITHUB_API_ORIGIN}/repos/${owner}/${repo}`;
 }
 
-function githubApiToken(): string | undefined {
-  return process.env.GH_TOKEN?.trim() || process.env.GITHUB_TOKEN?.trim() || undefined;
-}
-
-function githubApiHeaders(token?: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: "application/vnd.github+json",
-    "User-Agent": "OpenClaw-Control-UI",
-    "X-GitHub-Api-Version": GITHUB_API_VERSION,
-  };
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-  return headers;
-}
-
-function isGitHubApiRedirect(status: number): boolean {
-  return (
-    status === 301 || status === 302 || status === 303 || status === 307 || status === 308
-  );
-}
-
-function safeGitHubApiUrl(raw: string, base?: URL): URL | null {
-  try {
-    const url = new URL(raw, base);
-    if (
-      url.origin !== GITHUB_API_ORIGIN ||
-      url.username ||
-      url.password ||
-      url.port
-    ) {
-      return null;
-    }
-    return url;
-  } catch {
-    return null;
-  }
-}
-
-async function fetchGitHubApi(
-  rawUrl: string,
-  fetchImpl: typeof fetch,
-  token?: string,
-  beforeRedirect?: (url: URL) => Promise<void>,
-): Promise<Response> {
-  const initialUrl = safeGitHubApiUrl(rawUrl);
-  if (!initialUrl) {
-    throw new ControlUiGitHubPreviewError(502, "Invalid GitHub API URL");
-  }
-  let url: URL = initialUrl;
-
-  const signal = AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS);
-  for (let redirects = 0; ; redirects += 1) {
-    const response: Response = await fetchImpl(url.href, {
-      headers: githubApiHeaders(token),
-      redirect: "manual",
-      signal,
-    });
-    if (!isGitHubApiRedirect(response.status)) {
-      return response;
-    }
-
-    const location: string | null = response.headers.get("location");
-    const nextUrl: URL | null = location ? safeGitHubApiUrl(location, url) : null;
-    if (!nextUrl || redirects >= GITHUB_API_MAX_REDIRECTS) {
-      await discardResponse(response);
-      throw new ControlUiGitHubPreviewError(502, "GitHub API returned an unsafe redirect");
-    }
-    // Credentials stay on the fixed API origin across GitHub redirects;
-    // callers still verify the final response repository before returning it.
-    await discardResponse(response);
-    await beforeRedirect?.(nextUrl);
-    url = nextUrl;
-  }
-}
-
-async function discardResponse(response: Response): Promise<void> {
-  await response.body?.cancel().catch(() => {});
-}
-
-async function readBoundedResponse(response: Response, maxBytes: number): Promise<Buffer> {
-  try {
-    return await readResponseWithLimit(response, maxBytes);
-  } finally {
-    await discardResponse(response);
-  }
-}
-
-function upstreamErrorStatus(status: number): number {
-  if (status === 404) {
-    return 404;
-  }
-  if (status === 403 || status === 429) {
-    return 429;
-  }
-  return 502;
-}
-
 async function assertPublicRepositoryUrl(
   repositoryUrl: string,
   fetchImpl: typeof fetch,
@@ -212,50 +116,37 @@ async function assertPublicRepositoryUrl(
 ): Promise<void> {
   // Private and missing repositories stop at this same request boundary before
   // any item fetch, so operator.read callers cannot probe private item numbers.
-  const response = await fetchGitHubApi(repositoryUrl, fetchImpl, token);
-  if (!response.ok) {
-    await discardResponse(response);
-    throw new ControlUiGitHubPreviewError(
-      upstreamErrorStatus(response.status),
-      `GitHub repository request failed (${response.status})`,
-    );
-  }
-  const body = await readBoundedResponse(response, GITHUB_JSON_MAX_BYTES);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body.toString("utf8"));
-  } catch {
-    throw new ControlUiGitHubPreviewError(502, "GitHub repository response was not valid JSON");
-  }
+  const parsed = await readGitHubJsonResponse(
+    await fetchGitHubApi(repositoryUrl, fetchImpl, token),
+  );
   if (!isRecord(parsed) || parsed.private !== false) {
-    throw new ControlUiGitHubPreviewError(404, "GitHub repository is not public");
+    throw new ControlUiGitHubError(404, "GitHub repository is not public");
   }
 }
 
-function redirectedRepositoryApiUrl(
-  target: ControlUiGitHubPreviewTarget,
-  url: URL,
-): string | null {
+function redirectedRepositoryApiUrl(target: ControlUiGitHubPreviewTarget, url: URL): string | null {
   const segments = url.pathname.split("/").filter(Boolean);
   const collection = target.kind === "pull" ? "pulls" : "issues";
+  // The commits request redirects to the same item path plus one known suffix.
+  const itemSegments = segments.at(-1) === "commits" ? segments.slice(0, -1) : segments;
   if (
-    segments.length === 5 &&
-    segments[0] === "repos" &&
-    segments[1] &&
-    segments[2] &&
-    segments[3] === collection &&
-    /^\d+$/u.test(segments[4] ?? "")
+    itemSegments.length === 5 &&
+    itemSegments[0] === "repos" &&
+    itemSegments[1] &&
+    itemSegments[2] &&
+    itemSegments[3] === collection &&
+    /^\d+$/u.test(itemSegments[4] ?? "")
   ) {
-    return `${GITHUB_API_ORIGIN}/repos/${segments[1]}/${segments[2]}`;
+    return `${GITHUB_API_ORIGIN}/repos/${itemSegments[1]}/${itemSegments[2]}`;
   }
   if (
-    segments.length === 4 &&
-    segments[0] === "repositories" &&
-    /^\d+$/u.test(segments[1] ?? "") &&
-    segments[2] === collection &&
-    /^\d+$/u.test(segments[3] ?? "")
+    itemSegments.length === 4 &&
+    itemSegments[0] === "repositories" &&
+    /^\d+$/u.test(itemSegments[1] ?? "") &&
+    itemSegments[2] === collection &&
+    /^\d+$/u.test(itemSegments[3] ?? "")
   ) {
-    return `${GITHUB_API_ORIGIN}/repositories/${segments[1]}`;
+    return `${GITHUB_API_ORIGIN}/repositories/${itemSegments[1]}`;
   }
   return null;
 }
@@ -277,7 +168,7 @@ function parseGitHubResponse(
   value: unknown,
 ): { preview: ControlUiGitHubPreview; avatarUrl?: string } {
   if (!isRecord(value)) {
-    throw new ControlUiGitHubPreviewError(502, "GitHub response was not an object");
+    throw new ControlUiGitHubError(502, "GitHub response was not an object");
   }
   const user = isRecord(value.user) ? value.user : {};
   return {
@@ -285,19 +176,19 @@ function parseGitHubResponse(
       ...target,
       additions: optionalNumber(value, "additions"),
       changedFiles: optionalNumber(value, "changed_files"),
-      closedAt: optionalString(value, "closed_at"),
+      closedAt: readOptionalGitHubString(value, "closed_at"),
       comments: optionalNumber(value, "comments"),
       createdAt: requiredString(value, "created_at"),
       deletions: optionalNumber(value, "deletions"),
       draft: typeof value.draft === "boolean" ? value.draft : undefined,
-      login: optionalString(user, "login") ?? "ghost",
-      mergedAt: optionalString(value, "merged_at"),
+      login: readOptionalGitHubString(user, "login") ?? "ghost",
+      mergedAt: readOptionalGitHubString(value, "merged_at"),
       state: requiredString(value, "state"),
-      stateReason: optionalString(value, "state_reason"),
+      stateReason: readOptionalGitHubString(value, "state_reason"),
       title: requiredString(value, "title"),
       updatedAt: requiredString(value, "updated_at"),
     },
-    avatarUrl: optionalString(user, "avatar_url"),
+    avatarUrl: readOptionalGitHubString(user, "avatar_url"),
   };
 }
 
@@ -307,20 +198,91 @@ function safeAvatarUrl(raw: string | undefined): URL | null {
   }
   try {
     const url = new URL(raw);
+    const rawPathEnd = raw.search(/[?#]/u);
+    const rawPath = rawPathEnd === -1 ? raw : raw.slice(0, rawPathEnd);
     if (
       url.protocol !== "https:" ||
       url.hostname !== GITHUB_AVATAR_HOST ||
+      url.hash ||
       url.username ||
       url.password ||
-      url.port
+      url.port ||
+      rawPath.includes("..") ||
+      rawPath.includes("\\") ||
+      url.pathname.includes("..") ||
+      url.pathname.includes("\\")
     ) {
       return null;
     }
+    url.search = "";
     url.searchParams.set("s", "64");
     return url;
   } catch {
     return null;
   }
+}
+
+/**
+ * Distinct co-author logins from a PR's commit trailers, author excluded, in
+ * first-seen order. Returns the true total alongside the bounded face list so
+ * the card can render "+N" without another request.
+ */
+async function fetchCoAuthors(
+  target: ControlUiGitHubPreviewTarget,
+  authorLogin: string,
+  fetchImpl: typeof fetch,
+  token: string | undefined,
+  beforeRedirect: ((url: URL) => Promise<void>) | undefined,
+): Promise<{ coAuthors: { login: string; avatarDataUrl?: string }[]; coAuthorCount: number }> {
+  const empty = { coAuthors: [], coAuthorCount: 0 };
+  let commits: unknown;
+  try {
+    const response = await fetchGitHubApi(commitsApiUrl(target), fetchImpl, token, beforeRedirect);
+    if (!response.ok) {
+      await discardResponse(response);
+      return empty;
+    }
+    commits = JSON.parse(
+      (await readBoundedResponse(response, GITHUB_COMMITS_MAX_BYTES)).toString("utf8"),
+    );
+  } catch {
+    // Co-authors are decoration on an already-useful card, so a failed or
+    // oversized commits page degrades to no faces instead of failing the card.
+    return empty;
+  }
+  if (!Array.isArray(commits)) {
+    return empty;
+  }
+  const byLogin = new Map<string, { login: string; accountId: string }>();
+  for (const entry of commits) {
+    const commit = isRecord(entry) && isRecord(entry.commit) ? entry.commit : undefined;
+    const message = commit ? readOptionalGitHubString(commit, "message") : undefined;
+    if (!message) {
+      continue;
+    }
+    for (const match of message.matchAll(CO_AUTHOR_TRAILER)) {
+      const login = match.groups?.login;
+      const accountId = match.groups?.id;
+      if (!login || !accountId || login.toLowerCase() === authorLogin.toLowerCase()) {
+        continue;
+      }
+      const key = login.toLowerCase();
+      if (!byLogin.has(key)) {
+        byLogin.set(key, { login, accountId });
+      }
+    }
+  }
+  const faces = [...byLogin.values()].slice(0, CO_AUTHOR_FACE_LIMIT);
+  const coAuthors = await Promise.all(
+    faces.map(async (face) => {
+      const avatarDataUrl = await fetchAvatarDataUrl(
+        `https://${GITHUB_AVATAR_HOST}/u/${face.accountId}`,
+        fetchImpl,
+      );
+      return avatarDataUrl ? { login: face.login, avatarDataUrl } : { login: face.login };
+    }),
+  );
+  return { coAuthors, coAuthorCount: byLogin.size };
 }
 
 async function fetchAvatarDataUrl(
@@ -361,54 +323,54 @@ async function fetchPreview(
   if (token) {
     await assertPublicRepositoryUrl(repositoryApiUrl(target), fetchImpl, token);
   }
-  const response = await fetchGitHubApi(
-    previewApiUrl(target),
-    fetchImpl,
-    token,
-    token
-      ? async (url) => {
-          const repositoryUrl = redirectedRepositoryApiUrl(target, url);
-          if (!repositoryUrl) {
-            throw new ControlUiGitHubPreviewError(502, "GitHub item returned an unsafe redirect");
-          }
-          await assertPublicRepositoryUrl(repositoryUrl, fetchImpl, token);
+  // Every credentialed fetch below shares this guard: a rename or transfer can
+  // redirect into a repository the token can read but the viewer may not see.
+  const beforeRedirect = token
+    ? async (url: URL) => {
+        const repositoryUrl = redirectedRepositoryApiUrl(target, url);
+        if (!repositoryUrl) {
+          throw new ControlUiGitHubError(502, "GitHub item returned an unsafe redirect");
         }
-      : undefined,
+        await assertPublicRepositoryUrl(repositoryUrl, fetchImpl, token);
+      }
+    : undefined;
+  const parsed = await readGitHubJsonResponse(
+    await fetchGitHubApi(previewApiUrl(target), fetchImpl, token, beforeRedirect),
   );
-  if (!response.ok) {
-    await discardResponse(response);
-    throw new ControlUiGitHubPreviewError(
-      upstreamErrorStatus(response.status),
-      `GitHub request failed (${response.status})`,
-    );
-  }
-  const body = await readBoundedResponse(response, GITHUB_JSON_MAX_BYTES);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body.toString("utf8"));
-  } catch {
-    throw new ControlUiGitHubPreviewError(502, "GitHub response was not valid JSON");
-  }
   if (!isRecord(parsed)) {
-    throw new ControlUiGitHubPreviewError(502, "GitHub response was not an object");
+    throw new ControlUiGitHubError(502, "GitHub response was not an object");
   }
   if (token) {
     await assertPublicRepositoryUrl(previewRepositoryApiUrl(target, parsed), fetchImpl, token);
   }
   const { preview, avatarUrl } = parseGitHubResponse(target, parsed);
-  const avatarDataUrl = await fetchAvatarDataUrl(avatarUrl, fetchImpl);
-  return avatarDataUrl ? { ...preview, avatarDataUrl } : preview;
+  // Both extra fetches run only after the public-repository assertions above,
+  // so neither can widen what this token is allowed to read.
+  const [avatarDataUrl, coAuthorFacts] = await Promise.all([
+    fetchAvatarDataUrl(avatarUrl, fetchImpl),
+    target.kind === "pull"
+      ? fetchCoAuthors(target, preview.login, fetchImpl, token, beforeRedirect)
+      : Promise.resolve({ coAuthors: [], coAuthorCount: 0 }),
+  ]);
+  return {
+    ...preview,
+    ...(avatarDataUrl ? { avatarDataUrl } : {}),
+    ...(coAuthorFacts.coAuthorCount > 0
+      ? { coAuthors: coAuthorFacts.coAuthors, coAuthorCount: coAuthorFacts.coAuthorCount }
+      : {}),
+  };
 }
 
-function cacheKey(target: ControlUiGitHubPreviewTarget): string {
-  return `${target.kind}:${target.owner.toLowerCase()}/${target.repo.toLowerCase()}#${target.number}`;
+function cacheKey(target: ControlUiGitHubPreviewTarget, credentialScope: string): string {
+  return `${target.kind}:${target.owner.toLowerCase()}/${target.repo.toLowerCase()}#${target.number}\0${credentialScope}`;
 }
 
 export function loadControlUiGitHubPreview(
   target: ControlUiGitHubPreviewTarget,
   fetchImpl: typeof fetch = fetch,
 ): Promise<ControlUiGitHubPreview> {
-  const key = cacheKey(target);
+  const { token, cacheScope } = resolveGitHubApiCredentialScope();
+  const key = cacheKey(target, cacheScope);
   const now = Date.now();
   const cached = previewCache.get(key);
   if (cached && cached.expiresAt > now) {
@@ -420,11 +382,12 @@ export function loadControlUiGitHubPreview(
     previewCache.delete(key);
   }
 
-  const token = githubApiToken();
   const successCacheMs = token ? AUTHENTICATED_SUCCESS_CACHE_MS : ANONYMOUS_SUCCESS_CACHE_MS;
   const entry: CacheEntry<ControlUiGitHubPreview> = {
     expiresAt: now + successCacheMs,
-    promise: fetchPreview(target, fetchImpl, token).catch((error: unknown) => {
+    promise: withOptionalGitHubAuth(token, (requestToken) =>
+      fetchPreview(target, fetchImpl, requestToken),
+    ).catch((error: unknown) => {
       // Short failure caching protects the anonymous GitHub quota when a user
       // repeatedly crosses a private, missing, or rate-limited link.
       entry.expiresAt = Date.now() + FAILURE_CACHE_MS;
@@ -432,12 +395,6 @@ export function loadControlUiGitHubPreview(
     }),
   };
   previewCache.set(key, entry);
-  while (previewCache.size > CACHE_LIMIT) {
-    const oldestKey = previewCache.keys().next().value as string | undefined;
-    if (!oldestKey) {
-      break;
-    }
-    previewCache.delete(oldestKey);
-  }
+  pruneMapToMaxSize(previewCache, CACHE_LIMIT);
   return entry.promise;
 }

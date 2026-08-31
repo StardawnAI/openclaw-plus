@@ -3,9 +3,12 @@
  *
  * Bounds cleanup steps so run completion cannot hang forever while preserving late-failure diagnostics.
  */
-import { resolveOptionalIntegerOption } from "@openclaw/normalization-core/number-coercion";
+import {
+  parseStrictPositiveInteger,
+  resolveOptionalIntegerOption,
+} from "@openclaw/normalization-core/number-coercion";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatErrorMessage } from "../infra/errors.js";
-import { parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
 
 // Cleanup steps must not block run completion forever. This module bounds each
 // cleanup step and logs enough context to debug late failures.
@@ -47,7 +50,7 @@ function truncateCleanupTimeoutDetails(value: string): string {
     0,
     CLEANUP_TIMEOUT_DETAILS_MAX_CHARS - CLEANUP_TIMEOUT_DETAILS_TRUNCATED_SUFFIX.length,
   );
-  return `${value.slice(0, prefixLength)}${CLEANUP_TIMEOUT_DETAILS_TRUNCATED_SUFFIX}`;
+  return `${truncateUtf16Safe(value, prefixLength)}${CLEANUP_TIMEOUT_DETAILS_TRUNCATED_SUFFIX}`;
 }
 
 function resolveAgentCleanupStepTimeoutMs(params: {

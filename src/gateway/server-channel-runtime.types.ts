@@ -7,3 +7,12 @@ export type ChannelRuntimeSnapshot = {
   channels: Partial<Record<ChannelId, ChannelAccountSnapshot>>;
   channelAccounts: Partial<Record<ChannelId, Record<string, ChannelAccountSnapshot>>>;
 };
+
+export type StartChannelOptions = {
+  preserveRestartAttempts?: boolean;
+  preserveManualStop?: boolean;
+  /** Reload leaves snapshot-cold accounts stopped without bypassing credential-file reinspection. */
+  skipUnavailableAccounts?: boolean;
+  deferAccountStartUntil?: Promise<void>;
+  manual?: boolean;
+};

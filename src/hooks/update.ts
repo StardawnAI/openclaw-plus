@@ -3,26 +3,28 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { buildNpmResolutionFields } from "../infra/install-source-utils.js";
 import {
   expectedIntegrityForUpdate,
+  isPackageVersionDowngrade,
   readInstalledPackageVersion,
 } from "../infra/package-update-utils.js";
+import type { InstallSafetyOverrides } from "../plugins/install-security-scan.types.js";
 import {
   installHooksFromNpmSpec,
   type HookNpmIntegrityDriftParams,
   resolveHookInstallDir,
 } from "./install.js";
-import { recordHookInstall } from "./installs.js";
+import { readHookInstalls, recordHookInstall } from "./installs.js";
 
 /** Logger contract for hook pack update operations. */
-export type HookPackUpdateLogger = {
+type HookPackUpdateLogger = {
   info?: (message: string) => void;
   warn?: (message: string) => void;
 };
 
 /** Per-pack update status emitted by updateNpmInstalledHookPacks. */
-export type HookPackUpdateStatus = "updated" | "unchanged" | "skipped" | "error";
+type HookPackUpdateStatus = "updated" | "unchanged" | "skipped" | "error";
 
 /** Outcome for one hook pack update attempt. */
-export type HookPackUpdateOutcome = {
+type HookPackUpdateOutcome = {
   hookId: string;
   status: HookPackUpdateStatus;
   message: string;
@@ -31,14 +33,14 @@ export type HookPackUpdateOutcome = {
 };
 
 /** Aggregate update result with the possibly updated config. */
-export type HookPackUpdateSummary = {
+type HookPackUpdateSummary = {
   config: OpenClawConfig;
   changed: boolean;
   outcomes: HookPackUpdateOutcome[];
 };
 
 /** Integrity drift payload enriched with hook pack identity and dry-run state. */
-export type HookPackUpdateIntegrityDriftParams = HookNpmIntegrityDriftParams & {
+type HookPackUpdateIntegrityDriftParams = HookNpmIntegrityDriftParams & {
   hookId: string;
   resolvedSpec?: string;
   resolvedVersion?: string;
@@ -75,6 +77,8 @@ function createHookPackUpdateIntegrityDriftHandler(params: {
 /** Update npm-installed hook packs and return config changes plus per-pack outcomes. */
 export async function updateNpmInstalledHookPacks(params: {
   config: OpenClawConfig;
+  dangerouslyForceUnsafeInstall?: boolean;
+  onInstallPolicyWarning?: InstallSafetyOverrides["onInstallPolicyWarning"];
   logger?: HookPackUpdateLogger;
   hookIds?: string[];
   dryRun?: boolean;
@@ -82,7 +86,7 @@ export async function updateNpmInstalledHookPacks(params: {
   onIntegrityDrift?: (params: HookPackUpdateIntegrityDriftParams) => boolean | Promise<boolean>;
 }): Promise<HookPackUpdateSummary> {
   const logger = params.logger ?? {};
-  const installs = params.config.hooks?.internal?.installs ?? {};
+  const installs = readHookInstalls();
   const targets = params.hookIds?.length ? params.hookIds : Object.keys(installs);
   const outcomes: HookPackUpdateOutcome[] = [];
   let next = params.config;
@@ -137,6 +141,8 @@ export async function updateNpmInstalledHookPacks(params: {
     const currentVersion = await readInstalledPackageVersion(installPath);
     const result = await installHooksFromNpmSpec({
       config: params.config,
+      dangerouslyForceUnsafeInstall: params.dangerouslyForceUnsafeInstall,
+      onInstallPolicyWarning: params.onInstallPolicyWarning,
       spec: effectiveSpec,
       mode: "update",
       dryRun: params.dryRun,
@@ -165,6 +171,7 @@ export async function updateNpmInstalledHookPacks(params: {
     const nextLabel = nextVersion ?? "unknown";
     const status =
       currentVersion && nextVersion && currentVersion === nextVersion ? "unchanged" : "updated";
+    const downgraded = isPackageVersionDowngrade(currentVersion, nextVersion);
 
     if (params.dryRun) {
       outcomes.push({
@@ -175,7 +182,7 @@ export async function updateNpmInstalledHookPacks(params: {
         message:
           status === "unchanged"
             ? `Hook pack "${hookId}" is up to date (${currentLabel}).`
-            : `Would update hook pack "${hookId}": ${currentLabel} -> ${nextLabel}.`,
+            : `${downgraded ? "Would downgrade" : "Would update"} hook pack "${hookId}": ${currentLabel} -> ${nextLabel}.`,
       });
       continue;
     }
@@ -199,7 +206,7 @@ export async function updateNpmInstalledHookPacks(params: {
       message:
         status === "unchanged"
           ? `Hook pack "${hookId}" already at ${currentLabel}.`
-          : `Updated hook pack "${hookId}": ${currentLabel} -> ${nextLabel}.`,
+          : `${downgraded ? "Downgraded" : "Updated"} hook pack "${hookId}": ${currentLabel} -> ${nextLabel}.`,
     });
   }
 

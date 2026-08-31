@@ -1,7 +1,7 @@
 // Control UI module implements session goal behavior.
 import type { SessionGoal } from "../api/types.ts";
 
-export function formatGoalTokenCount(value: number): string {
+function formatGoalTokenCount(value: number): string {
   if (!Number.isFinite(value) || value <= 0) {
     return "0";
   }
@@ -84,12 +84,13 @@ export function formatGoalElapsed(elapsedMs: number): string {
     return `${totalSeconds}s`;
   }
   const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
   if (totalMinutes < 60) {
-    return `${totalMinutes}m`;
+    return `${totalMinutes}m ${seconds}s`;
   }
   const hours = Math.floor(totalMinutes / 60);
-  const minutes = totalMinutes % 60;
-  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  const minutes = String(totalMinutes % 60).padStart(2, "0");
+  return `${hours}h ${minutes}m ${seconds}s`;
 }
 
 export function formatGoalDetail(goal: SessionGoal): string {

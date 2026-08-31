@@ -11,6 +11,7 @@ import {
 } from "@openclaw/normalization-core/string-normalization";
 import type { TSchema } from "typebox";
 import { cleanSchemaForGemini } from "./clean-for-gemini.js";
+import { cleanSchemaForLlamacppGbnf } from "./clean-for-llamacpp-gbnf.js";
 import { stripUnsupportedSchemaKeywords } from "./schema-keyword-strip.js";
 
 /**
@@ -473,8 +474,8 @@ function resolveJsonPointerPath(value: unknown, segments: string[]): unknown {
     }
     const key = decodeJsonPointerSegment(segment);
     if (Array.isArray(current)) {
-      const index = Number(key);
-      if (!Number.isInteger(index) || index < 0 || index >= current.length) {
+      const index = /^(?:0|[1-9]\d*)$/.test(key) ? Number(key) : -1;
+      if (index < 0 || index >= current.length) {
         return undefined;
       }
       current = current[index];
@@ -815,7 +816,7 @@ function normalizeToolParameterSchemaUncached(
   // - OpenAI rejects function tool schemas unless the *top-level* is `type: "object"`.
   //   (TypeBox root unions compile to `{ anyOf: [...] }` without `type`).
   // - Anthropic expects full JSON Schema draft 2020-12 compliance.
-  // - xAI rejects validation-constraint keywords (minLength, maxLength, etc.) outright.
+  // - xAI's documented tool-schema contract rejects contains-count bounds.
   //
   // Normalize once here so callers can always pass `tools` through unchanged.
   const normalizedProvider = normalizeLowercaseStringOrEmpty(options?.modelProvider);
@@ -831,12 +832,16 @@ function normalizeToolParameterSchemaUncached(
   const isAnthropicProvider = normalizedProvider.includes("anthropic");
   const unsupportedToolSchemaKeywords = resolveUnsupportedToolSchemaKeywords(options?.modelCompat);
   const omitEmptyArrayItems = shouldOmitEmptyArrayItems(options?.modelCompat);
+  const isLlamacppGbnfProfile = normalizedToolSchemaProfile === "llamacpp";
 
   function applyProviderCleaning(s: unknown): TSchema {
     const normalizedSchema = normalizeArraySchemasMissingItems(s);
-    const arrayItemsCompatibleSchema = omitEmptyArrayItems
+    let arrayItemsCompatibleSchema = omitEmptyArrayItems
       ? stripEmptyArrayItemsFromArraySchemas(normalizedSchema)
       : normalizedSchema;
+    if (isLlamacppGbnfProfile) {
+      arrayItemsCompatibleSchema = cleanSchemaForLlamacppGbnf(arrayItemsCompatibleSchema);
+    }
     if (isGeminiProvider && !isAnthropicProvider) {
       const geminiCompatibleSchema = cleanSchemaForGemini(arrayItemsCompatibleSchema);
       return unsupportedToolSchemaKeywords.size > 0
@@ -887,7 +892,15 @@ function normalizeToolParameterSchemaUncached(
     return applyProviderCleaning(inlinedSchema);
   }
   const variants = schemaRecord[flattenableVariantKey] as unknown[];
-  const mergedProperties: Record<string, unknown> = {};
+  // Seed mergedProperties with the root-declared properties so branch properties
+  // merge *into* them instead of replacing them. Otherwise a root `required`
+  // field that is not re-declared in any branch would be dropped from
+  // `properties` while staying `required`, producing an unsatisfiable schema
+  // when `additionalProperties` is false (#128743).
+  const rootProperties = isSchemaRecord(schemaRecord.properties)
+    ? { ...schemaRecord.properties }
+    : {};
+  const mergedProperties: Record<string, unknown> = rootProperties;
   const requiredCounts = new Map<string, number>();
   let objectVariants = 0;
 
@@ -969,3 +982,4 @@ export function normalizeToolParameterSchema(
     normalizeToolParameterSchemaUncached(schema, options),
   );
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -1,10 +1,7 @@
 // Gmail Windows tests cover gog watcher command invocation on Windows.
 import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  getWindowsInstallRoots,
-  resetWindowsInstallRootsForTests,
-} from "../infra/windows-install-roots.js";
+import { getWindowsInstallRoots } from "../infra/windows-install-roots.js";
 import { withMockedWindowsPlatform } from "../test-utils/vitest-spies.js";
 
 const mocks = vi.hoisted(() => ({
@@ -27,9 +24,7 @@ function expectedTrustedCmdExe(): string {
 }
 
 describe("resolveGogServeInvocation on Windows", () => {
-  beforeEach(() => {
-    resetWindowsInstallRootsForTests({ queryRegistryValue: () => null });
-  });
+  beforeEach(() => {});
 
   it("wraps spaced gog .cmd paths in an outer cmd.exe command line", async () => {
     const { resolveGogServeInvocation } = await importGmailWithExecutable(
@@ -51,7 +46,7 @@ describe("resolveGogServeInvocation on Windows", () => {
           "/d",
           "/s",
           "/c",
-          '""C:\\Program Files\\gog\\gog.cmd" gmail watch serve --account me@example.com"',
+          '""C:\\Program Files\\gog\\gog.cmd" "gmail" "watch" "serve" "--account" "me@example.com""',
         ],
         windowsHide: true,
         windowsVerbatimArguments: true,
@@ -59,7 +54,7 @@ describe("resolveGogServeInvocation on Windows", () => {
     });
   });
 
-  it("escapes caret arguments for gog .cmd wrappers", async () => {
+  it("quotes caret arguments for gog .cmd wrappers", async () => {
     const { resolveGogServeInvocation } = await importGmailWithExecutable("gog.cmd");
 
     await withMockedWindowsPlatform(async () => {
@@ -75,7 +70,7 @@ describe("resolveGogServeInvocation on Windows", () => {
         "/d",
         "/s",
         "/c",
-        "gog.cmd gmail watch serve --label release/^^1",
+        '""gog.cmd" "gmail" "watch" "serve" "--label" "release/^1""',
       ]);
       expect(invocation.windowsVerbatimArguments).toBe(true);
     });

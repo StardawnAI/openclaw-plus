@@ -1,14 +1,26 @@
 // Msteams tests cover thread parent context plugin behavior.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GraphThreadMessage } from "./graph-thread.js";
-import {
-  resetThreadParentContextCachesForTest,
-  fetchParentMessageCached,
-  formatParentContextEvent,
-  markParentContextInjected,
-  shouldInjectParentContext,
-  summarizeParentMessage,
-} from "./thread-parent-context.js";
+
+let fetchParentMessageCached: typeof import("./thread-parent-context.js").fetchParentMessageCached;
+let formatParentContextEvent: typeof import("./thread-parent-context.js").formatParentContextEvent;
+let markParentContextInjected: typeof import("./thread-parent-context.js").markParentContextInjected;
+let shouldInjectParentContext: typeof import("./thread-parent-context.js").shouldInjectParentContext;
+let summarizeParentMessage: typeof import("./thread-parent-context.js").summarizeParentMessage;
+
+async function loadParentContextModule() {
+  vi.resetModules();
+  ({
+    fetchParentMessageCached,
+    formatParentContextEvent,
+    markParentContextInjected,
+    shouldInjectParentContext,
+    summarizeParentMessage,
+  } = await import("./thread-parent-context.js"));
+}
+
+// Formatting is stateless; only the cache and dedupe suites need per-case imports.
+beforeAll(loadParentContextModule);
 
 // Matches an unpaired UTF-16 surrogate (lone high or lone low), without relying
 // on the ES2024 String.prototype.isWellFormed() runtime API.
@@ -111,9 +123,7 @@ describe("formatParentContextEvent", () => {
 });
 
 describe("fetchParentMessageCached", () => {
-  beforeEach(() => {
-    resetThreadParentContextCachesForTest();
-  });
+  beforeEach(loadParentContextModule);
 
   afterEach(() => {
     vi.useRealTimers();
@@ -233,9 +243,7 @@ describe("fetchParentMessageCached", () => {
 });
 
 describe("shouldInjectParentContext / markParentContextInjected", () => {
-  beforeEach(() => {
-    resetThreadParentContextCachesForTest();
-  });
+  beforeEach(loadParentContextModule);
 
   it("returns true for first observation", () => {
     expect(shouldInjectParentContext("session-1", "parent-1")).toBe(true);

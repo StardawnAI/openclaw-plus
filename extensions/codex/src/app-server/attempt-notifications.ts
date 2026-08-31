@@ -1,3 +1,4 @@
+import { readStringField as readString } from "openclaw/plugin-sdk/string-coerce-runtime";
 /**
  * Predicates and readers for Codex app-server notification envelopes.
  */
@@ -12,10 +13,6 @@ import {
 
 const CODEX_TURN_ABORT_MARKER_START = "<turn_aborted>";
 const CODEX_TURN_ABORT_MARKER_END = "</turn_aborted>";
-const CODEX_INTERRUPTED_USER_GUIDANCE =
-  "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
-const CODEX_INTERRUPTED_DEVELOPER_GUIDANCE =
-  "The previous turn was interrupted on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
 
 /** Builds compact activity metadata for watchdog and diagnostic updates. */
 export function describeNotificationActivity(
@@ -109,7 +106,8 @@ function isCompletedAssistantNotification(notification: CodexServerNotification)
   return Boolean(
     item &&
     readString(item, "type") === "agentMessage" &&
-    readString(item, "phase") !== "commentary",
+    readString(item, "phase") !== "commentary" &&
+    readString(item, "delivery") !== "async",
   );
 }
 
@@ -135,7 +133,7 @@ export function isAssistantCommentaryCompletionNotification(
   return Boolean(
     item &&
     readString(item, "type") === "agentMessage" &&
-    readString(item, "phase") === "commentary",
+    (readString(item, "phase") === "commentary" || readString(item, "delivery") === "async"),
   );
 }
 
@@ -291,9 +289,7 @@ export function isRawAssistantProgressNotification(notification: CodexServerNoti
 }
 
 /** Returns true for raw assistant completion outside commentary phase. */
-export function isRawAssistantCompletionNotification(
-  notification: CodexServerNotification,
-): boolean {
+function isRawAssistantCompletionNotification(notification: CodexServerNotification): boolean {
   if (!isRawAssistantProgressNotification(notification) || !isJsonObject(notification.params)) {
     return false;
   }
@@ -347,7 +343,11 @@ export function isCodexTurnAbortMarkerNotification(
   }
   const item = notification.params.item;
   const role = isJsonObject(item) ? readString(item, "role") : undefined;
-  if (!isJsonObject(item) || (role !== "user" && role !== "developer")) {
+  if (
+    !isJsonObject(item) ||
+    readString(item, "type") !== "message" ||
+    (role !== "user" && role !== "developer")
+  ) {
     return false;
   }
   const text = extractRawResponseItemText(item).trim();
@@ -357,11 +357,7 @@ export function isCodexTurnAbortMarkerNotification(
   if (role === "user" && currentPromptTexts.includes(text)) {
     return false;
   }
-  const markerBody = readCodexTurnAbortMarkerBody(text);
-  return (
-    markerBody === CODEX_INTERRUPTED_USER_GUIDANCE ||
-    markerBody === CODEX_INTERRUPTED_DEVELOPER_GUIDANCE
-  );
+  return readCodexTurnAbortMarkerBody(text) !== undefined;
 }
 
 function readCodexTurnAbortMarkerBody(text: string): string | undefined {
@@ -394,11 +390,6 @@ function extractRawResponseItemText(item: JsonObject): string {
       return text ? [text] : [];
     })
     .join("");
-}
-
-function readString(record: JsonObject, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === "string" ? value : undefined;
 }
 
 /** Reads a typed Codex item from notification params when id/type are present. */

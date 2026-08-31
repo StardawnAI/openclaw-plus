@@ -1,5 +1,7 @@
 // Tool subscription helper tests cover error extraction, sanitized tool results,
 // and safe lifecycle payloads for embedded tool events.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as loggingConfigModule from "../logging/config.js";
 import {
@@ -7,10 +9,10 @@ import {
   extractToolResultText,
   extractToolErrorCode,
   extractToolErrorMessage,
-  isToolResultError,
   sanitizeToolArgs,
   sanitizeToolResult,
-} from "./embedded-agent-subscribe.tools.js";
+} from "./embedded-agent-tool-results.js";
+import { isToolResultError } from "./tool-result-error.js";
 
 afterEach(() => {
   // Logging config spies are global module state; restore after every sanitizer
@@ -193,8 +195,9 @@ describe("isToolResultError", () => {
     expect(isToolResultError({ details: { status: "blocked" } })).toBe(true);
     expect(isToolResultError({ details: { status: "approval-unavailable" } })).toBe(true);
     expect(isToolResultError({ details: { status: "completed", timedOut: true } })).toBe(true);
-    expect(isToolResultError({ details: { status: "completed", exitCode: 1 } })).toBe(true);
+    expect(isToolResultError({ details: { status: "completed", exitCode: 1 } })).toBe(false);
     expect(isToolResultError({ details: { status: "completed", exitCode: 0 } })).toBe(false);
+    expect(isToolResultError({ details: { exitCode: 1 } })).toBe(true);
     expect(isToolResultError({ details: { ok: true, status: "cancelled" } })).toBe(false);
     expect(isToolResultError({ details: { success: true, status: "canceled" } })).toBe(false);
     expect(isToolResultError({ details: { ok: false, status: "completed" } })).toBe(true);
@@ -207,7 +210,7 @@ describe("isToolResultError", () => {
 function getTextContent(result: unknown, index = 0): string {
   // Sanitizer tests assert text redaction while keeping the result shape opaque.
   const record = result as { content: Array<{ text: string }> };
-  return record.content[index].text;
+  return expectDefined(record.content[index], "record.content[index] test invariant").text;
 }
 
 describe("sanitizeToolResult", () => {
@@ -297,16 +300,39 @@ describe("sanitizeToolResult", () => {
     expect(text).not.toContain("abcdef0123456789QWERTY=");
   });
 
-  it("preserves image content stripping behavior", () => {
+  it("reports decoded byte size when stripping image content", () => {
+    const data = Buffer.from([0, 1, 2, 3, 4]).toString("base64");
     const result = {
-      content: [{ type: "image", data: "base64imagedata", mimeType: "image/png" }],
+      content: [{ type: "image", data, mimeType: "image/png" }],
     };
+
     const sanitized = sanitizeToolResult(result) as {
       content: Array<{ data?: string; bytes?: number; omitted?: boolean }>;
     };
-    expect(sanitized.content[0].data).toBeUndefined();
-    expect(sanitized.content[0].omitted).toBe(true);
-    expect(sanitized.content[0].bytes).toBe("base64imagedata".length);
+
+    expect(data).toHaveLength(8);
+    expect(
+      expectDefined(sanitized.content[0], "sanitized.content[0] test invariant").data,
+    ).toBeUndefined();
+    expect(expectDefined(sanitized.content[0], "sanitized.content[0] test invariant").omitted).toBe(
+      true,
+    );
+    expect(expectDefined(sanitized.content[0], "sanitized.content[0] test invariant").bytes).toBe(
+      5,
+    );
+  });
+
+  it("preserves an existing image byte size when data is already omitted", () => {
+    const result = {
+      content: [{ type: "image", mimeType: "image/png", bytes: 5, omitted: true }],
+    };
+
+    const sanitized = sanitizeToolResult(result) as {
+      content: Array<{ data?: string; bytes?: number; omitted?: boolean }>;
+    };
+    expect(expectDefined(sanitized.content[0], "sanitized.content[0] test invariant").bytes).toBe(
+      5,
+    );
   });
 
   it("redacts secrets inside result.details (e.g. exec aggregated stdout)", () => {
@@ -365,9 +391,29 @@ describe("sanitizeToolResult", () => {
 
   it("redacts primitive string results", () => {
     const sanitized = sanitizeToolResult("OPENROUTER_API_KEY=sk-or-v1-abcdef0123456789") as string;
+    const source = "if let token = timeObserverToken {";
 
     expect(sanitized).not.toContain("sk-or-v1-abcdef0123456789");
     expect(sanitized).toContain("OPENROUTER_API_KEY=");
+    expect(sanitizeToolResult(source)).toBe(source);
+  });
+
+  it("preserves source assignments in structured results while redacting credential fields", () => {
+    const source = "if let token = timeObserverToken {";
+    const credential = "sk-1234567890abcdefXYZ";
+    const sanitized = sanitizeToolResult({
+      content: [{ type: "text", text: source }],
+      detail: source,
+      token: credential,
+    }) as {
+      content: Array<{ text: string }>;
+      detail: string;
+      token: string;
+    };
+
+    expect(sanitized.content[0]?.text).toBe(source);
+    expect(sanitized.detail).toBe(source);
+    expect(sanitized.token).not.toContain(credential);
   });
 
   it("preserves top-level arrays while redacting nested strings", () => {
@@ -384,7 +430,6 @@ describe("sanitizeToolResult", () => {
 
   it("applies configured redact patterns to Control UI tool payloads", () => {
     vi.spyOn(loggingConfigModule, "readLoggingConfig").mockReturnValue({
-      redactSensitive: "off",
       redactPatterns: [String.raw`\bcustom-secret-[A-Za-z0-9]+\b`],
     });
 

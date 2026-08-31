@@ -23,6 +23,16 @@ import { maskApiKey } from "../../security/secret-mask.js";
 import { shortenHomePath } from "../../utils.js";
 import type { ProviderAuthOverview } from "./list.types.js";
 
+/**
+ * Count-first wording on purpose: `token=1`/`api_key=0` would match the console
+ * secret redactor's key=value patterns and get masked into garbled output.
+ */
+export function formatProviderAuthProfileCounts(
+  profiles: Pick<ProviderAuthOverview["profiles"], "count" | "oauth" | "token" | "apiKey">,
+): string {
+  return `${profiles.count} (${profiles.oauth} oauth, ${profiles.token} token, ${profiles.apiKey} api-key)`;
+}
+
 function formatMarkerOrSecret(value: string): string {
   return isNonSecretApiKeyMarker(value, { includeEnvVarName: false })
     ? `marker(${value.trim()})`
@@ -218,6 +228,16 @@ export function resolveProviderAuthOverview(params: {
           },
         }
       : {}),
-    ...(params.syntheticAuth ? { syntheticAuth: params.syntheticAuth } : {}),
+    // Re-project instead of passing the caller's object through: status callers
+    // hand richer runtime shapes that also carry the raw synthetic credential,
+    // and structural typing would let it leak into `--json` output verbatim.
+    ...(params.syntheticAuth
+      ? {
+          syntheticAuth: {
+            value: params.syntheticAuth.value,
+            source: params.syntheticAuth.source,
+          },
+        }
+      : {}),
   };
 }

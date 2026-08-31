@@ -47,9 +47,15 @@ function isAdvisoryStep(step: { advisory?: UpdateStepAdvisory }): boolean {
 }
 
 /** Convert updater failure reasons and stderr tails into operator-facing recovery hints. */
-export function inferUpdateFailureHints(result: UpdateRunResult): string[] {
+function inferUpdateFailureHints(result: UpdateRunResult): string[] {
   if (result.status !== "error") {
     return [];
+  }
+  if (result.reason === "preflight-insufficient-space") {
+    return [
+      "Free space on the preflight staging and package-manager store filesystems, then rerun the update.",
+      "Preflight stopped because storage was exhausted; trying another commit would not repair it.",
+    ];
   }
   if (result.reason === "pnpm-corepack-missing") {
     return [
@@ -115,7 +121,7 @@ export function inferUpdateFailureHints(result: UpdateRunResult): string[] {
 }
 
 /** Runner-facing progress callbacks plus terminal spinner cleanup. */
-export type ProgressController = {
+type ProgressController = {
   progress: UpdateStepProgress;
   stop: () => void;
 };

@@ -1,12 +1,12 @@
 // Agent run control tests cover talk-driven agent pause and resume behavior.
 import { describe, expect, it, vi } from "vitest";
+import type { RealtimeVoiceAgentRunActivity } from "./agent-run-control-shared.js";
 import {
   classifyRealtimeVoiceAgentControlText,
   controlRealtimeVoiceAgentRun,
   parseRealtimeVoiceAgentControlToolArgs,
   resolveRealtimeVoiceAgentControlIntent,
   shouldAutoControlRealtimeVoiceAgentText,
-  type RealtimeVoiceAgentRunActivity,
 } from "./agent-run-control.js";
 import type { TalkEvent } from "./talk-events.js";
 
@@ -20,7 +20,15 @@ function createDeps(options: {
   return {
     abortEmbeddedAgentRun: vi.fn(() => options.abortResult ?? true),
     queueEmbeddedAgentMessageWithOutcomeAsync: vi.fn(
-      async (sessionId: string, _text: string, _options?: { steeringMode?: "all" }) =>
+      async (
+        sessionId: string,
+        _text: string,
+        _options?: {
+          steeringMode?: "all";
+          isInboundUserMessage?: boolean;
+          taskSuggestionDeliveryMode?: undefined;
+        },
+      ) =>
         options.queued === false
           ? {
               queued: false as const,
@@ -143,7 +151,12 @@ describe("controlRealtimeVoiceAgentRun", () => {
     expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).toHaveBeenCalledWith(
       "session-active",
       "use the safer path",
-      { steeringMode: "all", debounceMs: 0 },
+      {
+        steeringMode: "all",
+        debounceMs: 0,
+        isInboundUserMessage: true,
+        taskSuggestionDeliveryMode: undefined,
+      },
     );
   });
 
@@ -334,25 +347,30 @@ describe("controlRealtimeVoiceAgentRun", () => {
     expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
   });
 
-  it("returns a structured rejection when no run is active", async () => {
-    const deps = createDeps({});
+  it.each(["injected", "runtime"] as const)(
+    "returns a structured rejection when no run is active (%s dependencies)",
+    async (source) => {
+      const deps = source === "injected" ? createDeps({}) : undefined;
 
-    const result = await controlRealtimeVoiceAgentRun(
-      {
-        sessionKey: "agent:main:main",
-        text: "use the safer path",
+      const result = await controlRealtimeVoiceAgentRun(
+        {
+          sessionKey: "agent:main:main",
+          text: "use the safer path",
+          mode: "steer",
+        },
+        deps,
+      );
+
+      expect(result).toMatchObject({
+        ok: false,
         mode: "steer",
-      },
-      deps,
-    );
-
-    expect(result).toMatchObject({
-      ok: false,
-      mode: "steer",
-      active: false,
-      queued: false,
-      reason: "no_active_run",
-    });
-    expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
-  });
+        active: false,
+        queued: false,
+        reason: "no_active_run",
+      });
+      if (deps) {
+        expect(deps.queueEmbeddedAgentMessageWithOutcomeAsync).not.toHaveBeenCalled();
+      }
+    },
+  );
 });

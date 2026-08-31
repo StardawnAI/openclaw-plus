@@ -1,4 +1,5 @@
 import OpenClawKit
+import OpenClawProtocol
 import SwiftUI
 
 struct IPadSkillWorkshopScreen: View {
@@ -17,16 +18,16 @@ struct IPadSkillWorkshopScreen: View {
     @State private var errorText: String?
     @State private var noticeText: String?
     @State private var presentedProposalRoute: IPadSkillProposalSheetRoute?
-    let headerLeadingAction: OpenClawSidebarHeaderAction?
+    let headerSidebarAction: OpenClawSidebarHeaderAction?
     let usesNativeNavigationChrome: Bool
     let openSettings: () -> Void
 
     init(
-        headerLeadingAction: OpenClawSidebarHeaderAction? = nil,
+        headerSidebarAction: OpenClawSidebarHeaderAction? = nil,
         usesNativeNavigationChrome: Bool = false,
         openSettings: @escaping () -> Void = {})
     {
-        self.headerLeadingAction = headerLeadingAction
+        self.headerSidebarAction = headerSidebarAction
         self.usesNativeNavigationChrome = usesNativeNavigationChrome
         self.openSettings = openSettings
     }
@@ -35,7 +36,7 @@ struct IPadSkillWorkshopScreen: View {
         IPadSidebarScreenChrome(
             title: "Skill Workshop",
             subtitle: "Review and apply proposed skills.",
-            headerLeadingAction: self.headerLeadingAction,
+            headerSidebarAction: self.headerSidebarAction,
             usesNativeNavigationChrome: self.usesNativeNavigationChrome,
             gatewayAction: self.openSettings)
         {
@@ -108,12 +109,15 @@ struct IPadSkillWorkshopScreen: View {
             VStack(alignment: .leading, spacing: 12) {
                 self.agentScopeMenu
                 self.proposalSearchField
-                Picker("Status", selection: self.$statusFilter) {
+                Picker(selection: self.$statusFilter) {
                     ForEach(Self.proposalStatusFilters, id: \.self) { filter in
                         Text(Self.proposalStatusFilterLabel(filter))
                             .font(OpenClawType.captionSemiBold)
                             .tag(filter)
                     }
+                } label: {
+                    Text("Status")
+                        .font(OpenClawType.captionSemiBold)
                 }
                 .pickerStyle(.segmented)
                 .controlSize(.small)
@@ -150,11 +154,14 @@ struct IPadSkillWorkshopScreen: View {
     }
 
     private var compactFiltersCard: some View {
-        ProCard(radius: OpenClawProMetric.cardRadius) {
+        let count = self.filteredProposals.count
+        let countText = String(
+            AttributedString(localized: "^[\(count) proposal](inflect: true)").characters)
+        return ProCard(radius: OpenClawProMetric.cardRadius) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("\(self.filteredProposals.count) proposals")
+                        Text(verbatim: countText)
                             .font(OpenClawType.headline)
                         Text(self.statusFilterLabel)
                             .font(OpenClawType.caption)
@@ -167,12 +174,15 @@ struct IPadSkillWorkshopScreen: View {
                 }
 
                 self.agentScopeMenu
-                Picker("Status", selection: self.$statusFilter) {
+                Picker(selection: self.$statusFilter) {
                     ForEach(Self.proposalStatusFilters, id: \.self) { filter in
                         Text(Self.proposalStatusFilterLabel(filter))
                             .font(OpenClawType.captionSemiBold)
                             .tag(filter)
                     }
+                } label: {
+                    Text("Status")
+                        .font(OpenClawType.captionSemiBold)
                 }
                 .pickerStyle(.segmented)
                 .controlSize(.small)
@@ -574,6 +584,7 @@ struct IPadSkillWorkshopScreen: View {
     private var agentScopeOptions: [IPadSkillWorkshopAgentScope] {
         let defaultID = Self.normalizedScopeID(self.appModel.gatewayDefaultAgentId)
         return self.appModel.gatewayAgents
+            .filter(\.isSelectableAgent)
             .filter { Self.normalizedScopeID($0.id) != defaultID }
             .map { agent in
                 let name = Self.normalizedScopeID(agent.name)
@@ -595,10 +606,10 @@ struct IPadSkillWorkshopScreen: View {
         let defaultID = Self.normalizedScopeID(self.appModel.gatewayDefaultAgentId)
         if let match = appModel.gatewayAgents.first(where: { Self.normalizedScopeID($0.id) == defaultID }) {
             let name = Self.normalizedScopeID(match.name)
-            return name.isEmpty ? "Default agent" : name
+            return name.isEmpty ? String(localized: "Default agent") : name
         }
         let activeName = Self.normalizedScopeID(self.appModel.activeAgentName)
-        return activeName.isEmpty ? "Default agent" : activeName
+        return activeName.isEmpty ? String(localized: "Default agent") : activeName
     }
 
     private var selectedAgentParam: String? {
@@ -641,18 +652,18 @@ struct IPadSkillWorkshopScreen: View {
 
     static func proposalStatusFilterLabel(_ filter: String) -> String {
         switch filter {
-        case "pending": "Pending"
-        case "held": "Held"
-        case "applied": "Applied"
-        case "rejected": "Rejected"
-        default: "All"
+        case "pending": String(localized: "Pending")
+        case "held": String(localized: "Held")
+        case "applied": String(localized: "Applied")
+        case "rejected": String(localized: "Rejected")
+        default: String(localized: "All")
         }
     }
 
     static func proposalLaneLabel(_ status: String) -> String {
         switch status {
-        case "quarantined": "Quarantined"
-        case "stale": "Stale"
+        case "quarantined": String(localized: "Quarantined")
+        case "stale": String(localized: "Stale")
         case "pending", "applied", "rejected":
             self.proposalStatusFilterLabel(status)
         default:
@@ -847,9 +858,9 @@ struct IPadSkillWorkshopScreen: View {
         do {
             let data = try await request(
                 method: "skills.proposals.inspect",
-                params: IPadSkillProposalInspectParams(
-                    agentId: selectedAgentParam,
-                    proposalId: proposalID),
+                params: SkillsProposalInspectParams(
+                    agentid: selectedAgentParam,
+                    proposalid: proposalID),
                 timeoutSeconds: 20)
             let response = try JSONDecoder().decode(IPadSkillProposalInspectResponse.self, from: data)
             self.merge(IPadSkillProposal(inspect: response, previous: self.proposals.first { $0.id == proposalID }))
@@ -860,23 +871,29 @@ struct IPadSkillWorkshopScreen: View {
 
     private func run(_ action: IPadSkillProposalAction.Kind, proposal: IPadSkillProposal) async {
         guard self.canApplyProposalMutations, self.busyAction == nil else { return }
-        self.busyAction = IPadSkillProposalAction(kind: action, proposalID: proposal.id)
+        guard let preparedAction = IPadSkillProposalAction(kind: action, proposal: proposal) else {
+            self.noticeText = nil
+            self.errorText = String(localized: "Review the proposal draft before applying or rejecting it.")
+            return
+        }
+        self.busyAction = preparedAction
         self.errorText = nil
         self.noticeText = nil
         defer { self.busyAction = nil }
 
         do {
-            let method = action == .apply ? "skills.proposals.apply" : "skills.proposals.reject"
             _ = try await self.request(
-                method: method,
-                params: IPadSkillProposalInspectParams(
-                    agentId: self.selectedAgentParam,
-                    proposalId: proposal.id),
+                method: preparedAction.method,
+                params: preparedAction.params(agentID: self.selectedAgentParam),
                 timeoutSeconds: 30)
-            self.noticeText = action == .apply ? "Proposal applied." : "Proposal rejected."
+            self.noticeText = preparedAction.kind == .apply
+                ? String(localized: "Proposal applied.")
+                : String(localized: "Proposal rejected.")
             await self.loadProposals(force: true)
         } catch {
-            self.errorText = Self.message(for: error)
+            let actionError = Self.message(for: error)
+            await self.loadProposals(force: true)
+            self.errorText = actionError
         }
     }
 
@@ -922,15 +939,19 @@ struct IPadSkillProposalKanbanColumn: View {
         ProCard(padding: 0, radius: OpenClawProMetric.cardRadius) {
             VStack(spacing: 0) {
                 ProPanelHeader(
-                    title: IPadSkillWorkshopScreen.proposalLaneLabel(self.status),
+                    title: .localized(IPadSkillWorkshopScreen.proposalLaneLabel(self.status)),
                     value: "\(self.proposals.count)",
                     actionTitle: nil,
                     action: nil)
 
                 if self.proposals.isEmpty {
+                    let lane = IPadSkillWorkshopScreen.proposalLaneLabel(self.status)
                     ProStatusRow(
                         icon: "hammer",
-                        title: "No \(IPadSkillWorkshopScreen.proposalLaneLabel(self.status).lowercased()) proposals",
+                        title: .verbatim(
+                            String(
+                                format: String(localized: "No proposals in %@"),
+                                lane)),
                         detail: "Matching proposals appear here after gateway refresh.",
                         value: "empty",
                         color: .secondary,
@@ -1112,6 +1133,25 @@ struct IPadSkillProposalAction: Equatable {
 
     let kind: Kind
     let proposalID: String
+    let revisionHash: String
+
+    init?(kind: Kind, proposal: IPadSkillProposal) {
+        guard let revisionHash = proposal.revisionHash else { return nil }
+        self.kind = kind
+        self.proposalID = proposal.id
+        self.revisionHash = revisionHash
+    }
+
+    var method: String {
+        self.kind == .apply ? "skills.proposals.apply" : "skills.proposals.reject"
+    }
+
+    func params(agentID: String?) -> SkillsProposalDecisionParams {
+        SkillsProposalDecisionParams(
+            agentid: agentID,
+            proposalid: self.proposalID,
+            expectedrevisionhash: self.revisionHash)
+    }
 }
 
 private struct IPadSkillProposalManifest: Decodable {
@@ -1120,13 +1160,11 @@ private struct IPadSkillProposalManifest: Decodable {
 
 struct IPadSkillProposalManifestEntry: Decodable {
     let id: String
-    let kind: String
     let status: String
     let title: String
     let description: String
     let skillName: String
     let skillKey: String
-    let createdAt: String
     let updatedAt: String
     let scanState: String
 }
@@ -1140,24 +1178,18 @@ private struct IPadSkillProposalListParams: Encodable {
     let agentId: String?
 }
 
-private struct IPadSkillProposalInspectParams: Encodable {
-    let agentId: String?
-    let proposalId: String
-}
-
 struct IPadSkillProposalInspectResponse: Decodable {
     let record: IPadSkillProposalRecord
+    let revisionHash: String?
     let content: String
     let supportFiles: [IPadSkillProposalSupportFile]?
 }
 
 struct IPadSkillProposalRecord: Decodable {
     let id: String
-    let kind: String
     let status: String
     let title: String
     let description: String
-    let createdAt: String
     let updatedAt: String
     let target: IPadSkillProposalTarget
 }
@@ -1174,42 +1206,40 @@ struct IPadSkillProposalSupportFile: Decodable {
 
 struct IPadSkillProposal: Identifiable {
     let id: String
-    let kind: String
     let status: String
     let title: String
     let description: String
     let skillName: String
     let skillKey: String
-    let createdAtMs: Double
     let updatedAtMs: Double
+    let revisionHash: String?
     var content: String?
     var supportFiles: [IPadSkillProposalSupportFile]
 
     init(entry: IPadSkillProposalManifestEntry, previous: IPadSkillProposal?) {
         self.id = entry.id
-        self.kind = entry.kind
         self.status = entry.status
         self.title = entry.title.isEmpty ? entry.skillName : entry.title
         self.description = entry.description
         self.skillName = entry.skillName
         self.skillKey = entry.skillKey
-        self.createdAtMs = Self.parseDate(entry.createdAt)
         self.updatedAtMs = Self.parseDate(entry.updatedAt)
-        self.content = previous?.updatedAtMs == self.updatedAtMs ? previous?.content : nil
-        self.supportFiles = previous?.updatedAtMs == self.updatedAtMs ? previous?.supportFiles ?? [] : []
+        let isSameRevision = previous?.updatedAtMs == self.updatedAtMs
+        self.revisionHash = isSameRevision ? previous?.revisionHash : nil
+        self.content = isSameRevision ? previous?.content : nil
+        self.supportFiles = isSameRevision ? previous?.supportFiles ?? [] : []
     }
 
     init(inspect: IPadSkillProposalInspectResponse, previous: IPadSkillProposal?) {
         let record = inspect.record
         self.id = record.id
-        self.kind = record.kind
         self.status = record.status
         self.title = record.title.isEmpty ? record.target.skillName : record.title
         self.description = record.description
         self.skillName = record.target.skillName
         self.skillKey = record.target.skillKey
-        self.createdAtMs = Self.parseDate(record.createdAt)
         self.updatedAtMs = Self.parseDate(record.updatedAt)
+        self.revisionHash = inspect.revisionHash
         self.content = Self.stripFrontmatter(inspect.content)
         self.supportFiles = inspect.supportFiles ?? previous?.supportFiles ?? []
     }
@@ -1217,11 +1247,15 @@ struct IPadSkillProposal: Identifiable {
     var ageLabel: String {
         let diff = max(0, Date().timeIntervalSince1970 * 1000 - self.updatedAtMs)
         let minutes = Int(diff / 60000)
-        if minutes < 1 { return "now" }
-        if minutes < 60 { return "\(minutes)m" }
+        if minutes < 1 { return String(localized: "now") }
+        if minutes < 60 {
+            return String(format: String(localized: "%@m"), minutes.formatted())
+        }
         let hours = minutes / 60
-        if hours < 24 { return "\(hours)h" }
-        return "\(hours / 24)d"
+        if hours < 24 {
+            return String(format: String(localized: "%@h"), hours.formatted())
+        }
+        return String(format: String(localized: "%@d"), (hours / 24).formatted())
     }
 
     var statusColor: Color {

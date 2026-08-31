@@ -11,22 +11,6 @@ private struct WatchConnectivityTransportCallbacks {
     var appCommandHandler: (@Sendable (WatchAppCommandEvent) -> Void)?
 }
 
-private func sendReachableWatchMessage(_ payload: [String: Any], with session: WCSession) async throws {
-    // WatchConnectivity replies arrive on its own queue. Keep this continuation explicitly
-    // nonisolated so Swift 6 does not inherit a caller actor (for example MainActor) into the
-    // Objective-C callback boundary and trap on the reply callback executor check.
-    try await withCheckedThrowingContinuation(isolation: nil) { (continuation: CheckedContinuation<Void, Error>) in
-        session.sendMessage(
-            payload,
-            replyHandler: { _ in
-                continuation.resume(returning: ())
-            },
-            errorHandler: { error in
-                continuation.resume(throwing: error)
-            })
-    }
-}
-
 final class WatchConnectivityTransport: NSObject, @unchecked Sendable {
     private nonisolated static let logger = Logger(subsystem: "ai.openclawfoundation.app", category: "watch.messaging")
 
@@ -45,24 +29,11 @@ final class WatchConnectivityTransport: NSObject, @unchecked Sendable {
         super.init()
         if let session = self.session {
             session.delegate = self
-            self.beginActivation(session)
         }
     }
 
     nonisolated static func isSupportedOnDevice() -> Bool {
         WCSession.isSupported()
-    }
-
-    nonisolated static func currentStatusSnapshot() -> WatchMessagingStatus {
-        guard WCSession.isSupported() else {
-            return WatchMessagingStatus(
-                supported: false,
-                paired: false,
-                appInstalled: false,
-                reachable: false,
-                activationState: "unsupported")
-        }
-        return self.status(for: WCSession.default)
     }
 
     func status() async -> WatchMessagingStatus {
@@ -106,6 +77,11 @@ final class WatchConnectivityTransport: NSObject, @unchecked Sendable {
 
     func setAppCommandHandler(_ handler: (@Sendable (WatchAppCommandEvent) -> Void)?) {
         self.updateCallbacks { $0.appCommandHandler = handler }
+    }
+
+    func activate() {
+        guard let session = self.session else { return }
+        self.beginActivation(session)
     }
 
     func sendPayload(_ payload: [String: Any]) async throws -> WatchNotificationSendResult {

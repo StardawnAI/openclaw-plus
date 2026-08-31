@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { withEnv, withEnvAsync } from "../../test-utils/env.js";
-import { loadWorkspaceSkillEntries } from "../loading/workspace.js";
+import { loadWorkspaceSkills } from "../loading/workspace-skill-loader.js";
 import { writeSkill } from "../test-support/e2e-test-helpers.js";
 import { createCanonicalFixtureSkill } from "../test-support/test-helpers.js";
 import type { SkillEntry } from "../types.js";
@@ -78,6 +78,25 @@ function requireSkillEntry(entry: SkillEntry | undefined, name: string): SkillEn
 }
 
 describe("buildWorkspaceSkillStatus", () => {
+  it("keeps config-disabled skills visible in status when eligibility is passed", async () => {
+    const workspaceDir = await createTempWorkspaceDir();
+    await writeSkill({
+      dir: path.join(workspaceDir, "skills"),
+      name: "hot-reload-probe",
+      description: "Lifecycle probe",
+    });
+
+    // Regression: skills.status passes eligibility (node-skill merge); the
+    // loader must stay unfiltered so disabled skills still report with flags.
+    const report = buildWorkspaceSkillStatus(workspaceDir, {
+      config: { skills: { entries: { "hot-reload-probe": { enabled: false } } } },
+      eligibility: { nodeSkills: { canExec: false } },
+    });
+    const skill = requireReportedSkill(report, "hot-reload-probe");
+
+    expect(skill.disabled).toBe(true);
+  });
+
   it("reports missing requirements and install options", () => {
     const entry = makeEntry({
       name: "status-skill",
@@ -175,7 +194,7 @@ describe("buildWorkspaceSkillStatus", () => {
   it("requires explicit enablement before exposing bundled coding-agent", async () => {
     const workspaceDir = await createTempWorkspaceDir();
     const bundledSkillsDir = path.resolve("skills");
-    const entries = loadWorkspaceSkillEntries(workspaceDir, {
+    const entries = loadWorkspaceSkills(workspaceDir, {
       managedSkillsDir: path.join(workspaceDir, ".managed"),
       bundledSkillsDir,
       config: {

@@ -1,5 +1,5 @@
 import { consume } from "@lit/context";
-import { html, LitElement } from "lit";
+import { html, type PropertyValues } from "lit";
 import { property, state } from "lit/decorators.js";
 import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type {
@@ -13,12 +13,11 @@ import type {
 } from "../../api/types.ts";
 import { subtitleForRoute, titleForRoute } from "../../app-navigation.ts";
 import { applicationContext, type ApplicationContext } from "../../app/context.ts";
+import { resolveControlUiAuthToken } from "../../app/control-ui-auth.ts";
+import { renderLearnMoreLink } from "../../components/settings-ui.ts";
 import { renderSettingsWorkspace } from "../../components/settings-workspace.ts";
-import {
-  resolveAgentConfig,
-  resolveEffectiveModelFallbacks,
-  resolveModelPrimary,
-} from "../../lib/agents/display.ts";
+import { t } from "../../i18n/index.ts";
+import { resolveAgentSkillsFilter, selectableAgentsList } from "../../lib/agents/display.ts";
 import {
   loadToolsCatalog,
   loadToolsEffective,
@@ -26,46 +25,68 @@ import {
   refreshVisibleToolsEffectiveForCurrentSession,
   resetToolsEffectiveState,
   setDefaultAgent,
-  type AgentsPanel,
   type AgentsState,
 } from "../../lib/agents/index.ts";
-import { currentConfigObject, findAgentConfigEntryIndex } from "../../lib/config/index.ts";
+import { DEFAULT_AGENT_PANEL, type AgentsPanel } from "../../lib/agents/panels.ts";
+import {
+  loadChatMetadata,
+  peekChatMetadata,
+  revalidateChatMetadata,
+} from "../../lib/chat/chat-metadata-store.ts";
+import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import {
   createInitialCronState,
   loadCronJobsPage,
+  loadCronScopeStats,
   loadCronStatus,
   runCronJob,
+  type CronState,
 } from "../../lib/cron/index.ts";
+import { formatUiError } from "../../lib/format-error.ts";
+import {
+  canCallGatewayMethod,
+  type GatewayMethodOperatorScope,
+} from "../../lib/gateway-methods.ts";
 import { parseAgentSessionKey } from "../../lib/sessions/session-key.ts";
-import { normalizeStringEntries } from "../../lib/string-coerce.ts";
+import { GatewayPageController } from "../../lit/gateway-page-controller.ts";
+import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
+import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import { loadAgentFileContent, saveAgentFile } from "./files.ts";
-import { loadAgentSkills } from "./skills.ts";
+import { GitHubIdentityController } from "./github-identity-controller.ts";
+import {
+  resetIdentityDraft,
+  saveIdentityDraft,
+  selectIdentityAvatar,
+  setIdentityDraftField,
+  togglePinnedAgent,
+} from "./identity-actions.ts";
+import { stageAgentModelFallbacks, stageAgentPrimaryModel } from "./model-config.ts";
+import type { AgentIdentityDraft } from "./panels-overview.ts";
+import {
+  navigateToAgent,
+  navigateToAgentPanel,
+  syncAgentsCanonicalLocation,
+} from "./route-navigation.ts";
+import type { AgentsRouteData } from "./route.ts";
+import { clearAgentSkillFilter, loadAgentSkills } from "./skills.ts";
 import { renderAgents } from "./view.ts";
 
-export type AgentsRouteData = {
-  connected: boolean;
-  agentsList: AgentsListResult | null;
-  selectedAgentId: string | null;
-  error: string | null;
-};
+const AGENTS_DOCS_URL = "https://docs.openclaw.ai/concepts/multi-agent";
+type AgentsRequestSources = Partial<
+  Pick<ApplicationContext, "agents" | "agentIdentity" | "sessions">
+>;
 
-class AgentsPage extends LitElement implements AgentsState {
-  override createRenderRoot() {
-    return this;
-  }
-
-  @consume({ context: applicationContext, subscribe: false })
+class AgentsPage
+  extends OpenClawLightDomElement
+  implements Omit<AgentsState, "agentsLoading" | "agentsError">
+{
+  @consume({ context: applicationContext, subscribe: true })
   private context!: ApplicationContext;
 
   @property({ attribute: false }) routeData?: AgentsRouteData;
 
-  @state() client: GatewayBrowserClient | null = null;
-  @state() connected = false;
-  @state() agentsLoading = false;
-  @state() agentsError: string | null = null;
   @state() agentsList: AgentsListResult | null = null;
   @state() agentsSelectedId: string | null = null;
-  @state() agentsPanel: AgentsPanel = "files";
   @state() toolsCatalogLoading = false;
   @state() toolsCatalogLoadingAgentId: string | null = null;
   @state() toolsCatalogError: string | null = null;
@@ -76,6 +97,7 @@ class AgentsPage extends LitElement implements AgentsState {
   @state() toolsEffectiveError: string | null = null;
   @state() toolsEffectiveResult: ToolsEffectiveResult | null = null;
   @state() chatModelCatalog: ModelCatalogEntry[] = [];
+  @state() chatModelCatalogError: string | null = null;
   @state() agentFilesLoading = false;
   @state() agentFilesError: string | null = null;
   @state() agentFilesList: AgentsFilesListResult | null = null;
@@ -83,8 +105,12 @@ class AgentsPage extends LitElement implements AgentsState {
   @state() agentFileDrafts: Record<string, string> = {};
   @state() agentFileActive: string | null = null;
   @state() agentFileSaving = false;
+  readonly agentFileWriteRevisions = new Map<string, number>();
   @state() agentIdentityLoading = false;
   @state() agentIdentityError: string | null = null;
+  @state() identityDraft: AgentIdentityDraft = { name: null, emoji: null, avatar: null };
+  @state() identitySaving = false;
+  @state() identityError: string | null = null;
   @state() agentSkillsLoading = false;
   @state() agentSkillsError: string | null = null;
   @state() agentSkillsReport: SkillStatusReport | null = null;
@@ -93,15 +119,153 @@ class AgentsPage extends LitElement implements AgentsState {
   @state() private cron = createInitialCronState();
 
   private routeDataInitialized = false;
-  private stopGatewaySubscription?: () => void;
-  private stopAgentsSubscription?: () => void;
-  private stopAgentIdentitySubscription?: () => void;
-  private stopChannelsSubscription?: () => void;
-  private stopConfigSubscription?: () => void;
-  private stopSessionsSubscription?: () => void;
+  private hasBoundAgents = false;
+  private agentsSource: ApplicationContext["agents"] | null = null;
+  private hasBoundAgentIdentity = false;
+  private agentIdentitySource: ApplicationContext["agentIdentity"] | null = null;
+  private hasBoundSessions = false;
+  private sessionsSource: ApplicationContext["sessions"] | null = null;
+  private chatModelCatalogAgentId: string | null = null;
+  private chatModelCatalogRequest: {
+    client: GatewayBrowserClient;
+    generation: number;
+    agentId: string;
+  } | null = null;
+  private normalizedLocation = "";
+  private readonly githubIdentity = new GitHubIdentityController({
+    requestUpdate: () => this.requestUpdate(),
+    runExternalMutation: (task, options) =>
+      this.context.runtimeConfig.runExternalMutation(task, options),
+  });
+  private readonly gateway = new GatewayPageController(this, {
+    getGateway: () => this.context?.gateway,
+    onIdentityChange: () => this.resetForClientChange(),
+    invalidateRequests: (change) => {
+      if (change.identityChanged) {
+        return;
+      }
+      this.invalidateTransientRequests();
+      this.chatModelCatalog = [];
+      this.chatModelCatalogAgentId = null;
+      this.chatModelCatalogError = null;
+    },
+    onSnapshot: () => this.syncGatewayState(),
+    ensureInitialData: () => this.ensureInitialData(),
+  });
+  private readonly subscriptions = new SubscriptionsController(this)
+    .effect(
+      () => this.context?.agents,
+      (agents) => {
+        const resetForSourceBind = this.hasBoundAgents;
+        this.hasBoundAgents = true;
+        this.agentsSource = agents;
+        if (resetForSourceBind) {
+          this.resetForAgentsSourceChange();
+        }
+        this.syncAgentState(agents);
+        this.ensureInitialData();
+        const stop = agents.subscribe(() => {
+          if (this.agentsSource !== agents || this.context.agents !== agents) {
+            return;
+          }
+          this.syncAgentState(agents);
+          this.ensureAgentIdentities();
+          this.loadActivePanelData();
+          this.requestUpdate();
+        });
+        return () => {
+          stop();
+          if (this.agentsSource === agents) {
+            this.agentsSource = null;
+          }
+        };
+      },
+    )
+    .effect(
+      () => this.context?.agentIdentity,
+      (agentIdentity) => {
+        const resetForSourceBind = this.hasBoundAgentIdentity;
+        this.hasBoundAgentIdentity = true;
+        this.agentIdentitySource = agentIdentity;
+        if (resetForSourceBind) {
+          this.invalidateTransientRequests();
+          this.agentIdentityError = null;
+        }
+        this.ensureAgentIdentities();
+        this.ensureInitialData();
+        const stop = agentIdentity.subscribe(() => {
+          if (
+            this.agentIdentitySource === agentIdentity &&
+            this.context.agentIdentity === agentIdentity
+          ) {
+            this.requestUpdate();
+          }
+        });
+        return () => {
+          stop();
+          if (this.agentIdentitySource === agentIdentity) {
+            this.agentIdentitySource = null;
+          }
+        };
+      },
+    )
+    .watch(
+      () => this.context?.channels,
+      (channels, notify) => channels.subscribe(notify),
+    )
+    .watch(
+      () => this.context?.navigation,
+      (navigation, notify) => navigation.subscribe(notify),
+    )
+    .watch(
+      () => this.context?.runtimeConfig,
+      (runtimeConfig, notify) => runtimeConfig.subscribe(notify),
+    )
+    .effect(
+      () => this.context?.sessions,
+      (sessions) => {
+        const resetForSourceBind = this.hasBoundSessions;
+        this.hasBoundSessions = true;
+        this.sessionsSource = sessions;
+        if (resetForSourceBind) {
+          this.invalidateTransientRequests();
+          resetToolsEffectiveState(this);
+          this.loadActivePanelData();
+        }
+        const stop = sessions.subscribe(() => {
+          if (this.sessionsSource !== sessions || this.context.sessions !== sessions) {
+            return;
+          }
+          void refreshVisibleToolsEffectiveForCurrentSession(this);
+          this.requestUpdate();
+        });
+        return () => {
+          stop();
+          if (this.sessionsSource === sessions) {
+            this.sessionsSource = null;
+          }
+        };
+      },
+    );
 
   get sessions() {
     return this.context.sessions;
+  }
+
+  get agents() {
+    return this.context.agents;
+  }
+
+  get client() {
+    return this.gateway.client;
+  }
+
+  get connected() {
+    return this.gateway.connected;
+  }
+
+  get requestGeneration() {
+    return this.gateway.epoch;
   }
 
   get sessionsResult() {
@@ -112,79 +276,48 @@ class AgentsPage extends LitElement implements AgentsState {
     return this.context.gateway.snapshot.sessionKey;
   }
 
-  override connectedCallback() {
-    super.connectedCallback();
-    this.syncGatewayState();
-    this.syncAgentState();
-    this.stopGatewaySubscription = this.context.gateway.subscribe((snapshot) => {
-      const previousClient = this.client;
-      this.syncGatewayState();
-      if (previousClient !== snapshot.client) {
-        this.resetForClientChange();
-      }
-      this.ensureInitialData();
-    });
-    this.stopAgentsSubscription = this.context.agents.subscribe(() => {
-      this.syncAgentState();
-      this.ensureAgentIdentities();
-      this.loadActivePanelData();
-      this.requestUpdate();
-    });
-    this.stopAgentIdentitySubscription = this.context.agentIdentity.subscribe(() =>
-      this.requestUpdate(),
-    );
-    this.stopChannelsSubscription = this.context.channels.subscribe(() => this.requestUpdate());
-    this.stopConfigSubscription = this.context.runtimeConfig.subscribe(() => this.requestUpdate());
-    this.stopSessionsSubscription = this.context.sessions.subscribe(() => {
-      void refreshVisibleToolsEffectiveForCurrentSession(this);
-      this.requestUpdate();
-    });
-    this.ensureInitialData();
+  get agentsPanel(): AgentsPanel {
+    return this.routeData?.panel ?? DEFAULT_AGENT_PANEL;
   }
 
-  override willUpdate(changed: Map<PropertyKey, unknown>) {
-    if (changed.has("routeData")) {
-      this.applyRouteData();
-      this.ensureInitialData();
-    }
+  override connectedCallback() {
+    super.connectedCallback();
+    this.syncCanonicalLocation();
   }
 
   override disconnectedCallback() {
-    this.stopGatewaySubscription?.();
-    this.stopGatewaySubscription = undefined;
-    this.stopAgentsSubscription?.();
-    this.stopAgentsSubscription = undefined;
-    this.stopAgentIdentitySubscription?.();
-    this.stopAgentIdentitySubscription = undefined;
-    this.stopChannelsSubscription?.();
-    this.stopChannelsSubscription = undefined;
-    this.stopConfigSubscription?.();
-    this.stopConfigSubscription = undefined;
-    this.stopSessionsSubscription?.();
-    this.stopSessionsSubscription = undefined;
+    this.githubIdentity.dispose();
+    this.subscriptions.clear();
     super.disconnectedCallback();
   }
 
-  private syncGatewayState() {
-    const gateway = this.context.gateway.snapshot;
-    this.client = gateway.client;
-    this.connected = gateway.connected;
-    this.cron = {
-      ...this.cron,
-      client: gateway.client,
-      connected: gateway.connected,
-    };
+  override willUpdate(changed: PropertyValues<this>) {
+    if (changed.has("routeData")) {
+      this.applyRouteData();
+      this.syncCanonicalLocation();
+      this.ensureInitialData();
+    }
   }
 
-  private syncAgentState() {
-    const agentState = this.context.agents.state;
-    this.agentsLoading = agentState.agentsLoading;
-    this.agentsError = agentState.agentsError;
-    this.agentsList = agentState.agentsList;
-    if (agentState.agentsList) {
-      this.ensureSelectedAgentInList(agentState.agentsList);
+  private syncGatewayState() {
+    if (this.cron.client !== this.client || this.cron.connected !== this.connected) {
+      // In-flight cron loaders mutate their captured state; same-client
+      // snapshots must retain it or loading never clears in the visible state.
+      this.cron = { ...this.cron, client: this.client, connected: this.connected };
     }
-    this.syncCurrentAgentFiles();
+  }
+
+  private canCall(method: string, requiredScope: GatewayMethodOperatorScope): boolean {
+    return canCallGatewayMethod(this.context?.gateway?.snapshot, method, requiredScope);
+  }
+
+  private syncAgentState(agents = this.context.agents) {
+    const agentState = agents.state;
+    this.agentsList = agentState.agentsList ? selectableAgentsList(agentState.agentsList) : null;
+    if (this.agentsList) {
+      this.ensureSelectedAgentInList(this.agentsList);
+    }
+    this.syncCurrentAgentFiles(agents);
   }
 
   private ensureSelectedAgentInList(agentsList: AgentsListResult) {
@@ -194,35 +327,64 @@ class AgentsPage extends LitElement implements AgentsState {
     }
   }
 
-  private syncCurrentAgentFiles() {
+  private syncCurrentAgentFiles(agents = this.context.agents) {
     const agentId = this.resolveSelectedAgentId();
     if (!agentId || this.agentsPanel !== "files") {
       return;
     }
-    const status = this.context.agents.files(agentId);
+    const status = agents.files(agentId);
     if (!status.list) {
       return;
     }
     this.agentFilesList = status.list;
-    this.agentFilesError = status.error;
-    if (
-      this.agentFileActive &&
-      !status.list.files.some((file) => file.name === this.agentFileActive)
-    ) {
-      this.agentFileActive = null;
+    void this.selectDefaultAgentFile(agentId);
+  }
+
+  private async selectDefaultAgentFile(agentId: string, force = false) {
+    const files = this.agentFilesList?.files ?? [];
+    if (!this.agentFileActive || !files.some((file) => file.name === this.agentFileActive)) {
+      this.agentFileActive = files.find((file) => file.name === "AGENTS.md")?.name ?? null;
+    }
+    if (this.agentFileActive) {
+      await loadAgentFileContent(this, agentId, this.agentFileActive, {
+        force,
+      });
     }
   }
 
   private resetForClientChange() {
-    this.agentsLoading = false;
-    this.agentsError = null;
+    this.agentsList = null;
+    this.agentsSelectedId = null;
+    this.chatModelCatalog = [];
+    this.chatModelCatalogAgentId = null;
+    this.chatModelCatalogError = null;
+    this.resetSelectionState();
+  }
+
+  private resetForAgentsSourceChange() {
     this.agentsList = null;
     this.agentsSelectedId = null;
     this.resetSelectionState();
-    this.cron = createInitialCronState({
-      client: this.client,
-      connected: this.connected,
-    });
+  }
+
+  private invalidateTransientRequests() {
+    this.gateway.invalidate();
+    this.agentFilesLoading = false;
+    this.agentFileSaving = false;
+    this.agentIdentityLoading = false;
+    this.agentSkillsLoading = false;
+    this.toolsCatalogLoading = false;
+    this.toolsCatalogLoadingAgentId = null;
+    resetToolsEffectiveState(this);
+    this.cron = {
+      ...this.cron,
+      cronLoading: false,
+      cronJobsLoadingMore: false,
+      cronJobsReloadPending: false,
+      cronJobsReloadPendingTableFilters: false,
+      cronRunsLoadingMore: false,
+      cronBusy: false,
+    };
   }
 
   private applyRouteData() {
@@ -231,12 +393,27 @@ class AgentsPage extends LitElement implements AgentsState {
       return;
     }
     this.routeDataInitialized = true;
-    this.agentsLoading = false;
-    this.agentsError = data.error;
+    if (!this.gateway.isRouteDataCurrent(data)) {
+      return;
+    }
     if (data.agentsList) {
       this.agentsList = data.agentsList;
-      this.agentsSelectedId = data.selectedAgentId ?? this.resolveSelectedAgentId();
+      const nextSelectedId = data.selectedAgentId ?? this.resolveSelectedAgentId();
+      if (nextSelectedId !== this.agentsSelectedId) {
+        this.agentsSelectedId = nextSelectedId;
+        // Route-driven agent switches (chip menu "Agent settings") must not
+        // carry per-agent panel caches or identity drafts across agents.
+        this.resetSelectionState();
+      }
     }
+  }
+
+  private syncCanonicalLocation() {
+    this.normalizedLocation = syncAgentsCanonicalLocation(
+      this.context,
+      this.routeData,
+      this.normalizedLocation,
+    );
   }
 
   private resolveSelectedAgentId() {
@@ -263,6 +440,17 @@ class AgentsPage extends LitElement implements AgentsState {
     );
   }
 
+  // Local /avatar/<id> images need a bearer credential when gateway auth is
+  // active; the agent select uses this to decide whether <img> URLs can load.
+  private controlUiAuthToken(): string | null {
+    const { snapshot, connection } = this.context.gateway;
+    return resolveControlUiAuthToken({
+      hello: snapshot.hello,
+      settings: connection,
+      password: connection.password,
+    });
+  }
+
   private ensureInitialData() {
     if (!this.connected || !this.client || !this.routeDataInitialized) {
       return;
@@ -273,7 +461,7 @@ class AgentsPage extends LitElement implements AgentsState {
     ) {
       void this.context.runtimeConfig.ensureLoaded();
     }
-    if (!this.agentsList && !this.agentsLoading) {
+    if (!this.agentsList && !this.context.agents.state.agentsLoading) {
       void this.loadAgentsAndCommit();
       return;
     }
@@ -281,29 +469,55 @@ class AgentsPage extends LitElement implements AgentsState {
     this.loadActivePanelData();
   }
 
+  private isCurrentRequest(
+    client: GatewayBrowserClient,
+    generation: number,
+    agentId?: string,
+    sources: AgentsRequestSources = {},
+  ): boolean {
+    return (
+      this.client === client &&
+      this.connected &&
+      this.requestGeneration === generation &&
+      (!sources.agents || this.context.agents === sources.agents) &&
+      (!sources.agentIdentity || this.context.agentIdentity === sources.agentIdentity) &&
+      (!sources.sessions || this.context.sessions === sources.sessions) &&
+      (!agentId || this.resolveSelectedAgentId() === agentId)
+    );
+  }
+
   private ensureAgentIdentities() {
+    const client = this.client;
+    const agentIdentity = this.context.agentIdentity;
     const ids =
-      this.agentsList?.agents
-        .map((entry) => entry.id)
-        .filter((id) => !this.context.agentIdentity.get(id)) ?? [];
-    if (ids.length === 0 || this.agentIdentityLoading) {
+      this.agentsList?.agents.map((entry) => entry.id).filter((id) => !agentIdentity.get(id)) ?? [];
+    if (!client || !this.connected || ids.length === 0 || this.agentIdentityLoading) {
       return;
     }
+    const generation = this.requestGeneration;
     this.agentIdentityLoading = true;
     this.agentIdentityError = null;
-    void this.context.agentIdentity
+    void agentIdentity
       .ensure(ids)
       .catch((err: unknown) => {
-        this.agentIdentityError = String(err);
+        if (this.isCurrentRequest(client, generation, undefined, { agentIdentity })) {
+          this.agentIdentityError = formatUiError(err);
+        }
       })
       .finally(() => {
-        this.agentIdentityLoading = false;
+        if (this.isCurrentRequest(client, generation, undefined, { agentIdentity })) {
+          this.agentIdentityLoading = false;
+        }
       });
   }
 
   private loadActivePanelData() {
     const agentId = this.resolveSelectedAgentId();
     if (!agentId) {
+      return;
+    }
+    if (this.agentsPanel === "overview") {
+      this.ensureModelCatalog();
       return;
     }
     if (this.agentsPanel === "files" && this.agentFilesList?.agentId !== agentId) {
@@ -315,117 +529,249 @@ class AgentsPage extends LitElement implements AgentsState {
       return;
     }
     if (this.agentsPanel === "tools") {
+      this.syncGitHubIdentity(agentId);
       if (this.toolsCatalogResult?.agentId !== agentId && !this.toolsCatalogLoading) {
         void loadToolsCatalog(this, agentId);
       }
       this.loadEffectiveToolsForAgent(agentId);
+      if (
+        this.githubIdentity.statusReadable &&
+        !this.githubIdentity.status &&
+        !this.githubIdentity.loading &&
+        !this.githubIdentity.error
+      ) {
+        void this.githubIdentity.verify();
+      }
       return;
     }
     if (this.agentsPanel === "channels" && !this.context.channels.state.channelsSnapshot) {
       void this.context.channels.refresh(false);
       return;
     }
-    if (this.agentsPanel === "cron" && !this.cron.cronLoading && !this.cron.cronStatus) {
-      void this.refreshCron();
+    if (this.agentsPanel === "cron") {
+      if (this.cron.cronAgentId !== agentId) {
+        this.cron = createInitialCronState({
+          client: this.client,
+          connected: this.connected,
+        });
+        this.cron.cronAgentId = agentId;
+      }
+      if (!this.cron.cronLoading && !this.cron.cronStatus) {
+        void this.refreshCron();
+      }
     }
   }
 
+  private syncGitHubIdentity(agentId: string | null) {
+    const snapshot = this.context.gateway.snapshot;
+    const hasScope = (method: string, scope: GatewayMethodOperatorScope) =>
+      canCallGatewayMethod(snapshot, method, scope, { requireAdvertisement: false });
+    this.githubIdentity.sync({
+      client: this.client,
+      connected: this.connected,
+      agentId,
+      config: currentConfigObject(this.context.runtimeConfig.state),
+      statusReadable: hasScope("tools.github.status", "operator.read"),
+      configurable: hasScope("tools.github.configure", "operator.admin"),
+      authorizable: [
+        "tools.github.authorize.start",
+        "tools.github.authorize.poll",
+        "tools.github.authorize.cancel",
+      ].every((method) => hasScope(method, "operator.admin")),
+      clientRevision: this.requestGeneration,
+    });
+  }
+
+  private ensureModelCatalog(options: { refresh?: boolean } = {}) {
+    const client = this.client;
+    const agentId = this.resolveSelectedAgentId();
+    if (!client || !this.connected || !agentId) {
+      return;
+    }
+    if (!options.refresh) {
+      const cached = peekChatMetadata(client, { agentId });
+      if (cached) {
+        this.chatModelCatalog = cached.models ?? [];
+        this.chatModelCatalogAgentId = agentId;
+        this.chatModelCatalogError = null;
+        return;
+      }
+    }
+    const generation = this.requestGeneration;
+    const previousRequest = this.chatModelCatalogRequest;
+    if (
+      previousRequest?.client === client &&
+      previousRequest.generation === generation &&
+      previousRequest.agentId === agentId
+    ) {
+      return;
+    }
+    if (this.chatModelCatalogAgentId !== agentId) {
+      this.chatModelCatalog = [];
+    }
+    const request = { client, generation, agentId };
+    this.chatModelCatalogRequest = request;
+    this.chatModelCatalogError = null;
+    // Chat metadata carries the selected agent's already-prepared startup models
+    // without initiating the live discovery reserved for explicit picker use.
+    const metadataRequest = options.refresh
+      ? revalidateChatMetadata(client, { agentId })
+      : loadChatMetadata(client, { agentId });
+    void metadataRequest
+      .then((result) => {
+        if (this.isCurrentRequest(client, generation, agentId)) {
+          const models = result.models ?? [];
+          this.chatModelCatalog = models;
+          this.chatModelCatalogAgentId = agentId;
+          this.chatModelCatalogError = null;
+        }
+      })
+      .catch((error: unknown) => {
+        if (this.isCurrentRequest(client, generation, agentId)) {
+          this.chatModelCatalogAgentId = null;
+          this.chatModelCatalogError = formatUiError(error);
+        }
+      })
+      .finally(() => {
+        if (this.chatModelCatalogRequest === request) {
+          this.chatModelCatalogRequest = null;
+        }
+      });
+  }
+
   private async loadAgentsAndCommit() {
-    await this.context.agents.ensureList();
-    this.syncAgentState();
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    if (!client) {
+      return;
+    }
+    await agents.ensureList();
+    if (!this.isCurrentRequest(client, generation, undefined, { agents })) {
+      return;
+    }
+    this.syncAgentState(agents);
     this.ensureAgentIdentities();
     this.loadActivePanelData();
   }
 
   private async loadAgentFiles(agentId: string, force = false) {
-    if (!this.client || !this.connected || this.agentFilesLoading) {
+    const client = this.client;
+    const agents = this.context.agents;
+    if (!client || !this.connected || this.agentFilesLoading) {
       return;
     }
-    const cached = this.context.agents.files(agentId);
+    const cached = agents.files(agentId);
     if (cached.list && !force) {
-      this.syncCurrentAgentFiles();
+      this.syncCurrentAgentFiles(agents);
       return;
     }
+    const generation = this.requestGeneration;
     this.agentFilesLoading = true;
     this.agentFilesError = null;
     try {
-      const list = force
-        ? await this.context.agents.refreshFiles(agentId)
-        : await this.context.agents.ensureFiles(agentId);
-      if (this.resolveSelectedAgentId() !== agentId) {
+      const list = force ? await agents.refreshFiles(agentId) : await agents.ensureFiles(agentId);
+      if (!this.isCurrentRequest(client, generation, agentId, { agents })) {
         return;
       }
-      this.agentFilesList = list ?? this.context.agents.files(agentId).list;
-      this.agentFilesError = this.context.agents.files(agentId).error;
-      if (
-        this.agentFileActive &&
-        !this.agentFilesList?.files.some((file) => file.name === this.agentFileActive)
-      ) {
-        this.agentFileActive = null;
-      }
+      this.agentFilesList = list ?? agents.files(agentId).list;
     } finally {
-      if (this.resolveSelectedAgentId() === agentId) {
+      if (this.isCurrentRequest(client, generation, agentId, { agents })) {
         this.agentFilesLoading = false;
       }
+    }
+    if (this.isCurrentRequest(client, generation, agentId, { agents })) {
+      await this.selectDefaultAgentFile(agentId, force);
     }
   }
 
   private async refreshCron() {
     const cronState = this.cron;
-    if (!cronState.connected || !cronState.client) {
+    if (!cronState.connected || !cronState.client || cronState.cronLoading) {
       return;
     }
     await Promise.all([
-      loadCronStatus(cronState),
-      loadCronJobsPage(cronState, { tableFilters: true }),
+      this.runCronTask((current) => loadCronStatus(current)),
+      this.runCronTask((current) => loadCronScopeStats(current)),
+      this.runCronTask((current) => loadCronJobsPage(current, { tableFilters: true })),
     ]);
-    if (this.cron === cronState) {
-      this.cron = { ...cronState, cronJobs: [...cronState.cronJobs] };
+  }
+
+  private async runCronTask<T>(task: (cronState: CronState) => Promise<T>): Promise<T> {
+    const cronState = this.cron;
+    try {
+      const result = task(cronState);
+      if (this.cron === cronState) {
+        this.requestUpdate();
+      }
+      return await result;
+    } finally {
+      if (this.cron === cronState) {
+        this.requestUpdate();
+      }
     }
   }
 
+  private saveIdentityDraft() {
+    if (!this.canCall("agents.update", "operator.admin")) {
+      return;
+    }
+    const client = this.client;
+    const agentId = this.resolveSelectedAgentId();
+    if (!client || !agentId || this.identitySaving) {
+      return;
+    }
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    const agentIdentity = this.context.agentIdentity;
+    void saveIdentityDraft({
+      host: this,
+      expectedClient: client,
+      agentId,
+      agents,
+      agentIdentity,
+      runtimeConfig: this.context.runtimeConfig,
+      canDispatch: () => this.canCall("agents.update", "operator.admin"),
+      isCurrent: () =>
+        this.isCurrentRequest(client, generation, agentId, { agents, agentIdentity }),
+      onSaved: () => this.syncAgentState(agents),
+    });
+  }
+
   private resetSelectionState() {
+    this.gateway.invalidate();
+    this.chatModelCatalog = [];
+    this.chatModelCatalogAgentId = null;
+    this.chatModelCatalogError = null;
     this.agentFilesList = null;
     this.agentFilesError = null;
     this.agentFileActive = null;
     this.agentFileContents = {};
     this.agentFileDrafts = {};
+    this.agentFileWriteRevisions.clear();
     this.agentFilesLoading = false;
+    this.agentFileSaving = false;
     this.agentSkillsReport = null;
+    this.agentSkillsLoading = false;
     this.agentSkillsError = null;
     this.agentSkillsAgentId = null;
+    this.agentIdentityLoading = false;
+    this.agentIdentityError = null;
+    resetIdentityDraft(this);
     this.toolsCatalogResult = null;
     this.toolsCatalogError = null;
     this.toolsCatalogLoading = false;
+    this.toolsCatalogLoadingAgentId = null;
     resetToolsEffectiveState(this);
-  }
-
-  private findAgentIndex(agentId: string) {
-    return findAgentConfigEntryIndex(
-      currentConfigObject(this.context.runtimeConfig.state),
-      agentId,
-    );
-  }
-
-  private ensureAgentIndex(agentId: string) {
-    return this.context.runtimeConfig.ensureAgentEntry(agentId);
+    this.cron = createInitialCronState({
+      client: this.client,
+      connected: this.connected,
+    });
   }
 
   private toolsPath(agentId: string, ensure: boolean) {
-    const index = ensure ? this.ensureAgentIndex(agentId) : this.findAgentIndex(agentId);
-    return index >= 0 ? (["agents", "list", index, "tools"] as Array<string | number>) : null;
-  }
-
-  private modelEntry(index: number) {
-    const list = (
-      currentConfigObject(this.context.runtimeConfig.state) as {
-        agents?: { list?: unknown[] };
-      } | null
-    )?.agents?.list;
-    const existing = Array.isArray(list)
-      ? (list[index] as { model?: unknown } | undefined)?.model
-      : undefined;
-    return { path: ["agents", "list", index, "model"] as Array<string | number>, existing };
+    const target = this.context.runtimeConfig.agentEntry(agentId, { ensure });
+    return target ? ([...target.path, "tools"] as Array<string | number>) : null;
   }
 
   private loadEffectiveToolsForAgent(agentId: string) {
@@ -443,35 +789,43 @@ class AgentsPage extends LitElement implements AgentsState {
     void loadToolsEffective(this, { agentId, sessionKey: this.sessionKey });
   }
 
-  private selectAgent(agentId: string) {
-    if (this.agentsSelectedId === agentId) {
+  private refreshAgents() {
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    if (!client) {
       return;
     }
-    this.agentsSelectedId = agentId;
-    this.resetSelectionState();
-    void this.context.agentIdentity.ensure([agentId]);
-    this.loadActivePanelData();
-  }
-
-  private selectPanel(panel: AgentsPanel) {
-    this.agentsPanel = panel;
-    this.loadActivePanelData();
-  }
-
-  private refreshAgents() {
     void (async () => {
-      await this.context.agents.refreshList();
-      this.syncAgentState();
+      await agents.refreshList();
+      if (!this.isCurrentRequest(client, generation, undefined, { agents })) {
+        return;
+      }
+      this.syncAgentState(agents);
       this.loadActivePanelData();
     })();
   }
 
   private saveAgentConfig() {
+    if (!this.canCall("config.set", "operator.admin")) {
+      return;
+    }
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    if (!client) {
+      return;
+    }
     const selectedBefore = this.agentsSelectedId;
     void (async () => {
-      await this.context.runtimeConfig.save();
-      await this.context.agents.refreshList();
-      this.syncAgentState();
+      if (!(await this.context.runtimeConfig.save())) {
+        return;
+      }
+      await agents.refreshList();
+      if (!this.isCurrentRequest(client, generation, undefined, { agents })) {
+        return;
+      }
+      this.syncAgentState(agents);
       if (selectedBefore && this.agentsList?.agents.some((entry) => entry.id === selectedBefore)) {
         this.agentsSelectedId = selectedBefore;
       }
@@ -480,37 +834,110 @@ class AgentsPage extends LitElement implements AgentsState {
     })();
   }
 
+  private setDefaultAgent(agentId: string) {
+    if (!this.canCall("config.set", "operator.admin")) {
+      return;
+    }
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    const runtimeConfig = this.context.runtimeConfig;
+    if (!client) {
+      return;
+    }
+    const canDispatch = () =>
+      this.context.runtimeConfig === runtimeConfig &&
+      this.isCurrentRequest(client, generation, undefined, { agents }) &&
+      this.canCall("config.set", "operator.admin");
+    void (async () => {
+      await runtimeConfig.ensureLoaded();
+      if (!canDispatch()) {
+        return;
+      }
+      await setDefaultAgent(runtimeConfig, agentId, () => agents.refreshList(), canDispatch);
+    })();
+  }
+
+  private saveSelectedAgentFile(agentId: string, name: string, content: string) {
+    if (!this.canCall("agents.files.set", "operator.admin")) {
+      return;
+    }
+    void saveAgentFile(this, agentId, name, content);
+  }
+
   private reloadConfig() {
     void this.context.runtimeConfig.refresh({ discardPendingChanges: true });
   }
 
-  private runCronJobNow(jobId: string) {
-    const job = this.cron.cronJobs.find((entry) => entry.id === jobId);
-    if (!job) {
+  private clearAgentSkills(agentId: string) {
+    if (!this.canCall("config.patch", "operator.admin")) {
       return;
     }
-    void runCronJob(this.cron, job, "force").finally(() => {
-      this.cron = { ...this.cron, cronJobs: [...this.cron.cronJobs] };
+    const client = this.client;
+    const generation = this.requestGeneration;
+    const agents = this.context.agents;
+    const runtimeConfig = this.context.runtimeConfig;
+    if (!client) {
+      return;
+    }
+    const canDispatch = () =>
+      this.context.runtimeConfig === runtimeConfig &&
+      this.isCurrentRequest(client, generation, agentId, { agents }) &&
+      this.canCall("config.patch", "operator.admin");
+    void clearAgentSkillFilter(runtimeConfig, agentId, canDispatch).then((updated) => {
+      if (!canDispatch()) {
+        return;
+      }
+      if (!updated) {
+        this.agentSkillsError =
+          runtimeConfig.state.lastError ?? t("agents.skillsPanel.updateError");
+        return;
+      }
+      this.agentSkillsError = null;
+      void loadAgentSkills(this, agentId);
     });
+  }
+
+  private runCronJobNow(jobId: string) {
+    if (!this.canCall("cron.run", "operator.admin")) {
+      return;
+    }
+    if (!this.cron.cronJobs.some((entry) => entry.id === jobId)) {
+      return;
+    }
+    void this.runCronTask((cronState) => runCronJob(cronState, jobId, "force"));
   }
 
   override render() {
     const configState = this.context.runtimeConfig.state;
+    const agentsState = this.context.agents.state;
     const selectedAgentId = this.resolveSelectedAgentId();
     const config = currentConfigObject(configState);
+    const access = {
+      canCreateAgent: this.canCall("openclaw.chat", "operator.admin"),
+      canPatchConfig: this.canCall("config.patch", "operator.admin"),
+      canUpdateConfig: this.canCall("config.set", "operator.admin"),
+      canUpdateIdentity: this.canCall("agents.update", "operator.admin"),
+      canWriteFiles: this.canCall("agents.files.set", "operator.admin"),
+      canRunCron: this.canCall("cron.run", "operator.admin"),
+    };
+    this.syncGitHubIdentity(selectedAgentId);
     return html`
       <section class="content-header">
         <div>
           <div class="page-title">${titleForRoute("agents")}</div>
-          <div class="page-sub">${subtitleForRoute("agents")}</div>
+          <div class="page-subtitle">
+            ${subtitleForRoute("agents")} ${renderLearnMoreLink(AGENTS_DOCS_URL)}
+          </div>
         </div>
       </section>
       ${renderSettingsWorkspace(
-        this.context.basePath,
         renderAgents({
+          access,
           basePath: this.context.basePath,
-          loading: this.agentsLoading,
-          error: this.agentsError,
+          authToken: this.controlUiAuthToken(),
+          loading: agentsState.agentsLoading,
+          error: agentsState.agentsError,
           agentsList: this.agentsList,
           selectedAgentId,
           activePanel: this.agentsPanel,
@@ -519,6 +946,7 @@ class AgentsPage extends LitElement implements AgentsState {
             loading: configState.configLoading,
             saving: configState.configSaving,
             dirty: configState.configFormDirty,
+            error: configState.lastError,
           },
           channels: {
             snapshot: this.context.channels.state.channelsSnapshot,
@@ -529,13 +957,18 @@ class AgentsPage extends LitElement implements AgentsState {
           cron: {
             status: this.cron.cronStatus,
             jobs: this.cron.cronJobs,
+            jobsTotal: this.cron.cronJobsTotal,
+            jobsHasMore: this.cron.cronJobsHasMore,
+            jobsLoadingMore: this.cron.cronJobsLoadingMore,
+            scopedTotal: this.cron.cronScopedTotal,
+            scopedNextWakeAtMs: this.cron.cronScopedNextWakeAtMs,
             loading: this.cron.cronLoading,
             error: this.cron.cronError,
           },
           agentFiles: {
             list: this.agentFilesList,
             loading: this.agentFilesLoading,
-            error: this.agentFilesError,
+            error: this.agentFilesError ?? this.context.agents.files(selectedAgentId).error,
             active: this.agentFileActive,
             contents: this.agentFileContents,
             drafts: this.agentFileDrafts,
@@ -544,6 +977,9 @@ class AgentsPage extends LitElement implements AgentsState {
           agentIdentityLoading: this.agentIdentityLoading,
           agentIdentityError: this.agentIdentityError,
           agentIdentityById: this.agentIdentityById(),
+          identityDraft: this.identityDraft,
+          identitySaving: this.identitySaving,
+          identityError: this.identityError,
           agentSkills: {
             report: this.agentSkillsReport,
             loading: this.agentSkillsLoading,
@@ -561,12 +997,23 @@ class AgentsPage extends LitElement implements AgentsState {
             error: this.toolsEffectiveError,
             result: this.toolsEffectiveResult,
           },
+          githubIdentity: this.githubIdentity,
           runtimeSessionKey: this.sessionKey,
           runtimeSessionMatchesSelectedAgent: selectedAgentId === this.chatAgentId(),
           modelCatalog: this.chatModelCatalog,
+          modelCatalogError: this.chatModelCatalogError,
+          pinnedAgentIds: this.context.navigation.snapshot.pinnedAgentIds,
+          onTogglePinnedAgent: (agentId) => togglePinnedAgent(this.context.navigation, agentId),
           onRefresh: () => this.refreshAgents(),
-          onSelectAgent: (agentId) => this.selectAgent(agentId),
-          onSelectPanel: (panel) => this.selectPanel(panel),
+          onSelectAgent: (agentId) =>
+            navigateToAgent(this.context, agentId, selectedAgentId, this.agentsPanel),
+          onCreateAgent: () => {
+            if (this.canCall("openclaw.chat", "operator.admin")) {
+              this.context.navigate("custodian", { search: "?intent=new-agent" });
+            }
+          },
+          onSelectPanel: (panel) =>
+            navigateToAgentPanel(this.context, selectedAgentId, this.agentsPanel, panel),
           onLoadFiles: (agentId) => void this.loadAgentFiles(agentId, true),
           onSelectFile: (name) => {
             this.agentFileActive = name;
@@ -585,15 +1032,17 @@ class AgentsPage extends LitElement implements AgentsState {
           },
           onFileSave: (name) => {
             if (selectedAgentId) {
-              void saveAgentFile(
-                this,
+              this.saveSelectedAgentFile(
                 selectedAgentId,
                 name,
                 this.agentFileDrafts[name] ?? this.agentFileContents[name] ?? "",
-              ).then(() => this.loadAgentFiles(selectedAgentId, true));
+              );
             }
           },
           onToolsProfileChange: (agentId, profile, clearAllow) => {
+            if (!this.canCall("config.set", "operator.admin")) {
+              return;
+            }
             const path = this.toolsPath(agentId, Boolean(profile || clearAllow));
             if (!path) {
               return;
@@ -608,6 +1057,9 @@ class AgentsPage extends LitElement implements AgentsState {
             }
           },
           onToolsOverridesChange: (agentId, alsoAllow, deny) => {
+            if (!this.canCall("config.set", "operator.admin")) {
+              return;
+            }
             const path = this.toolsPath(agentId, alsoAllow.length > 0 || deny.length > 0);
             if (!path) {
               return;
@@ -625,8 +1077,26 @@ class AgentsPage extends LitElement implements AgentsState {
           },
           onConfigReload: () => this.reloadConfig(),
           onConfigSave: () => this.saveAgentConfig(),
+          onIdentityFieldChange: (field, value) => {
+            if (this.canCall("agents.update", "operator.admin")) {
+              setIdentityDraftField(this, field, value);
+            }
+          },
+          onIdentityAvatarSelect: (file) => {
+            if (this.canCall("agents.update", "operator.admin")) {
+              selectIdentityAvatar(this, file);
+            }
+          },
+          onIdentitySave: () => this.saveIdentityDraft(),
           onChannelsRefresh: () => void this.context.channels.refresh(false),
+          onOpenMemoryImport: () => this.context.navigate("memory-import"),
+          onOpenMemorySettings: () => this.context.navigate("memory"),
+          onOpenAgentDefaults: () => this.context.navigate("ai-agents"),
           onCronRefresh: () => void this.refreshCron(),
+          onCronLoadMore: () =>
+            void this.runCronTask((cronState) =>
+              loadCronJobsPage(cronState, { append: true, tableFilters: true }),
+            ),
           onCronRunNow: (jobId) => this.runCronJobNow(jobId),
           onSkillsFilterChange: (next) => (this.skillsFilter = next),
           onSkillsRefresh: () => {
@@ -635,115 +1105,57 @@ class AgentsPage extends LitElement implements AgentsState {
             }
           },
           onAgentSkillToggle: (agentId, skillName, enabled) => {
-            const index = this.ensureAgentIndex(agentId);
-            if (index < 0 || !skillName.trim()) {
+            if (!this.canCall("config.set", "operator.admin")) {
               return;
             }
-            const list = (
-              currentConfigObject(configState) as {
-                agents?: { list?: unknown[] };
-              } | null
-            )?.agents?.list;
-            const entry = Array.isArray(list)
-              ? (list[index] as { skills?: unknown } | undefined)
-              : undefined;
-            const base = Array.isArray(entry?.skills)
-              ? normalizeStringEntries(entry.skills)
-              : (this.agentSkillsReport?.skills?.map((skill) => skill.name).filter(Boolean) ?? []);
+            const target = this.context.runtimeConfig.agentEntry(agentId, { ensure: true });
+            if (!target || !skillName.trim()) {
+              return;
+            }
+            const base =
+              resolveAgentSkillsFilter(
+                currentConfigObject(this.context.runtimeConfig.state),
+                agentId,
+              ) ??
+              this.agentSkillsReport?.agentSkillFilter ??
+              this.agentSkillsReport?.skills?.map((skill) => skill.name).filter(Boolean) ??
+              [];
             const next = new Set(base);
             if (enabled) {
               next.add(skillName.trim());
             } else {
               next.delete(skillName.trim());
             }
-            this.context.runtimeConfig.patchForm(["agents", "list", index, "skills"], [...next]);
+            this.context.runtimeConfig.patchForm([...target.path, "skills"], [...next]);
           },
-          onAgentSkillsClear: (agentId) => {
-            const index = this.findAgentIndex(agentId);
-            if (index >= 0) {
-              this.context.runtimeConfig.removeFormValue(["agents", "list", index, "skills"]);
-            }
-          },
+          onAgentSkillsClear: (agentId) => this.clearAgentSkills(agentId),
           onAgentSkillsDisableAll: (agentId) => {
-            const index = this.ensureAgentIndex(agentId);
-            if (index >= 0) {
-              this.context.runtimeConfig.patchForm(["agents", "list", index, "skills"], []);
+            if (!this.canCall("config.set", "operator.admin")) {
+              return;
+            }
+            const target = this.context.runtimeConfig.agentEntry(agentId, { ensure: true });
+            if (target) {
+              this.context.runtimeConfig.patchForm([...target.path, "skills"], []);
             }
           },
           onModelChange: (agentId, modelId) => {
-            const index = modelId ? this.ensureAgentIndex(agentId) : this.findAgentIndex(agentId);
-            if (index < 0) {
+            if (!this.canCall("config.set", "operator.admin")) {
               return;
             }
-            const entry = this.modelEntry(index);
-            if (!modelId) {
-              this.context.runtimeConfig.removeFormValue(entry.path);
-            } else if (entry.existing && typeof entry.existing === "object") {
-              const fallbacks = (entry.existing as { fallbacks?: unknown }).fallbacks;
-              this.context.runtimeConfig.patchForm(entry.path, {
-                primary: modelId,
-                ...(Array.isArray(fallbacks) ? { fallbacks } : {}),
-              });
-            } else {
-              this.context.runtimeConfig.patchForm(entry.path, modelId);
-            }
+            stageAgentPrimaryModel(this.context.runtimeConfig, agentId, modelId);
             void refreshVisibleToolsEffectiveForCurrentSession(this);
           },
+          // Availability facts (provider keys added/removed, new models) go
+          // stale in the per-agent cache; opening the picker re-reads them,
+          // mirroring the chat composer's on-open refresh.
+          onModelCatalogRetry: () => this.ensureModelCatalog({ refresh: true }),
           onModelFallbacksChange: (agentId, fallbacks) => {
-            const normalized = normalizeStringEntries(fallbacks);
-            const resolved = resolveAgentConfig(config, agentId);
-            const primary =
-              resolveModelPrimary(resolved.entry?.model) ??
-              resolveModelPrimary(resolved.defaults?.model);
-            const effective = resolveEffectiveModelFallbacks(
-              resolved.entry?.model,
-              resolved.defaults?.model,
-            );
-            const index =
-              normalized.length > 0
-                ? primary
-                  ? this.ensureAgentIndex(agentId)
-                  : -1
-                : (effective?.length ?? 0) > 0 || this.findAgentIndex(agentId) >= 0
-                  ? this.ensureAgentIndex(agentId)
-                  : -1;
-            if (index < 0) {
-              return;
-            }
-            const entry = this.modelEntry(index);
-            const currentPrimary =
-              typeof entry.existing === "string"
-                ? entry.existing.trim()
-                : entry.existing &&
-                    typeof entry.existing === "object" &&
-                    typeof (entry.existing as { primary?: unknown }).primary === "string"
-                  ? (entry.existing as { primary: string }).primary.trim()
-                  : "";
-            if (normalized.length === 0) {
-              if (currentPrimary || primary) {
-                this.context.runtimeConfig.patchForm(entry.path, currentPrimary || primary);
-              } else {
-                this.context.runtimeConfig.removeFormValue(entry.path);
-              }
-            } else if (currentPrimary || primary) {
-              this.context.runtimeConfig.patchForm(entry.path, {
-                primary: currentPrimary || primary,
-                fallbacks: normalized,
-              });
+            if (this.canCall("config.set", "operator.admin")) {
+              stageAgentModelFallbacks(this.context.runtimeConfig, agentId, fallbacks);
             }
           },
-          onSetDefault: (agentId) => {
-            void (async () => {
-              await this.context.runtimeConfig.ensureLoaded();
-              await setDefaultAgent(this.context.runtimeConfig, agentId, () =>
-                this.context.agents.refreshList(),
-              );
-            })();
-          },
+          onSetDefault: (agentId) => this.setDefaultAgent(agentId),
         }),
-        "agents",
-        (routeId) => this.context.navigate(routeId),
-        (routeId) => this.context.preload(routeId),
       )}
     `;
   }
@@ -752,3 +1164,4 @@ class AgentsPage extends LitElement implements AgentsState {
 if (!customElements.get("openclaw-agents-page")) {
   customElements.define("openclaw-agents-page", AgentsPage);
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

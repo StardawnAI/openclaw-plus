@@ -1,7 +1,12 @@
 // Tests bounded HTTP response reads and cleanup behavior.
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { readResponseTextSnippet, readResponseWithLimit } from "./http-body.js";
+import {
+  cancelUnreadResponseBody,
+  readResponseTextPrefix,
+  readResponseTextSnippet,
+  readResponseWithLimit,
+} from "./http-body.js";
 
 function makeStream(chunks: Uint8Array[], delayMs?: number) {
   return new ReadableStream<Uint8Array>({
@@ -27,6 +32,30 @@ function makeStallingStream(initialChunks: Uint8Array[], onCancel?: (reason?: un
       }
     },
     cancel: onCancel,
+  });
+}
+
+function makeTricklingStream(intervalMs: number, onCancel?: (reason?: unknown) => void) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelled = false;
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const enqueue = () => {
+        if (cancelled) {
+          return;
+        }
+        controller.enqueue(new Uint8Array([1]));
+        timer = setTimeout(enqueue, intervalMs);
+      };
+      enqueue();
+    },
+    cancel(reason) {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+      onCancel?.(reason);
+    },
   });
 }
 
@@ -75,10 +104,112 @@ async function expectReadResponseWithLimitFailureCase(params: {
   ).rejects.toThrow(params.expectedError);
 }
 
+describe("cancelUnreadResponseBody", () => {
+  it("cancels unread bodies and ignores cancellation failures", async () => {
+    const cancel = vi.fn(() => {
+      throw new Error("already closed");
+    });
+    const response = new Response(makeStallingStream([], cancel));
+
+    await expect(cancelUnreadResponseBody(response)).resolves.toBeUndefined();
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("leaves consumed and absent bodies alone", async () => {
+    const cancel = vi.fn();
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("done"));
+          controller.close();
+        },
+        cancel,
+      }),
+    );
+    await response.text();
+
+    await cancelUnreadResponseBody(response);
+    await cancelUnreadResponseBody(undefined);
+
+    expect(cancel).not.toHaveBeenCalled();
+  });
+
+  it("does not wait for a retained response clone to finish cancellation", async () => {
+    const cancel = vi.fn();
+    const response = new Response(makeStallingStream([], cancel));
+    const capture = response.clone();
+    const cleanup = cancelUnreadResponseBody(response);
+    try {
+      const completed = await Promise.race([
+        cleanup.then(() => true),
+        new Promise<boolean>((resolve) => {
+          setImmediate(() => resolve(false));
+        }),
+      ]);
+      expect(completed).toBe(true);
+      expect(response.bodyUsed).toBe(true);
+      expect(cancel).not.toHaveBeenCalled();
+    } finally {
+      await capture.body?.cancel();
+      await cleanup;
+    }
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+});
+
 describe("readResponseWithLimit", () => {
   beforeEach(() => {
     vi.useRealTimers();
   });
+
+  it.each(["prefix", "overflow", "deadline"] as const)(
+    "settles %s reads before a retained response clone is released",
+    async (kind) => {
+      const cancel = vi.fn();
+      const response = new Response(
+        makeStallingStream([new TextEncoder().encode("abcdefgh")], cancel),
+      );
+      const capture = response.clone();
+      const expected = new Error("read rejected");
+      const operation = (
+        kind === "prefix"
+          ? readResponseTextPrefix(response, 8)
+          : readResponseWithLimit(
+              response,
+              4,
+              kind === "overflow"
+                ? { onOverflow: () => expected }
+                : {
+                    timeoutMs: () => {
+                      throw expected;
+                    },
+                  },
+            )
+      ).then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      try {
+        const result = await Promise.race([
+          operation,
+          new Promise<undefined>((resolve) => {
+            setImmediate(() => resolve(undefined));
+          }),
+        ]);
+        expect(result).toEqual(
+          kind === "prefix"
+            ? { value: { text: "abcdefgh", size: 8, truncated: true } }
+            : { error: expected },
+        );
+        expect(response.body?.locked).toBe(false);
+        expect(cancel).not.toHaveBeenCalled();
+      } finally {
+        await capture.body?.cancel();
+        await operation;
+      }
+      expect(cancel).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each([
     {
@@ -155,6 +286,26 @@ describe("readResponseWithLimit", () => {
     5_000,
   );
 
+  it("names the default idle timeout for retry classifiers", async () => {
+    vi.useFakeTimers();
+    try {
+      const result = readResponseWithLimit(
+        new Response(makeStallingStream([new Uint8Array([1, 2])])),
+        1024,
+        { chunkTimeoutMs: 50 },
+      ).catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(60);
+
+      await expect(result).resolves.toMatchObject({
+        name: "TimeoutError",
+        message: expect.stringMatching(/stalled/i),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     {
       name: "does not time out while chunks keep arriving",
@@ -213,6 +364,136 @@ describe("readResponseWithLimit", () => {
       vi.useRealTimers();
     }
   });
+
+  it("cancels a trickling body when its overall timeout expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn();
+      const response = new Response(makeTricklingStream(40, cancel));
+      const assertion = expect(
+        readResponseWithLimit(response, 1024, {
+          chunkTimeoutMs: 50,
+          timeoutMs: 100,
+          onTimeout: ({ timeoutMs }) => new Error(`custom overall ${timeoutMs}`),
+        }),
+      ).rejects.toThrow("custom overall 100");
+
+      await vi.advanceTimersByTimeAsync(110);
+      await assertion;
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(cancel.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+      expect((cancel.mock.calls[0]?.[0] as Error | undefined)?.message).toBe("custom overall 100");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names the default overall timeout for retry classifiers", async () => {
+    vi.useFakeTimers();
+    try {
+      const result = readResponseWithLimit(new Response(makeTricklingStream(40)), 1024, {
+        timeoutMs: 50,
+      }).catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(60);
+
+      await expect(result).resolves.toMatchObject({
+        name: "TimeoutError",
+        message: "Response body timed out after 50ms",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resolves a lazy overall timeout immediately before reading", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn();
+      const timeoutMs = vi.fn(() => 75);
+      const response = new Response(makeTricklingStream(40, cancel));
+      const assertion = expect(
+        readResponseWithLimit(response, 1024, {
+          timeoutMs,
+          onTimeout: ({ timeoutMs: resolved }) => new Error(`lazy overall ${resolved}`),
+        }),
+      ).rejects.toThrow("lazy overall 75");
+
+      expect(timeoutMs).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(80);
+      await assertion;
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels the body when a lazy timeout resolver reports an expired deadline", async () => {
+    const cancel = vi.fn();
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise<void>(() => {});
+        },
+        cancel,
+      }),
+    );
+
+    await expect(
+      readResponseWithLimit(response, 1024, {
+        timeoutMs: () => {
+          throw new Error("deadline expired");
+        },
+      }),
+    ).rejects.toThrow("deadline expired");
+    expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ message: "deadline expired" }));
+  });
+
+  it("cancels a getReader-less body when its overall timeout expires", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn(async (_reason?: unknown) => undefined);
+      const response = {
+        body: { cancel },
+        arrayBuffer: async () => await new Promise<ArrayBuffer>(() => {}),
+      } as unknown as Response;
+      const assertion = expect(
+        readResponseWithLimit(response, 1024, {
+          timeoutMs: 50,
+          onTimeout: ({ timeoutMs }) => new Error(`fallback overall ${timeoutMs}`),
+        }),
+      ).rejects.toThrow("fallback overall 50");
+
+      await vi.advanceTimersByTimeAsync(50);
+      await assertion;
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(cancel.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the overall timeout after a successful read", async () => {
+    vi.useFakeTimers();
+    try {
+      const cancel = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2]));
+          controller.close();
+        },
+        cancel,
+      });
+
+      await expect(
+        readResponseWithLimit(new Response(body), 100, { timeoutMs: 50 }),
+      ).resolves.toEqual(Buffer.from([1, 2]));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(cancel).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("readResponseTextSnippet", () => {
@@ -236,6 +517,12 @@ describe("readResponseTextSnippet", () => {
       expected: "1234567…",
     },
     {
+      name: "drops partial UTF-8 characters when snippets truncate at a byte boundary",
+      response: new Response(makeStream([new TextEncoder().encode("ab😀cd")])),
+      options: { maxBytes: 3, maxChars: 50 },
+      expected: "ab…",
+    },
+    {
       name: "keeps character-limited snippets UTF-16 well-formed",
       response: new Response(makeStream([new TextEncoder().encode("ab🚀tail")])),
       options: { maxBytes: 64, maxChars: 3 },
@@ -251,6 +538,18 @@ describe("readResponseTextSnippet", () => {
         maxBytes: Number.NaN,
       }),
     ).rejects.toThrow(/maxBytes must be a non-negative finite number/);
+  });
+
+  it("cancels immediately when a diagnostic prefix fills the byte budget", async () => {
+    const cancel = vi.fn();
+    const response = new Response(makeStallingStream([new TextEncoder().encode("exact")], cancel));
+
+    await expect(readResponseTextPrefix(response, 5)).resolves.toEqual({
+      text: "exact",
+      size: 5,
+      truncated: true,
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it.each([

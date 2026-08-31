@@ -6,7 +6,11 @@ import {
 } from "openclaw/plugin-sdk/memory-host-markdown";
 import { readFiniteNumberParam } from "openclaw/plugin-sdk/param-readers";
 import { FsSafeError, root as fsRoot } from "openclaw/plugin-sdk/security-runtime";
-import { normalizeStringEntries, uniqueStrings } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  asNonArrayRecord,
+  normalizeStringEntries,
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { compileMemoryWikiVault, type CompileMemoryWikiResult } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import {
@@ -18,6 +22,7 @@ import {
   normalizeWikiClaims,
   type WikiClaim,
 } from "./markdown.js";
+import { withMemoryWikiVaultMutation } from "./mutation-coordinator.js";
 import {
   readQueryableWikiPages,
   resolveQueryableWikiPageByLookup,
@@ -53,9 +58,7 @@ type UpdateMetadataMemoryWikiMutation = {
   status?: string;
 };
 
-export type ApplyMemoryWikiMutation =
-  | CreateSynthesisMemoryWikiMutation
-  | UpdateMetadataMemoryWikiMutation;
+type ApplyMemoryWikiMutation = CreateSynthesisMemoryWikiMutation | UpdateMetadataMemoryWikiMutation;
 
 type MemoryWikiMutationInputOp = ApplyMemoryWikiMutation["op"] | "synthesis" | "metadata";
 
@@ -101,7 +104,7 @@ function normalizeMemoryWikiMutationOp(
 }
 
 export function normalizeMemoryWikiMutationInput(rawParams: unknown): ApplyMemoryWikiMutation {
-  const params = rawParams as {
+  const params = asNonArrayRecord(rawParams) as {
     op: MemoryWikiMutationInputOp;
     title?: string;
     body?: string;
@@ -359,11 +362,16 @@ async function applyUpdateMetadataMutation(params: {
   };
 }
 
-export async function applyMemoryWikiMutation(params: {
+async function applyMemoryWikiMutationUnlocked(params: {
   config: ResolvedMemoryWikiConfig;
   mutation: ApplyMemoryWikiMutation;
+  signal?: AbortSignal;
 }): Promise<ApplyMemoryWikiMutationResult> {
-  await initializeMemoryWikiVault(params.config);
+  await initializeMemoryWikiVault(
+    params.config,
+    params.signal ? { signal: params.signal } : undefined,
+  );
+  params.signal?.throwIfAborted();
   const result =
     params.mutation.op === "create_synthesis"
       ? await applyCreateSynthesisMutation({
@@ -374,7 +382,11 @@ export async function applyMemoryWikiMutation(params: {
           config: params.config,
           mutation: params.mutation,
         });
-  const compile = await compileMemoryWikiVault(params.config);
+  params.signal?.throwIfAborted();
+  const compile = await compileMemoryWikiVault(
+    params.config,
+    params.signal ? { signal: params.signal } : undefined,
+  );
   return {
     changed: result.changed,
     operation: params.mutation.op,
@@ -382,4 +394,14 @@ export async function applyMemoryWikiMutation(params: {
     ...(result.pageId ? { pageId: result.pageId } : {}),
     compile,
   };
+}
+
+export async function applyMemoryWikiMutation(params: {
+  config: ResolvedMemoryWikiConfig;
+  mutation: ApplyMemoryWikiMutation;
+  signal?: AbortSignal;
+}): Promise<ApplyMemoryWikiMutationResult> {
+  return await withMemoryWikiVaultMutation(params.config.vault.path, () =>
+    applyMemoryWikiMutationUnlocked(params),
+  );
 }

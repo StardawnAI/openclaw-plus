@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Reproduces the multi-node-install update bug.
+# Guards the multi-node-install update fix.
 #
 # Sets up two independent Node installations inside a Docker container, installs
 # OpenClaw under node-A, registers the gateway service pointing at node-A, then
 # switches PATH so node-B comes first and runs `openclaw update`. Verifies that:
 #
-# 1. The update targets the wrong install root (node-B npm prefix) or produces
-#    a gateway service definition pointing at node-B while the package lives
-#    under node-A.
-# 2. The gateway fails to start or runs a stale/missing entrypoint.
+# 1. The update stays on node-A's package root and service runtime.
+# 2. The gateway restarts from the preserved entrypoint and becomes healthy.
 #
 # Usage:
 #   ./scripts/e2e/multi-node-update-docker.sh
@@ -124,142 +122,14 @@ ls -la "$PACKAGE_ROOT_A/package.json" 2>/dev/null || echo "WARNING: package.json
 echo ""
 echo "── Step 3: Install the systemd service (gateway) using node-A ──"
 
-# Create a systemctl shim since we are in Docker (no real systemd).
-SHIM_DIR="/usr/local/bin"
+# Reuse the service fixture that models manager-loaded definitions and restarts.
 GATEWAY_UNIT_PATH="/root/.config/systemd/user/openclaw-gateway.service"
-SYSTEMCTL_LOG="$ARTIFACTS/systemctl-shim.log"
 GATEWAY_DAEMON_LOG="$ARTIFACTS/gateway-daemon.log"
-GATEWAY_PID_FILE="$ARTIFACTS/gateway.pid"
-: >"$SYSTEMCTL_LOG"
-
-cat >"$SHIM_DIR/systemctl" <<SHIMEOF
-#!/usr/bin/env bash
-set -euo pipefail
-printf "%s %s\n" "\$(date -u +%H:%M:%S)" "\$*" >>"$SYSTEMCTL_LOG"
-
-filtered=()
-for ((i = 1; i <= \$#; i++)); do
-  arg="\${!i}"
-  case "\$arg" in
-    --user|--quiet|--no-page|--now|--value) ;;
-    --property)
-      i=\$((i + 1))
-      ;;
-    --property=*) ;;
-    *) filtered+=("\$arg") ;;
-  esac
-done
-command="\${filtered[0]:-status}"
-
-is_running() {
-  [ -s "$GATEWAY_PID_FILE" ] || return 1
-  local pid
-  pid="\$(cat "$GATEWAY_PID_FILE" 2>/dev/null || true)"
-  [ -n "\$pid" ] || return 1
-  kill -0 "\$pid" >/dev/null 2>&1
-}
-
-stop_gateway() {
-  [ -s "$GATEWAY_PID_FILE" ] || return 0
-  local pid
-  pid="\$(cat "$GATEWAY_PID_FILE" 2>/dev/null || true)"
-  if [[ "\$pid" =~ ^[0-9]+$ ]] && [ "\$pid" -gt 1 ] && kill -0 "\$pid" >/dev/null 2>&1; then
-    kill "\$pid" >/dev/null 2>&1 || true
-    for _ in \$(seq 1 100); do
-      kill -0 "\$pid" >/dev/null 2>&1 || break
-      sleep 0.1
-    done
-    kill -9 "\$pid" >/dev/null 2>&1 || true
-  fi
-  rm -f "$GATEWAY_PID_FILE"
-}
-
-load_unit_environment() {
-  local unit="\$1"
-  while IFS= read -r line; do
-    case "\$line" in
-      EnvironmentFile=*)
-        local spec="\${line#EnvironmentFile=}"
-        for token in \$spec; do
-          local file="\${token#-}"
-          [ -f "\$file" ] || continue
-          set -a
-          # shellcheck disable=SC1090
-          . "\$file"
-          set +a
-        done
-        ;;
-      Environment=*)
-        local assignment="\${line#Environment=}"
-        assignment="\${assignment#\"}"
-        assignment="\${assignment%\"}"
-        export "\$assignment"
-        ;;
-    esac
-  done <"\$unit"
-}
-
-start_gateway() {
-  local unit="$GATEWAY_UNIT_PATH"
-  local exec_start
-  if [ ! -f "\$unit" ]; then
-    echo "systemctl shim: unit not found: \$unit" >&2
-    return 1
-  fi
-  exec_start="\$(sed -n 's/^ExecStart=//p' "\$unit" | tail -n 1)"
-  if [ -z "\$exec_start" ]; then
-    echo "systemctl shim: no ExecStart in \$unit" >&2
-    return 1
-  fi
-  (
-    load_unit_environment "\$unit"
-    export OPENCLAW_NO_RESPAWN=1
-    echo "systemctl shim: starting: \$exec_start"
-    nohup bash -lc "exec \$exec_start" >>"$GATEWAY_DAEMON_LOG" 2>&1 &
-    printf '%s\n' "\$!" >"$GATEWAY_PID_FILE"
-  )
-}
-
-case "\$command" in
-  daemon-reload)
-    echo "daemon-reload (shim: no-op)"
-    ;;
-  enable)
-    echo "enable (shim: no-op)"
-    ;;
-  is-enabled)
-    echo "enabled"
-    ;;
-  restart|start)
-    stop_gateway
-    start_gateway
-    ;;
-  stop)
-    stop_gateway
-    ;;
-  is-active)
-    if is_running; then
-      echo "active"
-    else
-      echo "inactive"
-      exit 3
-    fi
-    ;;
-  show)
-    if is_running; then
-      printf 'ActiveState=active\nSubState=running\nMainPID=%s\nExecMainStatus=0\nExecMainCode=0\n' "\$(cat "$GATEWAY_PID_FILE")"
-    else
-      printf 'ActiveState=inactive\nSubState=dead\nMainPID=0\nExecMainStatus=0\nExecMainCode=0\n'
-    fi
-    ;;
-  *)
-    echo "systemctl shim: unsupported command: \$*" >&2
-    exit 1
-    ;;
-esac
-SHIMEOF
-chmod +x "$SHIM_DIR/systemctl"
-echo "systemctl shim installed."
+export OPENCLAW_UPGRADE_SURVIVOR_SYSTEMCTL_SHIM_LOG="$ARTIFACTS/systemctl-shim.log"
+export OPENCLAW_UPGRADE_SURVIVOR_SYSTEMCTL_SHIM_DAEMON_LOG="$GATEWAY_DAEMON_LOG"
+export OPENCLAW_UPGRADE_SURVIVOR_SYSTEMCTL_SHIM_PID_FILE="$ARTIFACTS/gateway.pid"
+source scripts/e2e/lib/upgrade-survivor/update-restart-auth.sh
+install_update_restart_systemctl_shim
 
 # Now install the gateway service using node-A.
 echo "Installing gateway service..."
@@ -268,6 +138,27 @@ if ! openclaw gateway install --json >"$ARTIFACTS/gateway-install.json" 2>"$ARTI
   echo "FAIL: gateway install failed before update"
   cat "$ARTIFACTS/gateway-install.json" 2>/dev/null || true
   cat "$ARTIFACTS/gateway-install.err" 2>/dev/null || true
+  exit 1
+fi
+
+if ! openclaw gateway status --json \
+  >"$ARTIFACTS/gateway-status-before-update.json" \
+  2>"$ARTIFACTS/gateway-status-before-update.err"; then
+  echo "FAIL: gateway status failed before update"
+  cat "$ARTIFACTS/gateway-status-before-update.err" 2>/dev/null || true
+  exit 1
+fi
+if ! GATEWAY_STATUS_FILE="$ARTIFACTS/gateway-status-before-update.json" node --input-type=module <<"NODE"
+import fs from "node:fs";
+const status = JSON.parse(fs.readFileSync(process.env.GATEWAY_STATUS_FILE, "utf8"));
+if (status.service?.runtime?.status !== "running") {
+  console.error(`expected running gateway service before update, got \${status.service?.runtime?.status ?? "missing"}`);
+  process.exit(1);
+}
+NODE
+then
+  echo "FAIL: gateway service was not running before update"
+  cat "$ARTIFACTS/gateway-status-before-update.json" 2>/dev/null || true
   exit 1
 fi
 
@@ -385,14 +276,11 @@ else
 fi
 
 # Check 3: Does the entrypoint in the unit file actually exist?
-if [ -f "$GATEWAY_UNIT_PATH" ]; then
-  EXEC_START_AFTER="$(grep "^ExecStart=" "$GATEWAY_UNIT_PATH" | head -1 | sed "s/^ExecStart=//")"
-  ENTRYPOINT_PATH="$(echo "$EXEC_START_AFTER" | awk "{print \$2}")"
-  if [ -n "$ENTRYPOINT_PATH" ] && [ ! -f "$ENTRYPOINT_PATH" ]; then
-    echo "BUG: Entrypoint in service unit does not exist: $ENTRYPOINT_PATH"
-  elif [ -n "$ENTRYPOINT_PATH" ]; then
-    echo "OK: Entrypoint exists: $ENTRYPOINT_PATH"
-  fi
+ENTRYPOINT_FAILED=0
+if ENTRYPOINT_PATH="$(node scripts/e2e/lib/doctor-install-switch/assert-exec-start.mjs entrypoint-exists "$GATEWAY_UNIT_PATH")"; then
+  echo "OK: Entrypoint exists: $ENTRYPOINT_PATH"
+else
+  ENTRYPOINT_FAILED=1
 fi
 
 # Check 4: Were there any warnings about split install in the update output?
@@ -411,7 +299,7 @@ echo "── Step 9: Try starting the gateway with the post-update unit ──"
 
 GATEWAY_START_FAILED=0
 if [ -f "$GATEWAY_UNIT_PATH" ]; then
-  systemctl restart 2>&1 || true
+  systemctl --user restart openclaw-gateway.service 2>&1 || true
   if PORT=18789 node <<NODE
 const url = "http://127.0.0.1:" + process.env.PORT + "/healthz";
 const deadline = Date.now() + 30000;
@@ -419,7 +307,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let last = "timeout";
 while (Date.now() < deadline) {
   try {
-    const response = await fetch(url);
+    // Keep each request inside the outer probe budget so a stalled fetch cannot outlive it.
+    const remainingMs = Math.max(1, deadline - Date.now());
+    const response = await fetch(url, { signal: AbortSignal.timeout(remainingMs) });
     if (response.ok) {
       process.exit(0);
     }
@@ -427,7 +317,11 @@ while (Date.now() < deadline) {
   } catch (error) {
     last = error instanceof Error ? error.message : String(error);
   }
-  await sleep(500);
+  const remainingDelayMs = deadline - Date.now();
+  if (remainingDelayMs <= 0) {
+    break;
+  }
+  await sleep(Math.min(500, remainingDelayMs));
 }
 console.error(last);
 process.exit(1);
@@ -440,7 +334,7 @@ NODE
     GATEWAY_HEALTH_FAILED=1
     cat "$GATEWAY_DAEMON_LOG" 2>/dev/null | tail -20 || true
   fi
-  systemctl stop 2>&1 || true
+  systemctl --user stop openclaw-gateway.service 2>&1 || true
 fi
 
 echo ""
@@ -458,11 +352,8 @@ fi
 if [ -f "$NPM_PREFIX_B/lib/node_modules/openclaw/package.json" ]; then
   EXIT_CODE=1
 fi
-if [ -f "$GATEWAY_UNIT_PATH" ]; then
-  ENTRYPOINT_PATH_CHECK="$(grep "^ExecStart=" "$GATEWAY_UNIT_PATH" | head -1 | sed "s/^ExecStart=//" | awk "{print \$2}")" || true
-  if [ -n "$ENTRYPOINT_PATH_CHECK" ] && [ ! -f "$ENTRYPOINT_PATH_CHECK" ]; then
-    EXIT_CODE=1
-  fi
+if [ "$ENTRYPOINT_FAILED" -ne 0 ]; then
+  EXIT_CODE=1
 fi
 if [ "$UPDATE_FAILED" -ne 0 ]; then
   EXIT_CODE=1

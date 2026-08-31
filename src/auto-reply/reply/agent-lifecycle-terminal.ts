@@ -49,7 +49,9 @@ export function createAgentLifecycleTerminalBackstop(params: {
   };
 }): AgentLifecycleTerminalBackstop {
   let terminalEmitted = false;
-  let startedAt = params.startedAt;
+  // Preparation can fail before a lifecycle start. Capture its real boundary
+  // without signaling readiness; an observed model start replaces it below.
+  let startedAt = params.startedAt ?? Date.now();
   let deferredError: string | undefined;
   const deferredTerminalMetadata: Record<string, unknown> = {};
 
@@ -58,8 +60,16 @@ export function createAgentLifecycleTerminalBackstop(params: {
       return;
     }
     const phase = readStringValue(evt.data.phase);
-    if (phase === "start" && typeof evt.data.startedAt === "number") {
-      startedAt = evt.data.startedAt;
+    if (phase === "start") {
+      if (typeof evt.data.startedAt === "number") {
+        startedAt = evt.data.startedAt;
+      }
+      // A same-candidate retry replaces deferred terminal state from the
+      // preceding attempt; retaining it would abort a recovered run.
+      deferredError = undefined;
+      for (const key of DEFERRED_TERMINAL_METADATA_KEYS) {
+        delete deferredTerminalMetadata[key];
+      }
     }
     if (phase === "finishing") {
       deferredError = readStringValue(evt.data.error) ?? deferredError;
@@ -83,7 +93,7 @@ export function createAgentLifecycleTerminalBackstop(params: {
       ...deferredTerminalMetadata,
       phase: restartAbort ? "end" : phase,
       endedAt: Date.now(),
-      ...(startedAt !== undefined ? { startedAt } : {}),
+      startedAt,
     };
     if (restartAbort) {
       data.aborted = true;

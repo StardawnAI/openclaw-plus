@@ -1,28 +1,70 @@
 // Verifies models.json planning applies config env vars and discovery scope.
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { createConfigRuntimeEnv } from "../config/env-vars.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { withEnvAsync } from "../test-utils/env.js";
-import { __testing as externalAuthTesting } from "./auth-profiles/external-auth.js";
+import { testing as externalAuthTesting } from "./auth-profiles/external-auth.test-support.js";
 import {
   clearRuntimeAuthProfileStoreSnapshots,
   replaceRuntimeAuthProfileStoreSnapshots,
-} from "./auth-profiles/store.js";
+} from "./auth-profiles/runtime-snapshots.js";
 import { unsetEnv, withTempEnv } from "./models-config.e2e-harness.js";
 import {
   planOpenClawModelsJsonWithDeps,
   resolveProvidersForModelsJsonWithDeps,
-} from "./models-config.plan.js";
+} from "./models-config.plan.test-support.js";
 import type { ProviderConfig } from "./models-config.providers.secrets.js";
 import { encodePluginModelCatalogRelativePath } from "./plugin-model-catalog.js";
+
+const providerRuntimeMocks = vi.hoisted(() => ({
+  normalizeProviderConfigWithPlugin: vi.fn<
+    typeof import("../plugins/provider-runtime.js").normalizeProviderConfigWithPlugin
+  >(() => undefined),
+  resolveProviderConfigApiKeyWithPlugin: vi.fn<
+    typeof import("../plugins/provider-runtime.js").resolveProviderConfigApiKeyWithPlugin
+  >(() => undefined),
+}));
 
 vi.mock("./provider-auth-aliases.js", () => ({
   resolveProviderAuthAliasMap: () => Object.create(null) as Record<string, string>,
   resolveProviderIdForAuth: (provider: string) => provider.trim().toLowerCase(),
 }));
 
+// These planner tests exercise no plugin-owned auth policy. Keep their exact
+// provider markers local instead of loading the bundled plugin/runtime catalog.
+vi.mock("../plugins/provider-runtime.js", () => ({
+  normalizeProviderConfigWithPlugin: providerRuntimeMocks.normalizeProviderConfigWithPlugin,
+  resolveProviderConfigApiKeyWithPlugin: providerRuntimeMocks.resolveProviderConfigApiKeyWithPlugin,
+  resolveExternalAuthProfilesWithPlugins: () => [],
+  resolveProviderSyntheticAuthWithPlugin: () => undefined,
+}));
+
+vi.mock("./model-auth-env-vars.js", () => ({
+  listKnownProviderEnvApiKeyNames: () => [
+    "GOOGLE_CLOUD_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+  ],
+  resolveProviderEnvAuthLookupMaps: () => ({
+    aliasMap: {},
+    envCandidateMap: {
+      "google-vertex": ["GOOGLE_CLOUD_API_KEY"],
+      openai: ["OPENAI_API_KEY"],
+      openrouter: ["OPENROUTER_API_KEY"],
+    },
+    authEvidenceMap: {},
+  }),
+}));
+
 const TEST_ENV_VAR = "OPENCLAW_MODELS_CONFIG_TEST_ENV";
+
+afterEach(() => {
+  providerRuntimeMocks.normalizeProviderConfigWithPlugin.mockReset();
+  providerRuntimeMocks.normalizeProviderConfigWithPlugin.mockReturnValue(undefined);
+  providerRuntimeMocks.resolveProviderConfigApiKeyWithPlugin.mockReset();
+  providerRuntimeMocks.resolveProviderConfigApiKeyWithPlugin.mockReturnValue(undefined);
+});
 
 function createImplicitOpenRouterProvider(): ProviderConfig {
   return {
@@ -131,6 +173,7 @@ async function resolveProvidersAndCaptureDiscoveryEnv(cfg: OpenClawConfig) {
 
 let unauthenticatedProviderWritePlan: Awaited<ReturnType<typeof planOpenClawModelsJsonWithDeps>>;
 let unauthenticatedProviderParsed: { providers?: Record<string, unknown> };
+let googleVertexProfileCatalogPlan: Awaited<ReturnType<typeof planGoogleVertexProfileCatalog>>;
 
 async function planGoogleVertexProfileCatalog() {
   const agentDir = "/tmp/openclaw-google-vertex-models-profile";
@@ -213,7 +256,9 @@ beforeAll(async () => {
   unauthenticatedProviderParsed = JSON.parse(unauthenticatedProviderWritePlan.contents) as {
     providers?: Record<string, unknown>;
   };
-  await planGoogleVertexProfileCatalog();
+  // Retain this expensive plan so the assertion test does not repeat the same
+  // auth-profile and catalog planning pass.
+  googleVertexProfileCatalogPlan = await planGoogleVertexProfileCatalog();
 });
 
 describe("models-config", () => {
@@ -362,6 +407,64 @@ describe("models-config", () => {
 
     expect(observedSnapshot).toBe(pluginMetadataSnapshot);
   });
+
+  it.each([
+    { label: "full", pluginIds: undefined, expectedRegistry: true },
+    { label: "scoped", pluginIds: ["owner"], expectedRegistry: false },
+  ])(
+    "threads provider policy metadata only from a $label plugin snapshot",
+    async ({ pluginIds, expectedRegistry }) => {
+      const manifestRegistry = { plugins: [], diagnostics: [] };
+      const pluginMetadataSnapshot = {
+        index: { plugins: [] },
+        manifestRegistry,
+        owners: {
+          providers: new Map(),
+          modelCatalogProviders: new Map(),
+          setupProviders: new Map(),
+        },
+        ...(pluginIds ? { pluginIds } : {}),
+      } as unknown as Pick<
+        PluginMetadataSnapshot,
+        "index" | "manifestRegistry" | "owners" | "pluginIds"
+      >;
+      providerRuntimeMocks.resolveProviderConfigApiKeyWithPlugin.mockReturnValue(
+        "POLICY_ALIAS_API_KEY",
+      );
+
+      await planOpenClawModelsJsonWithDeps(
+        {
+          cfg: { models: { providers: {} } },
+          agentDir: "/tmp/openclaw-models-config-policy-registry-test",
+          env: {},
+          existingRaw: "",
+          existingParsed: null,
+          pluginMetadataSnapshot,
+        },
+        {
+          resolveImplicitProviders: async () => ({
+            "policy-alias": createImplicitOpenAiProvider({
+              baseUrl: "https://policy.example/v1",
+              apiKey: undefined,
+            }),
+          }),
+        },
+      );
+
+      const normalizeParams =
+        providerRuntimeMocks.normalizeProviderConfigWithPlugin.mock.calls.find(
+          ([params]) => params.provider === "policy-alias",
+        )?.[0];
+      const apiKeyParams =
+        providerRuntimeMocks.resolveProviderConfigApiKeyWithPlugin.mock.calls.find(
+          ([params]) => params.provider === "policy-alias",
+        )?.[0];
+      expect(normalizeParams?.manifestRegistry).toBe(
+        expectedRegistry ? manifestRegistry : undefined,
+      );
+      expect(apiKeyParams?.manifestRegistry).toBe(expectedRegistry ? manifestRegistry : undefined);
+    },
+  );
 
   it("does not write unauthenticated model providers that would invalidate models.json", async () => {
     expect(unauthenticatedProviderWritePlan.action).toBe("write");
@@ -525,8 +628,8 @@ describe("models-config", () => {
     ]);
   });
 
-  it("keeps google-vertex static catalog rows when an auth profile supplies the API key", async () => {
-    const plan = await planGoogleVertexProfileCatalog();
+  it("keeps google-vertex static catalog rows when an auth profile supplies the API key", () => {
+    const plan = googleVertexProfileCatalogPlan;
 
     expect(plan.action).toBe("write");
     if (plan.action !== "write") {

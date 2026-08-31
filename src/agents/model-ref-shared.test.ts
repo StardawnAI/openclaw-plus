@@ -1,20 +1,18 @@
 // Documents provider/model id normalization from built-ins and plugin manifests.
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  clearCurrentPluginMetadataSnapshot,
-  setCurrentPluginMetadataSnapshot,
-} from "../plugins/current-plugin-metadata-snapshot.js";
+import { setCurrentPluginMetadataSnapshot } from "../plugins/current-plugin-metadata.test-support.js";
+import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 import {
   normalizeConfiguredProviderCatalogModelId,
   normalizeStaticProviderModelId,
 } from "./model-ref-shared.js";
 
 beforeEach(() => {
-  clearCurrentPluginMetadataSnapshot();
+  clearPluginMetadataLifecycleCaches();
 });
 
 afterEach(() => {
-  clearCurrentPluginMetadataSnapshot();
+  clearPluginMetadataLifecycleCaches();
 });
 
 describe("normalizeStaticProviderModelId", () => {
@@ -74,12 +72,12 @@ describe("normalizeStaticProviderModelId", () => {
     ).toBe("openrouter/auto");
   });
 
-  it("normalizes retired XAI beta ids without manifest lookup", () => {
+  it("preserves provider-owned XAI beta aliases without manifest lookup", () => {
     expect(
       normalizeStaticProviderModelId("xai", "grok-4.20-experimental-beta-0304-reasoning", {
         allowManifestNormalization: false,
       }),
-    ).toBe("grok-4.20-beta-latest-reasoning");
+    ).toBe("grok-4.20-experimental-beta-0304-reasoning");
   });
 
   it("normalizes the shipped retired Together default without manifest lookup", () => {

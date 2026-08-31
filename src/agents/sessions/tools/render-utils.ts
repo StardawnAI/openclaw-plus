@@ -5,7 +5,7 @@
  */
 import * as os from "node:os";
 import { getCapabilities, getImageDimensions, imageFallback } from "@earendil-works/pi-tui";
-import { stripAnsiSequences } from "../../../../packages/terminal-core/src/ansi.js";
+import { shortenPathWithHome } from "../../../infra/home-display.js";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { Theme } from "../../modes/interactive/theme/theme.js";
 import { sanitizeBinaryOutput } from "../../shell-utils.js";
@@ -17,14 +17,7 @@ export function shortenPath(path: unknown): string {
   if (typeof path !== "string") {
     return "";
   }
-  const home = os.homedir();
-  if (path === home) {
-    return "~";
-  }
-  if (path.startsWith(`${home}/`) || path.startsWith(`${home}\\`)) {
-    return `~${path.slice(home.length)}`;
-  }
-  return path;
+  return shortenPathWithHome(path, { home: os.homedir(), prefix: "~" });
 }
 
 /** Returns a display string for string/nullish values, or null for unsupported values. */
@@ -63,7 +56,7 @@ export function getTextOutput(
   const imageBlocks = result.content.filter((c) => c.type === "image");
 
   let output = textBlocks
-    .map((c) => sanitizeBinaryOutput(stripAnsiSequences(c.text || "")).replace(/\r/g, ""))
+    .map((c) => sanitizeBinaryOutput(c.text || "", { ansiMode: "compat" }).replace(/\r/g, ""))
     .join("\n");
 
   const caps = getCapabilities();

@@ -6,9 +6,11 @@ import type {
   RealtimeVoiceAudioClearReason,
   RealtimeVoiceAudioFormat,
   RealtimeVoiceBargeInOptions,
+  RealtimeVoiceCloseOptions,
   RealtimeVoiceCloseReason,
   RealtimeVoiceBridgeEvent,
   RealtimeVoiceProviderConfig,
+  RealtimeVoiceResponseOutcome,
   RealtimeVoiceRole,
   RealtimeVoiceTool,
   RealtimeVoiceToolCallEvent,
@@ -35,14 +37,18 @@ export type RealtimeVoiceMarkStrategy = "transport" | "ack-immediately" | "ignor
  */
 export type RealtimeVoiceBridgeSession = {
   bridge: RealtimeVoiceBridge;
-  acknowledgeMark(): void;
-  close(): void;
+  acknowledgeMark(markName?: string): void;
+  close(options?: RealtimeVoiceCloseOptions): void;
   connect(): Promise<void>;
   sendAudio(audio: Buffer): void;
   sendUserMessage(text: string): void;
   handleBargeIn(options?: RealtimeVoiceBargeInOptions): void;
   setMediaTimestamp(ts: number): void;
-  submitToolResult(callId: string, result: unknown, options?: RealtimeVoiceToolResultOptions): void;
+  submitToolResult(
+    callId: string,
+    result: unknown,
+    options?: RealtimeVoiceToolResultOptions,
+  ): void | Promise<void>;
   triggerGreeting(instructions?: string): void;
 };
 
@@ -52,10 +58,13 @@ export type RealtimeVoiceBridgeSession = {
 export type RealtimeVoiceBridgeSessionParams = {
   provider: RealtimeVoiceProviderPlugin;
   cfg?: OpenClawConfig;
+  /** Host-selected agent scope for provider auth and agent-owned bridge state. */
+  agentId?: string;
   providerConfig: RealtimeVoiceProviderConfig;
   audioFormat?: RealtimeVoiceAudioFormat;
   audioSink: RealtimeVoiceAudioSink;
   instructions?: string;
+  language?: string;
   initialGreetingInstructions?: string;
   autoRespondToAudio?: boolean;
   interruptResponseOnInputAudio?: boolean;
@@ -64,11 +73,17 @@ export type RealtimeVoiceBridgeSessionParams = {
   tools?: RealtimeVoiceTool[];
   onTranscript?: (role: RealtimeVoiceRole, text: string, isFinal: boolean) => void;
   onEvent?: (event: RealtimeVoiceBridgeEvent) => void;
-  onToolCall?: (event: RealtimeVoiceToolCallEvent, session: RealtimeVoiceBridgeSession) => void;
+  onResponseDone?: (outcome: RealtimeVoiceResponseOutcome) => void;
+  onToolCall?: (
+    event: RealtimeVoiceToolCallEvent,
+    session: RealtimeVoiceBridgeSession,
+  ) => void | Promise<void>;
   onReady?: (session: RealtimeVoiceBridgeSession) => void;
   onError?: (error: Error) => void;
   onClose?: (reason: RealtimeVoiceCloseReason) => void;
 };
+
+type RealtimeVoiceSessionPhase = "admitting" | "provider-terminal" | "disposed";
 
 /**
  * Creates a realtime voice bridge session and wires provider events to the configured audio sink.
@@ -77,6 +92,12 @@ export function createRealtimeVoiceBridgeSession(
   params: RealtimeVoiceBridgeSessionParams,
 ): RealtimeVoiceBridgeSession {
   const bridgeRef: { current?: RealtimeVoiceBridge } = {};
+  // Local disposal owns provider cleanup. Only a terminal callback fired before bridge
+  // adoption may reopen; adopted bridges own reconnects and stale-event fencing internally.
+  let phase: RealtimeVoiceSessionPhase = "admitting";
+  let terminalBeforeBridgeAdoption = false;
+  let closeReported = false;
+  const isAdmitting = () => phase === "admitting";
   const requireBridge = () => {
     if (!bridgeRef.current) {
       throw new Error("Realtime voice bridge is not ready");
@@ -89,23 +110,68 @@ export function createRealtimeVoiceBridgeSession(
     get bridge() {
       return requireBridge();
     },
-    acknowledgeMark: () => requireBridge().acknowledgeMark(),
-    close: () => requireBridge().close(),
-    connect: () => requireBridge().connect(),
-    sendAudio: (audio) => requireBridge().sendAudio(audio),
+    acknowledgeMark: (markName) => requireBridge().acknowledgeMark(markName),
+    close: (options) => {
+      if (phase === "disposed") {
+        return;
+      }
+      const bridge = requireBridge();
+      phase = "disposed";
+      bridge.close(options);
+    },
+    connect: () => {
+      if (phase === "disposed") {
+        return Promise.reject(new Error("Realtime voice session is closed"));
+      }
+      if (phase === "provider-terminal") {
+        if (!terminalBeforeBridgeAdoption) {
+          return Promise.reject(new Error("Realtime voice connection is closed"));
+        }
+        terminalBeforeBridgeAdoption = false;
+        phase = "admitting";
+        closeReported = false;
+      }
+      return requireBridge().connect();
+    },
+    sendAudio: (audio) => {
+      if (isAdmitting()) {
+        requireBridge().sendAudio(audio);
+      }
+    },
     sendUserMessage: (text) => requireBridge().sendUserMessage?.(text),
     handleBargeIn: (options) => requireBridge().handleBargeIn?.(options),
     setMediaTimestamp: (ts) => requireBridge().setMediaTimestamp(ts),
-    submitToolResult: (callId, result, options) =>
-      requireBridge().submitToolResult(callId, result, options),
+    submitToolResult: (callId, result, options) => {
+      const bridge = requireBridge();
+      if (options?.suppressResponse && bridge.supportsToolResultSuppression === false) {
+        throw new Error("Realtime provider does not support suppressed tool results");
+      }
+      return bridge.submitToolResult(callId, result, options);
+    },
     triggerGreeting: (instructions) => requireBridge().triggerGreeting?.(instructions),
   };
-  const canSendAudio = () => params.audioSink.isOpen?.() ?? true;
+  // Session inactivity is the shared admission boundary for both audio directions.
+  // Provider and transport callbacks may still race after close, but cannot retain new audio.
+  const canSendAudio = () => isAdmitting() && (params.audioSink.isOpen?.() ?? true);
+  const reportCallbackError = (error: unknown) => {
+    // Async tool handlers can settle after the provider closes. Once inactive, no
+    // callback may report stale failures into the next session lifecycle.
+    if (!isAdmitting()) {
+      return;
+    }
+    try {
+      params.onError?.(error instanceof Error ? error : new Error(String(error)));
+    } catch {
+      // An error callback is the terminal boundary for provider callback failures.
+    }
+  };
   const bridge = params.provider.createBridge({
     cfg: params.cfg,
+    agentId: params.agentId,
     providerConfig: params.providerConfig,
     audioFormat: params.audioFormat,
     instructions: params.instructions,
+    language: params.language,
     autoRespondToAudio: params.autoRespondToAudio,
     interruptResponseOnInputAudio: params.interruptResponseOnInputAudio,
     tools: params.tools,
@@ -126,7 +192,7 @@ export function createRealtimeVoiceBridgeSession(
         return;
       }
       if (params.markStrategy === "ack-immediately") {
-        bridgeRef.current?.acknowledgeMark();
+        bridgeRef.current?.acknowledgeMark(markName);
         return;
       }
       if (params.markStrategy === undefined || params.markStrategy === "transport") {
@@ -135,14 +201,22 @@ export function createRealtimeVoiceBridgeSession(
     },
     onTranscript: params.onTranscript,
     onEvent: params.onEvent,
+    onResponseDone: params.onResponseDone,
     onToolCall: (event) => {
-      if (!bridgeRef.current) {
+      if (!bridgeRef.current || !isAdmitting()) {
         return;
       }
-      params.onToolCall?.(event, session);
+      try {
+        const pending = params.onToolCall?.(event, session);
+        if (pending) {
+          void pending.catch(reportCallbackError);
+        }
+      } catch (error) {
+        reportCallbackError(error);
+      }
     },
     onReady: () => {
-      if (!bridgeRef.current) {
+      if (!bridgeRef.current || !isAdmitting()) {
         return;
       }
       if (params.triggerGreetingOnReady) {
@@ -151,7 +225,19 @@ export function createRealtimeVoiceBridgeSession(
       params.onReady?.(session);
     },
     onError: params.onError,
-    onClose: params.onClose,
+    onClose: (reason) => {
+      if (!bridgeRef.current) {
+        terminalBeforeBridgeAdoption = true;
+      }
+      if (phase !== "disposed") {
+        phase = "provider-terminal";
+      }
+      if (closeReported) {
+        return;
+      }
+      closeReported = true;
+      params.onClose?.(reason);
+    },
   });
   bridgeRef.current = bridge;
 

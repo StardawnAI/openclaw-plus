@@ -5,7 +5,9 @@ import type { ChannelApprovalNativeRuntimeAdapter } from "./approval-handler-run
 // Shared approval-runtime stubs keep channel approval tests focused on route
 // behavior instead of rebuilding the native adapter shape.
 export type ApprovalNativeRuntimeAdapterStubParams = {
+  eventKinds?: ChannelApprovalNativeRuntimeAdapter["eventKinds"];
   resolveApprovalKind?: ChannelApprovalNativeRuntimeAdapter["resolveApprovalKind"];
+  shouldHandle?: ChannelApprovalNativeRuntimeAdapter["availability"]["shouldHandle"];
   buildResolvedResult?: ChannelApprovalNativeRuntimeAdapter["presentation"]["buildResolvedResult"];
   unbindPending?: NonNullable<ChannelApprovalNativeRuntimeAdapter["interactions"]>["unbindPending"];
   cancelDelivered?: NonNullable<
@@ -21,10 +23,11 @@ export function createApprovalNativeRuntimeAdapterStubs(
   params: ApprovalNativeRuntimeAdapterStubParams = {},
 ): ChannelApprovalNativeRuntimeAdapter {
   return {
-    resolveApprovalKind: params.resolveApprovalKind,
+    ...(params.eventKinds ? { eventKinds: params.eventKinds } : {}),
+    ...(params.resolveApprovalKind ? { resolveApprovalKind: params.resolveApprovalKind } : {}),
     availability: {
       isConfigured: vi.fn().mockReturnValue(true),
-      shouldHandle: vi.fn().mockReturnValue(true),
+      shouldHandle: params.shouldHandle ?? vi.fn().mockReturnValue(true),
     },
     presentation: {
       buildPendingPayload: vi.fn().mockResolvedValue({ text: "pending" }),

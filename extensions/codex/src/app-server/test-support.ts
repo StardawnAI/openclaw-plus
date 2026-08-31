@@ -4,10 +4,63 @@
  */
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
+import type { EmbeddedRunAttemptParamsV2 as EmbeddedRunAttemptParams } from "openclaw/plugin-sdk/agent-harness-runtime";
 import type { Model } from "openclaw/plugin-sdk/llm";
 import { vi } from "vitest";
 import { CodexAppServerClient } from "./client.js";
 import type { CodexAppServerClientFactory, CodexAppServerClientOptions } from "./shared-client.js";
+
+/** Minimal deterministic host terminal observer for Codex harness tests. */
+export function createCodexTestToolTerminalObserver(): NonNullable<
+  EmbeddedRunAttemptParams["observeToolTerminal"]
+> {
+  let lastToolError: ReturnType<
+    NonNullable<EmbeddedRunAttemptParams["observeToolTerminal"]>
+  >["lastToolError"];
+
+  return (observation) => {
+    const record =
+      typeof observation.arguments === "object" && observation.arguments !== null
+        ? (observation.arguments as Record<string, unknown>)
+        : {};
+    const action = typeof record.action === "string" ? record.action : undefined;
+    const mutation = observation.nativeMutation ?? {
+      mutatingAction: observation.toolName === "message" && action === "send",
+      replaySafe: !(observation.toolName === "message" && action === "send"),
+    };
+    const executionStarted = observation.executionStarted !== false;
+    if (observation.outcome === "failure") {
+      const mutatingAction = executionStarted && mutation.mutatingAction;
+      lastToolError = {
+        toolName: observation.toolName,
+        ...(observation.meta ? { meta: observation.meta } : {}),
+        ...observation.failure,
+        mutatingAction,
+      };
+    } else if (lastToolError?.toolName === observation.toolName) {
+      lastToolError = undefined;
+    }
+    return {
+      ...(lastToolError ? { lastToolError } : {}),
+      executionStarted,
+      ...(Object.keys(record).length > 0 ? { executedArguments: record } : {}),
+      sideEffectEvidence: executionStarted && !mutation.replaySafe,
+      effectReceipt: {
+        state: !executionStarted
+          ? "uncertain"
+          : mutation.replaySafe
+            ? observation.outcome === "success"
+              ? "read_completed"
+              : "failed_no_effect"
+            : mutation.mutatingAction && observation.outcome === "success"
+              ? "mutation_committed"
+              : "uncertain",
+      },
+    };
+  };
+}
+
+export { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 
 /** Positional naked-client injection contract confined to tests. */
 export type CodexTestAppServerClientFactory = (
@@ -48,12 +101,19 @@ export function createCodexTestModel(provider = "openai", input = ["text"]): Mod
 }
 
 /** Creates an in-memory Codex app-server client harness with writable stdout frames. */
-export function createClientHarness() {
+export function createClientHarness(options: { autoEmitExit?: boolean } = {}) {
   const stdout = new PassThrough();
   const writes: string[] = [];
+  const writeEvents = new EventEmitter();
   let stdinDestroyed = false;
   let exitEmitted = false;
   let emitProcessExit: () => void = () => undefined;
+  const emitExit = () => {
+    if (!exitEmitted) {
+      exitEmitted = true;
+      emitProcessExit();
+    }
+  };
   type HarnessProcess = EventEmitter & {
     stdin: Writable;
     stdout: PassThrough;
@@ -65,17 +125,17 @@ export function createClientHarness() {
     write(chunk, _encoding, callback) {
       writes.push(chunk.toString());
       callback();
+      writeEvents.emit("write");
     },
   });
   const destroyStdin = stdin.destroy.bind(stdin);
   stdin.destroy = ((error?: Error) => {
     stdinDestroyed = true;
     const result = destroyStdin(error);
-    if (!exitEmitted) {
-      exitEmitted = true;
+    if (!exitEmitted && options.autoEmitExit !== false) {
       // Let stdin surface pipe errors before the harness emits the fake child exit.
       // Otherwise close-reason tests can race EPIPE against a synthetic clean exit.
-      setImmediate(emitProcessExit);
+      setImmediate(emitExit);
     }
     return result;
   }) as typeof stdin.destroy;
@@ -96,9 +156,32 @@ export function createClientHarness() {
     client,
     process,
     writes,
+    async waitForWrite(index: number): Promise<string> {
+      if (writes[index] !== undefined) {
+        return writes[index];
+      }
+      return await new Promise<string>((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          writeEvents.off("write", onWrite);
+        };
+        const onWrite = () => {
+          if (writes[index] !== undefined) {
+            cleanup();
+            resolve(writes[index]);
+          }
+        };
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Timed out waiting for app-server harness write ${index}`));
+        }, 1_000);
+        writeEvents.on("write", onWrite);
+      });
+    },
     get stdinDestroyed() {
       return stdinDestroyed;
     },
+    emitExit,
     send(message: unknown) {
       stdout.write(`${JSON.stringify(message)}\n`);
     },

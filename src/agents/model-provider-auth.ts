@@ -3,12 +3,11 @@
  * keeps per-agent auth snapshots process-current so model listing can avoid
  * repeated env/profile/plugin discovery on hot paths.
  */
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { hashRuntimeConfigValue } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { toErrorObject } from "../infra/errors.js";
+import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import {
   listAgentIds,
   resolveAgentDir,
@@ -25,12 +24,17 @@ import {
   type AuthProfileStore,
 } from "./auth-profiles.js";
 import {
+  createModelAuthAvailabilityResolver,
+  type ModelAuthAvailabilityEvaluation,
+  type ModelAuthAvailabilityRef,
+  type ModelAuthAvailabilityResolver,
+} from "./model-auth-availability.js";
+import {
   createRuntimeProviderAuthLookup,
   hasAvailableAuthForProvider,
   hasRuntimeAvailableProviderAuth,
   type RuntimeProviderAuthLookup,
 } from "./model-auth.js";
-import { loadModelCatalog } from "./model-catalog.js";
 import {
   cancelCurrentProviderAuthWarmWorker,
   claimCurrentProviderAuthStateGeneration,
@@ -176,19 +180,6 @@ export async function hasAuthForModelProvider(params: {
   await new Promise<void>((resolve) => {
     setImmediate(resolve);
   });
-  if (
-    hasRuntimeAvailableProviderAuth({
-      provider,
-      cfg: params.cfg,
-      workspaceDir: params.workspaceDir,
-      env: params.env,
-      allowPluginSyntheticAuth: params.allowPluginSyntheticAuth,
-      runtimeLookup: params.runtimeAuthLookup ?? params.resolveRuntimeAuthLookup?.(),
-      modelApi: params.modelApi,
-    })
-  ) {
-    return true;
-  }
   const slowPathAgentDir =
     params.agentDir ??
     (params.agentId && params.cfg
@@ -203,6 +194,21 @@ export async function hasAuthForModelProvider(params: {
       : ensureAuthProfileStore(slowPathAgentDir, {
           externalCli: externalCliDiscoveryForProviderAuth({ cfg: params.cfg, provider }),
         }));
+
+  if (
+    hasRuntimeAvailableProviderAuth({
+      provider,
+      cfg: params.cfg,
+      workspaceDir: params.workspaceDir,
+      env: params.env,
+      allowPluginSyntheticAuth: params.allowPluginSyntheticAuth,
+      runtimeLookup: params.runtimeAuthLookup ?? params.resolveRuntimeAuthLookup?.(),
+      modelApi: params.modelApi,
+      store,
+    })
+  ) {
+    return true;
+  }
   if (listProfilesForProvider(store, provider).length > 0) {
     return params.modelApi === undefined
       ? true
@@ -218,7 +224,17 @@ export async function hasAuthForModelProvider(params: {
   return false;
 }
 
-/** Creates a cached provider-auth checker bound to one agent/runtime context. */
+export type ProviderModelAuthChecker = ((
+  provider: string,
+  ref?: ModelAuthAvailabilityRef,
+) => Promise<boolean>) & {
+  evaluateModelAuth(
+    provider: string,
+    ref?: ModelAuthAvailabilityRef,
+  ): Promise<ModelAuthAvailabilityEvaluation>;
+};
+
+/** Creates a cached provider-auth evaluator bound to one agent/runtime context. */
 export function createProviderAuthChecker(params: {
   cfg?: OpenClawConfig;
   workspaceDir?: string;
@@ -228,38 +244,104 @@ export function createProviderAuthChecker(params: {
   allowPluginSyntheticAuth?: boolean;
   discoverExternalCliAuth?: boolean;
   allowPreparedRuntimeAuth?: boolean;
-}): (provider: string, modelApi?: string) => Promise<boolean> {
-  const authCache = new Map<string, boolean>();
+}): ProviderModelAuthChecker {
+  const authCache = new Map<string, Promise<ModelAuthAvailabilityEvaluation>>();
   let runtimeAuthLookup: RuntimeProviderAuthLookup | undefined;
-  return async (provider: string, modelApi?: string) => {
-    const key = normalizeProviderId(provider);
-    const cacheKey = modelApi === undefined ? key : `${key}\0${modelApi}`;
-    const cached = authCache.get(cacheKey);
-    if (cached !== undefined) {
-      return cached;
+  let modelAuthResolver: ModelAuthAvailabilityResolver | undefined;
+  const resolveModelAuthResolver = () => {
+    if (modelAuthResolver) {
+      return modelAuthResolver;
     }
-    const value = await hasAuthForModelProvider({
-      provider: key,
-      modelApi,
+    const agentDir =
+      params.agentDir ??
+      (params.agentId && params.cfg
+        ? resolveAgentDir(params.cfg, params.agentId, params.env)
+        : undefined);
+    const authStore = ensureAuthProfileStoreWithoutExternalProfiles(agentDir, {
+      allowKeychainPrompt: false,
+    });
+    runtimeAuthLookup ??= createRuntimeProviderAuthLookup({
       cfg: params.cfg,
       workspaceDir: params.workspaceDir,
-      agentDir: params.agentDir,
-      agentId: params.agentId,
       env: params.env,
-      allowPluginSyntheticAuth: params.allowPluginSyntheticAuth,
-      discoverExternalCliAuth: params.discoverExternalCliAuth,
-      allowPreparedRuntimeAuth: params.allowPreparedRuntimeAuth,
-      resolveRuntimeAuthLookup: () =>
-        (runtimeAuthLookup ??= createRuntimeProviderAuthLookup({
-          cfg: params.cfg,
-          workspaceDir: params.workspaceDir,
-          env: params.env,
-          includePluginSyntheticAuth: params.allowPluginSyntheticAuth !== false,
-        })),
+      includePluginSyntheticAuth: params.allowPluginSyntheticAuth !== false,
     });
-    authCache.set(cacheKey, value);
-    return value;
+    modelAuthResolver = createModelAuthAvailabilityResolver({
+      cfg: params.cfg ?? {},
+      authStore,
+      agentDir,
+      workspaceDir: params.workspaceDir,
+      env: params.env,
+      skipSetupProviderFallback: true,
+      allowPreparedRuntimeAuth:
+        params.allowPreparedRuntimeAuth === true ||
+        (params.discoverExternalCliAuth !== false && params.allowPluginSyntheticAuth !== false),
+      syntheticAuthProviderRefs: runtimeAuthLookup.syntheticAuthProviderRefs,
+      ...(params.discoverExternalCliAuth === false ? {} : { externalCliProviderIds: ["openai"] }),
+    });
+    return modelAuthResolver;
   };
+  const evaluateModelAuth = (
+    provider: string,
+    ref: ModelAuthAvailabilityRef = {},
+  ): Promise<ModelAuthAvailabilityEvaluation> => {
+    const key = normalizeProviderId(provider);
+    const hasRouteFacts =
+      ref.modelId !== undefined ||
+      ref.api !== undefined ||
+      ref.baseUrl !== undefined ||
+      ref.observedRoutes !== undefined;
+    const cacheKey = hasRouteFacts
+      ? `${key}\0${hashRuntimeConfigValue(ref as unknown as OpenClawConfig)}`
+      : key;
+    const cached = authCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const resolveLegacyProviderAuth = () =>
+      hasAuthForModelProvider({
+        provider: key,
+        modelApi: typeof ref.api === "string" ? ref.api : undefined,
+        cfg: params.cfg,
+        workspaceDir: params.workspaceDir,
+        agentDir: params.agentDir,
+        agentId: params.agentId,
+        env: params.env,
+        allowPluginSyntheticAuth: params.allowPluginSyntheticAuth,
+        discoverExternalCliAuth: params.discoverExternalCliAuth,
+        allowPreparedRuntimeAuth: params.allowPreparedRuntimeAuth,
+        resolveRuntimeAuthLookup: () =>
+          (runtimeAuthLookup ??= createRuntimeProviderAuthLookup({
+            cfg: params.cfg,
+            workspaceDir: params.workspaceDir,
+            env: params.env,
+            includePluginSyntheticAuth: params.allowPluginSyntheticAuth !== false,
+          })),
+      });
+    const evaluation = Promise.resolve().then(
+      async (): Promise<ModelAuthAvailabilityEvaluation> => {
+        if (hasRouteFacts) {
+          return resolveModelAuthResolver().evaluateModelAuth(key, ref);
+        }
+        return {
+          availability: await resolveLegacyProviderAuth(),
+          routeResolution: null,
+        };
+      },
+    );
+    authCache.set(cacheKey, evaluation);
+    void evaluation.catch(() => {
+      if (authCache.get(cacheKey) === evaluation) {
+        authCache.delete(cacheKey);
+      }
+    });
+    return evaluation;
+  };
+  return Object.assign(
+    async (provider: string, ref: ModelAuthAvailabilityRef = {}) =>
+      (await evaluateModelAuth(provider, ref)).availability === true,
+    { evaluateModelAuth },
+  );
 }
 
 function serializeProviderAuthStates(
@@ -317,26 +399,31 @@ export async function buildCurrentProviderAuthStateSnapshot(
   } = {},
 ): Promise<ProviderAuthWarmSnapshot> {
   const isWarmStale = () => options.isCancelled?.() === true;
-  const catalog = await loadModelCatalog({ config: cfg, readOnly: true });
-  if (isWarmStale()) {
-    return { agents: [] };
-  }
-  const providers = new Set<string>();
-  for (const entry of catalog) {
-    providers.add(normalizeProviderId(entry.provider));
-  }
-  const providerList = [...providers];
   const configFingerprint = resolveProviderAuthConfigFingerprint(cfg) ?? "";
   const states = new Map<string, PreparedProviderAuthState>();
-  // Warm one entry per configured agent so callers hit the prepared map for
-  // any agentId. The catalog above is shared across agents; the per-agent
-  // work is the auth-discovery sweep against that agent's store.
+  // Catalog generations are agent-scoped because provider plugins and auth stores can differ.
+  // Keep each auth snapshot paired with the same lifecycle owner that supplied its model rows.
   for (const agentId of listAgentIds(cfg)) {
     if (isWarmStale()) {
       return { agents: [] };
     }
-    const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
     const agentDir = resolveAgentDir(cfg, agentId);
+    // Worker warmup is the only path that may need to construct a read-only catalog generation.
+    // Keep the lifecycle graph out of foreground provider-auth module initialization.
+    const { loadPreparedModelCatalogOwnerSnapshot } = await import("./prepared-model-catalog.js");
+    const preparedOwner = await loadPreparedModelCatalogOwnerSnapshot({
+      config: cfg,
+      agentId,
+      agentDir,
+      readOnly: true,
+    });
+    const workspaceDir = preparedOwner.workspaceDir ?? resolveAgentWorkspaceDir(cfg, agentId);
+    const catalog = preparedOwner.modelCatalog.entries;
+    if (isWarmStale()) {
+      return { agents: [] };
+    }
+    const providers = new Set(catalog.map((entry) => normalizeProviderId(entry.provider)));
+    const providerList = [...providers];
     const runtimeAuthLookup =
       options.runtimeAuthLookups?.get(agentId) ??
       createRuntimeProviderAuthLookup({
@@ -395,18 +482,6 @@ export async function buildCurrentProviderAuthStateSnapshot(
   return serializeProviderAuthStates(states);
 }
 
-function resolveProviderAuthWarmWorkerUrl(currentModuleUrl: string): URL {
-  const currentPath = fileURLToPath(currentModuleUrl);
-  const distMarker = `${path.sep}dist${path.sep}`;
-  const distIndex = currentPath.lastIndexOf(distMarker);
-  if (distIndex >= 0) {
-    const distRoot = currentPath.slice(0, distIndex + distMarker.length - 1);
-    return pathToFileURL(path.join(distRoot, "agents", "model-provider-auth.worker.js"));
-  }
-  const extension = path.extname(currentPath) || ".js";
-  return new URL(`./model-provider-auth.worker${extension}`, currentModuleUrl);
-}
-
 function isProviderAuthWarmSnapshot(value: unknown): value is ProviderAuthWarmSnapshot {
   if (
     !value ||
@@ -449,9 +524,18 @@ function createProviderAuthWarmPresenceStore(store: AuthProfileStore): AuthProfi
       provider: credential.provider,
     };
   }
+  const usageStats: AuthProfileStore["usageStats"] = {};
+  if (store.usageStats) {
+    for (const [id, stats] of Object.entries(store.usageStats)) {
+      if (id.startsWith("inline-api-key:")) {
+        usageStats[id] = stats;
+      }
+    }
+  }
   return {
     version: store.version,
     profiles,
+    usageStats,
   };
 }
 
@@ -510,7 +594,15 @@ function runProviderAuthWarmWorker(params: {
   isCancelled: () => boolean;
   workerUrl?: URL;
 }): Promise<ProviderAuthWarmSnapshot> {
-  const worker = new Worker(params.workerUrl ?? resolveProviderAuthWarmWorkerUrl(import.meta.url), {
+  const workerUrl =
+    params.workerUrl ??
+    resolveRuntimeWorkerUrl({
+      currentModuleUrl: import.meta.url,
+      sourceWorkerName: "model-provider-auth.worker",
+      distWorkerPath: "agents/model-provider-auth.worker.js",
+    });
+  const sourceWorkerExecArgv = workerUrl.pathname.endsWith(".ts") ? ["--import", "tsx"] : undefined;
+  const worker = new Worker(workerUrl, {
     workerData: {
       cfg: params.cfg,
       ...(params.runtimeAuthStores?.length ? { runtimeAuthStores: params.runtimeAuthStores } : {}),
@@ -519,6 +611,7 @@ function runProviderAuthWarmWorker(params: {
         : {}),
       ...(params.omitFalseProviderAuth ? { omitFalseProviderAuth: true } : {}),
     },
+    execArgv: sourceWorkerExecArgv,
   });
   worker.unref?.();
   const handle = {

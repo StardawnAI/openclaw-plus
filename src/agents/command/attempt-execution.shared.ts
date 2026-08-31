@@ -2,7 +2,7 @@
  * Shared session persistence and prompt-body helpers for agent attempt
  * execution paths.
  */
-import { patchSessionEntry } from "../../config/sessions/session-accessor.js";
+import { patchSessionEntryCore } from "../../config/sessions/session-accessor.js";
 import { mergeSessionSnapshotChanges } from "../../config/sessions/session-snapshot-merge.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import {
@@ -26,14 +26,19 @@ type PersistSessionEntryParams = {
 };
 
 /** Persists one session entry while keeping the caller's in-memory store aligned. */
-export async function persistSessionEntry(
+export async function persistAgentSession(
   params: PersistSessionEntryParams,
 ): Promise<SessionEntry | undefined> {
   let rejectedMissingEntry = false;
-  const persisted = await patchSessionEntry(
+  const persisted = await patchSessionEntryCore(
     { sessionKey: params.sessionKey, storePath: params.storePath },
     (_entry, context) => {
-      if (params.shouldPersist && !params.shouldPersist(context.existingEntry)) {
+      const shouldPersistCurrent = params.shouldPersist?.(context.existingEntry);
+      if (!context.existingEntry && shouldPersistCurrent !== true) {
+        rejectedMissingEntry = true;
+        return null;
+      }
+      if (shouldPersistCurrent === false) {
         rejectedMissingEntry = !context.existingEntry;
         return null;
       }

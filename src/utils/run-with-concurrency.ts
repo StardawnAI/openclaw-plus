@@ -1,3 +1,5 @@
+import pLimit from "p-limit";
+
 /** Controls whether the worker pool keeps scheduling after a task failure. */
 export type ConcurrencyErrorMode = "continue" | "stop";
 
@@ -9,6 +11,8 @@ export type RunTasksWithConcurrencyOptions<T> = {
   limit: number;
   /** `stop` prevents new work after the first failure; in-flight workers still settle. */
   errorMode?: ConcurrencyErrorMode;
+  /** Reject immediately on a task failure instead of returning aggregate error state. */
+  throwOnError?: boolean;
   /** Called once per failed task with the original task index. */
   onTaskError?: (error: unknown, index: number) => void;
 };
@@ -27,45 +31,44 @@ export type RunTasksWithConcurrencyResult<T> = {
 export async function runTasksWithConcurrency<T>(
   params: RunTasksWithConcurrencyOptions<T>,
 ): Promise<RunTasksWithConcurrencyResult<T>> {
-  const { tasks, limit, onTaskError } = params;
+  const { tasks, limit, onTaskError, throwOnError = false } = params;
   const errorMode = params.errorMode ?? "continue";
   if (tasks.length === 0) {
     return { results: [], firstError: undefined, hasError: false };
   }
 
-  const resolvedLimit = Math.max(1, Math.min(limit, tasks.length));
+  const resolvedLimit = Number.isFinite(limit)
+    ? Math.max(1, Math.min(Math.floor(limit), tasks.length))
+    : tasks.length;
   const results: T[] = Array.from({ length: tasks.length });
-  let next = 0;
   let firstError: unknown = undefined;
   let hasError = false;
+  const limiter = pLimit(resolvedLimit);
 
-  const workers = Array.from({ length: resolvedLimit }, async () => {
-    while (true) {
+  const runs = tasks.map((task, index) =>
+    limiter(async () => {
       if (errorMode === "stop" && hasError) {
         return;
       }
-      // Synchronous cursor adoption is the whole scheduling lock: each worker
-      // claims one stable index before awaiting task work.
-      const index = next;
-      next += 1;
-      if (index >= tasks.length) {
-        return;
-      }
       try {
-        results[index] = await tasks[index]();
+        results[index] = await task();
       } catch (error) {
         if (!hasError) {
           firstError = error;
           hasError = true;
         }
         onTaskError?.(error, index);
-        if (errorMode === "stop") {
-          return;
+        if (throwOnError) {
+          throw error;
         }
       }
-    }
-  });
+    }),
+  );
 
-  await Promise.allSettled(workers);
+  if (throwOnError) {
+    await Promise.all(runs);
+  } else {
+    await Promise.allSettled(runs);
+  }
   return { results, firstError, hasError };
 }

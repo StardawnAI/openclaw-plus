@@ -1,6 +1,7 @@
 // Tests background side-question command routing and typing controller integration.
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
+import { resolveMessageActionTurnCapability } from "../../gateway/message-action-turn-capability.js";
 import {
   expectObjectFields,
   mockCall,
@@ -117,6 +118,25 @@ describe("handleBtwCommand", () => {
     expect(typing.startTypingLoop).toHaveBeenCalledTimes(1);
   });
 
+  it("returns an actionable visible error before running a restricted side question", async () => {
+    const params = buildParams("/btw what changed?");
+    params.agentDir = "/tmp/agent";
+    params.sessionEntry = { sessionId: "session-1", updatedAt: Date.now() };
+    params.ctx.ConversationToolPolicy = { deny: ["exec"] };
+
+    const result = await handleBtwCommand(params, true);
+
+    expect(result).toEqual({
+      shouldContinue: false,
+      reply: {
+        text: "⚠️ /btw cannot enforce this conversation's tool policy. Ask in the main conversation or switch this session to the embedded runtime.",
+        btw: { question: "what changed?" },
+        isError: true,
+      },
+    });
+    expect(runBtwSideQuestionMock).not.toHaveBeenCalled();
+  });
+
   it("delegates to the side-question runner", async () => {
     const params = buildParams("/btw what changed?");
     params.command.senderId = "sender-1";
@@ -137,7 +157,20 @@ describe("handleBtwCommand", () => {
       parentSessionKey: "agent:main:parent",
       updatedAt: Date.now(),
     };
-    runBtwSideQuestionMock.mockResolvedValue({ text: "nothing important" });
+    let resolvedTurnContext: ReturnType<typeof resolveMessageActionTurnCapability> | undefined;
+    runBtwSideQuestionMock.mockImplementation(async (input: Record<string, unknown>) => {
+      resolvedTurnContext = resolveMessageActionTurnCapability({
+        token:
+          typeof input.messageActionTurnCapability === "string"
+            ? input.messageActionTurnCapability
+            : undefined,
+        agentId: "main",
+        runId: typeof input.authorityRunId === "string" ? input.authorityRunId : undefined,
+        sessionKey: "agent:main:runtime-policy",
+        sessionId: "session-1",
+      });
+      return { text: "nothing important" };
+    });
 
     const result = await handleBtwCommand(params, true);
 
@@ -163,6 +196,19 @@ describe("handleBtwCommand", () => {
       senderIsOwner: true,
     });
     expect(String(runnerArgs.agentDir)).toContain("/agents/main/agent");
+    expect(runnerArgs.messageActionTurnCapability).toEqual(expect.any(String));
+    expect(runnerArgs.opts).toMatchObject({ runId: expect.any(String) });
+    expect(runnerArgs.authorityRunId).toEqual(expect.any(String));
+    expect(runnerArgs.authorityRunId).not.toBe(
+      (runnerArgs.opts as { runId?: string } | undefined)?.runId,
+    );
+    expect(resolvedTurnContext).toMatchObject({
+      requesterAccountId: "account-1",
+      requesterSenderId: "sender-1",
+      toolContext: {
+        currentChannelProvider: "whatsapp",
+      },
+    });
     expect(result).toEqual({
       shouldContinue: false,
       reply: { text: "nothing important", btw: { question: "what changed?" } },
@@ -172,6 +218,8 @@ describe("handleBtwCommand", () => {
   it("uses the originating target before the command transport target", async () => {
     const params = buildParams("/btw what changed?");
     params.ctx.OriginatingTo = "channel:source";
+    params.ctx.NativeChannelId = "native:source";
+    params.ctx.ChatType = "channel";
     params.command.to = "slash:transport";
     params.agentDir = "/tmp/agent";
     params.sessionEntry = {
@@ -183,7 +231,10 @@ describe("handleBtwCommand", () => {
     await handleBtwCommand(params, true);
 
     expectObjectFields(mockFirstObjectArg(runBtwSideQuestionMock), {
-      currentChannelId: "channel:source",
+      chatId: "native:source",
+      chatType: "channel",
+      messageTo: "channel:source",
+      currentChannelId: "native:source",
     });
   });
 
@@ -206,6 +257,25 @@ describe("handleBtwCommand", () => {
       messageProvider: "telegram",
       currentChannelId: "+2000",
     });
+  });
+
+  it("does not mint current-turn context for Gateway chat with an explicit origin", async () => {
+    const params = buildParams("/btw what changed?");
+    params.ctx.Provider = "webchat";
+    params.ctx.OriginatingChannel = "matrix";
+    params.ctx.OriginatingTo = "!room:example.org";
+    params.command.channel = "matrix";
+    params.command.to = "!room:example.org";
+    params.agentDir = "/tmp/agent";
+    params.sessionEntry = {
+      sessionId: "session-1",
+      updatedAt: Date.now(),
+    };
+    runBtwSideQuestionMock.mockResolvedValue({ text: "origin answer" });
+
+    await handleBtwCommand(params, true);
+
+    expect(mockFirstObjectArg(runBtwSideQuestionMock).messageActionTurnCapability).toBeUndefined();
   });
 
   it("accepts /side as a /btw alias", async () => {

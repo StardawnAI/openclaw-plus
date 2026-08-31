@@ -1,11 +1,10 @@
 // Control UI view renders agents utils screen content.
 import { formatByteSize } from "@openclaw/normalization-core";
-import { html, nothing } from "lit";
 import {
-  expandToolGroups,
-  normalizeToolName,
-  resolveToolProfilePolicy,
-} from "../../../../src/agents/tool-policy-shared.js";
+  normalizeLowercaseStringOrEmpty,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
 import type {
   AgentIdentityResult,
   AgentsFilesListResult,
@@ -14,10 +13,26 @@ import type {
   ToolCatalogProfile,
   ToolsCatalogResult,
 } from "../../api/types.ts";
-import { controlUiPublicAssetPath } from "../../app/public-assets.ts";
+import { t } from "../../i18n/index.ts";
 import { resolveAgentAvatarUrl, resolveAssistantTextAvatar } from "../avatar.ts";
-import { buildQualifiedChatModelValue } from "../chat/model-ref.ts";
-import { normalizeLowercaseStringOrEmpty, normalizeOptionalString } from "../string-coerce.ts";
+import { buildCatalogDisplayLookup, buildChatModelOptionFromLookup } from "../chat/model-ref.ts";
+import { resolveAgentConfigEntryTarget } from "../config/config-state-model.ts";
+
+type AgentRosterEntry = {
+  id: string;
+  kind?: "agent" | "system";
+  name?: string;
+  identity?: { name?: string };
+};
+
+/** Ordinary agent targets; system rows remain available to diagnostic surfaces. */
+export function listSelectableAgents<T extends AgentRosterEntry>(agents: readonly T[]): T[] {
+  return agents.filter((agent) => agent.kind !== "system");
+}
+
+export function selectableAgentsList(agentsList: AgentsListResult): AgentsListResult {
+  return { ...agentsList, agents: listSelectableAgents(agentsList.agents) };
+}
 
 export type AgentToolEntry = {
   id: string;
@@ -37,140 +52,161 @@ export type AgentToolSection = {
   tools: AgentToolEntry[];
 };
 
-const FALLBACK_TOOL_SECTIONS: AgentToolSection[] = [
+type FallbackToolSection = Omit<AgentToolSection, "label" | "tools"> & {
+  labelId: string;
+  tools: string[];
+};
+
+const FALLBACK_TOOL_SECTIONS: FallbackToolSection[] = [
   {
     id: "fs",
-    label: "Files",
-    tools: [
-      { id: "read", label: "read", description: "Read file contents" },
-      { id: "write", label: "write", description: "Create or overwrite files" },
-      { id: "edit", label: "edit", description: "Make precise edits" },
-      { id: "apply_patch", label: "apply_patch", description: "Patch files (OpenAI)" },
-    ],
+    labelId: "files",
+    tools: ["read", "write", "edit", "apply_patch"],
   },
   {
     id: "runtime",
-    label: "Runtime",
-    tools: [
-      { id: "exec", label: "exec", description: "Run shell commands" },
-      { id: "process", label: "process", description: "Manage background processes" },
-    ],
+    labelId: "runtime",
+    tools: ["exec", "process"],
   },
   {
     id: "web",
-    label: "Web",
-    tools: [
-      { id: "web_search", label: "web_search", description: "Search the web" },
-      { id: "web_fetch", label: "web_fetch", description: "Fetch web content" },
-    ],
+    labelId: "web",
+    tools: ["web_search", "web_fetch"],
   },
   {
     id: "memory",
-    label: "Memory",
-    tools: [
-      { id: "memory_search", label: "memory_search", description: "Semantic search" },
-      { id: "memory_get", label: "memory_get", description: "Read memory files" },
-    ],
+    labelId: "memory",
+    tools: ["memory_search", "memory_get"],
   },
   {
     id: "sessions",
-    label: "Sessions",
+    labelId: "sessions",
     tools: [
-      { id: "sessions_list", label: "sessions_list", description: "List sessions" },
-      { id: "sessions_history", label: "sessions_history", description: "Session history" },
-      { id: "sessions_send", label: "sessions_send", description: "Send to session" },
-      { id: "sessions_spawn", label: "sessions_spawn", description: "Spawn sub-agent" },
-      { id: "session_status", label: "session_status", description: "Session status" },
+      "sessions_list",
+      "sessions_history",
+      "sessions_send",
+      "sessions_spawn",
+      "session_status",
     ],
   },
   {
     id: "ui",
-    label: "UI",
-    tools: [
-      { id: "browser", label: "browser", description: "Control web browser" },
-      { id: "canvas", label: "canvas", description: "Control canvases" },
-    ],
+    labelId: "ui",
+    tools: ["browser", "canvas"],
   },
   {
     id: "messaging",
-    label: "Messaging",
-    tools: [{ id: "message", label: "message", description: "Send messages" }],
+    labelId: "messaging",
+    tools: ["message"],
   },
   {
     id: "automation",
-    label: "Automation",
-    tools: [
-      { id: "cron", label: "cron", description: "Schedule tasks" },
-      { id: "gateway", label: "gateway", description: "Gateway control" },
-    ],
+    labelId: "automation",
+    tools: ["cron", "gateway"],
   },
   {
     id: "nodes",
-    label: "Nodes",
-    tools: [{ id: "nodes", label: "nodes", description: "Nodes + devices" }],
+    labelId: "nodes",
+    tools: ["nodes"],
   },
   {
     id: "agents",
-    label: "Agents",
-    tools: [{ id: "agents_list", label: "agents_list", description: "List agents" }],
+    labelId: "agents",
+    tools: ["agents_list"],
   },
   {
     id: "media",
-    label: "Media",
-    tools: [{ id: "image", label: "image", description: "Image understanding" }],
+    labelId: "media",
+    tools: ["view_image"],
   },
 ];
 
-const PROFILE_OPTIONS = [
-  { id: "minimal", label: "Minimal" },
-  { id: "coding", label: "Coding" },
-  { id: "messaging", label: "Messaging" },
-  { id: "full", label: "Full" },
+function fallbackToolDescriptionId(toolId: string): string {
+  return toolId === "view_image"
+    ? "image"
+    : toolId.replace(/_([a-z])/gu, (_, letter: string) => letter.toUpperCase());
+}
+
+// Canonical UI tool-profile list; Security and Agents surfaces share it so
+// labels stay translated and consistent.
+export const PROFILE_OPTIONS = [
+  { id: "minimal", labelKey: "agents.toolCatalog.profiles.minimal" },
+  { id: "coding", labelKey: "agents.toolCatalog.profiles.coding" },
+  { id: "messaging", labelKey: "agents.toolCatalog.profiles.messaging" },
+  { id: "full", labelKey: "agents.toolCatalog.profiles.full" },
 ] as const;
+
+// Gateway catalog labels are English-only strings. Translate the known core
+// group/profile enum labels locally so localized UIs don't render English
+// section names; plugin groups (`plugin:<id>` ids) never match and keep the
+// catalog-provided label.
+const CORE_GROUP_LABEL_IDS = new Map<string, string>(
+  FALLBACK_TOOL_SECTIONS.map((section) => [section.id, section.labelId]),
+);
+const PROFILE_LABEL_KEYS = new Map<string, string>(
+  PROFILE_OPTIONS.map((profile) => [profile.id, profile.labelKey]),
+);
 
 export function resolveToolSections(
   toolsCatalogResult: ToolsCatalogResult | null,
 ): AgentToolSection[] {
   if (toolsCatalogResult?.groups?.length) {
-    return toolsCatalogResult.groups.map((group) => ({
-      id: group.id,
-      label: group.label,
-      source: group.source,
-      pluginId: group.pluginId,
-      tools: group.tools.map((tool) => ({
-        id: tool.id,
-        label: tool.label,
-        description: tool.description,
-        source: tool.source,
-        pluginId: tool.pluginId,
-        optional: tool.optional,
-        defaultProfiles: [...tool.defaultProfiles],
-      })),
-    }));
+    return toolsCatalogResult.groups.map((group) => {
+      const labelId = CORE_GROUP_LABEL_IDS.get(group.id);
+      return {
+        id: group.id,
+        label: labelId ? t(`agents.toolCatalog.groups.${labelId}`) : group.label,
+        source: group.source,
+        pluginId: group.pluginId,
+        tools: group.tools.map((tool) => ({
+          id: tool.id,
+          label: tool.label,
+          description: tool.description,
+          source: tool.source,
+          pluginId: tool.pluginId,
+          optional: tool.optional,
+          defaultProfiles: [...tool.defaultProfiles],
+        })),
+      };
+    });
   }
-  return FALLBACK_TOOL_SECTIONS;
+  return FALLBACK_TOOL_SECTIONS.map((section) => ({
+    id: section.id,
+    label: t(`agents.toolCatalog.groups.${section.labelId}`),
+    tools: section.tools.map((toolId) => ({
+      id: toolId,
+      label: toolId,
+      description: t(`agents.toolCatalog.descriptions.${fallbackToolDescriptionId(toolId)}`),
+    })),
+  }));
 }
 
 export function resolveToolProfileOptions(
   toolsCatalogResult: ToolsCatalogResult | null,
-): readonly ToolCatalogProfile[] | typeof PROFILE_OPTIONS {
+): readonly ToolCatalogProfile[] | ReadonlyArray<{ id: string; label: string }> {
   if (toolsCatalogResult?.profiles?.length) {
-    return toolsCatalogResult.profiles;
+    return toolsCatalogResult.profiles.map((profile) => {
+      const labelKey = PROFILE_LABEL_KEYS.get(profile.id);
+      return labelKey ? { id: profile.id, label: t(labelKey) } : profile;
+    });
   }
-  return PROFILE_OPTIONS;
+  return PROFILE_OPTIONS.map((profile) => ({
+    id: profile.id,
+    label: t(profile.labelKey),
+  }));
 }
 
-type ToolPolicy = {
-  allow?: string[];
-  deny?: string[];
+type GitHubIdentityConfigValue = {
+  profileId?: string;
+  gitAuthor?: { name?: string; email?: string };
 };
 
 type AgentConfigEntry = {
-  id: string;
   name?: string;
   workspace?: string;
   agentDir?: string;
   model?: unknown;
+  models?: Record<string, { alias?: unknown }>;
   agentRuntime?: unknown;
   skills?: string[];
   tools?: {
@@ -178,37 +214,59 @@ type AgentConfigEntry = {
     allow?: string[];
     alsoAllow?: string[];
     deny?: string[];
+    github?: GitHubIdentityConfigValue;
   };
 };
 
 type ConfigSnapshot = {
   agents?: {
-    defaults?: { workspace?: string; model?: unknown; models?: Record<string, { alias?: string }> };
-    list?: AgentConfigEntry[];
+    defaults?: {
+      workspace?: string;
+      model?: unknown;
+      models?: Record<string, { alias?: unknown }>;
+      skills?: string[];
+    };
+    entries?: Record<string, AgentConfigEntry>;
   };
   tools?: {
     profile?: string;
     allow?: string[];
     alsoAllow?: string[];
     deny?: string[];
+    github?: GitHubIdentityConfigValue;
   };
 };
 
-export function normalizeAgentLabel(agent: {
-  id: string;
-  name?: string;
-  identity?: { name?: string };
-}) {
+export function normalizeAgentLabel(
+  agent: AgentRosterEntry,
+  hydratedIdentity?: { name?: string } | null,
+) {
+  // Roster labels own operator target identity; workspace identity only fills gaps.
   return (
-    normalizeOptionalString(agent.name) ?? normalizeOptionalString(agent.identity?.name) ?? agent.id
+    normalizeOptionalString(agent.name) ??
+    normalizeOptionalString(agent.identity?.name) ??
+    normalizeOptionalString(hydratedIdentity?.name) ??
+    agent.id
   );
 }
 
-export function assistantAvatarFallbackUrl(basePath: string): string {
-  return controlUiPublicAssetPath("apple-touch-icon.png", basePath);
+export function normalizeAgentTargetLabel(
+  agent: AgentRosterEntry,
+  hydratedIdentity?: Pick<AgentIdentityResult, "name" | "nameSource"> | null,
+) {
+  const resolvedName =
+    hydratedIdentity?.nameSource && hydratedIdentity.nameSource !== "default"
+      ? normalizeOptionalString(hydratedIdentity.name)
+      : undefined;
+  return (
+    resolvedName ??
+    normalizeOptionalString(agent.name) ??
+    normalizeOptionalString(agent.identity?.name) ??
+    agent.id
+  );
 }
 
-function resolveAgentTextAvatar(
+export function resolveAgentTextAvatar(
   agent: { identity?: { emoji?: string; avatar?: string } },
   agentIdentity?: AgentIdentityResult | null,
 ): string | null {
@@ -228,30 +286,49 @@ function resolveAgentTextAvatar(
 }
 
 export function agentBadgeText(agentId: string, defaultId: string | null) {
-  return defaultId && agentId === defaultId ? "default" : null;
+  return defaultId && agentId === defaultId ? t("agents.default") : null;
 }
 
-export function formatBytes(bytes?: number) {
+type FormatBytesOptions = {
+  fallback?: string;
+  maxUnit?: "kilo" | "mega" | "giga" | "tera";
+  fractionDigits?: Parameters<typeof formatByteSize>[1]["fractionDigits"];
+};
+
+export function formatBytes(bytes?: number, options: FormatBytesOptions = {}) {
   if (bytes == null || !Number.isFinite(bytes)) {
-    return "-";
+    return options.fallback ?? "-";
   }
   return formatByteSize(bytes, {
     style: "legacy-binary",
-    maxUnit: "tera",
+    maxUnit: options.maxUnit ?? "tera",
     separator: " ",
-    fractionDigits: (value, unit) => (unit === "byte" ? null : value < 10 ? 1 : 0),
+    fractionDigits:
+      options.fractionDigits ?? ((value, unit) => (unit === "byte" ? null : value < 10 ? 1 : 0)),
   });
 }
 
 export function resolveAgentConfig(config: Record<string, unknown> | null, agentId: string) {
   const cfg = config as ConfigSnapshot | null;
-  const list = cfg?.agents?.list ?? [];
-  const entry = list.find((agent) => agent?.id === agentId);
+  const entry = resolveAgentConfigEntryTarget(config, agentId)?.entry as
+    | AgentConfigEntry
+    | undefined;
   return {
     entry,
     defaults: cfg?.agents?.defaults,
     globalTools: cfg?.tools,
   };
+}
+
+/** Resolves the effective skill allowlist, including inherited agent defaults. */
+export function resolveAgentSkillsFilter(config: Record<string, unknown> | null, agentId: string) {
+  const resolved = resolveAgentConfig(config, agentId);
+  if (Array.isArray(resolved.entry?.skills)) {
+    return normalizeStringEntries(resolved.entry.skills);
+  }
+  return Array.isArray(resolved.defaults?.skills)
+    ? normalizeStringEntries(resolved.defaults.skills)
+    : undefined;
 }
 
 export type AgentContext = {
@@ -277,14 +354,17 @@ export function buildAgentContext(
   const workspace =
     workspaceFromFiles ||
     config.entry?.workspace ||
-    config.defaults?.workspace ||
     agent.workspace ||
+    config.defaults?.workspace ||
     "default";
-  const modelLabel = config.entry?.model
-    ? resolveModelLabel(config.entry?.model)
-    : config.defaults?.model
-      ? resolveModelLabel(config.defaults?.model)
-      : resolveModelLabel(agent.model);
+  const primary =
+    resolveModelPrimary(config.entry?.model) ??
+    resolveModelPrimary(config.defaults?.model) ??
+    resolveModelPrimary(agent.model);
+  const fallbacks =
+    resolveEffectiveModelFallbacks(config.entry?.model, config.defaults?.model) ??
+    (configForm ? null : resolveModelFallbacks(agent.model));
+  const modelLabel = primary ? resolveModelLabel({ primary, fallbacks }) : "-";
   const runtime = resolveAgentRuntimeLabel(agent.agentRuntime);
   const identityName =
     normalizeOptionalString(agent.identity?.name) ||
@@ -295,7 +375,7 @@ export function buildAgentContext(
   const identityAvatar = resolveAgentAvatarUrl(agent, agentIdentity)
     ? "custom"
     : (resolveAgentTextAvatar(agent, agentIdentity) ?? "—");
-  const skillFilter = Array.isArray(config.entry?.skills) ? config.entry?.skills : null;
+  const skillFilter = resolveAgentSkillsFilter(configForm, agent.id);
   const skillCount = skillFilter?.length ?? null;
   return {
     workspace,
@@ -303,7 +383,9 @@ export function buildAgentContext(
     runtime,
     identityName,
     identityAvatar,
-    skillsLabel: skillFilter ? `${skillCount} selected` : "all skills",
+    skillsLabel: skillFilter
+      ? t("agents.overview.selectedSkills", { count: String(skillCount) })
+      : t("agents.overview.allSkills"),
     isDefault: Boolean(defaultId && agent.id === defaultId),
   };
 }
@@ -336,7 +418,7 @@ export function resolveModelLabel(model?: unknown): string {
 
 export function normalizeModelValue(label: string): string {
   const match = label.match(/^(.+) \(\+\d+ fallback\)$/);
-  return match ? match[1] : label;
+  return match?.[1] ?? label;
 }
 
 export function resolveModelPrimary(model?: unknown): string | null {
@@ -387,43 +469,49 @@ export function resolveEffectiveModelFallbacks(
   entryModel?: unknown,
   defaultModel?: unknown,
 ): string[] | null {
-  return resolveModelFallbacks(entryModel) ?? resolveModelFallbacks(defaultModel);
-}
-
-export function parseFallbackList(value: string): string[] {
-  return value
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+  const entryFallbacks = resolveModelFallbacks(entryModel);
+  if (entryFallbacks !== null) {
+    return entryFallbacks;
+  }
+  // An agent-owned primary is strict; only an inherited primary can use
+  // the global fallback chain, matching the Gateway's model routing.
+  return resolveModelPrimary(entryModel) ? [] : resolveModelFallbacks(defaultModel);
 }
 
 type ConfiguredModelOption = {
   value: string;
   label: string;
+  provider?: string;
+  tags?: string[];
+  alias?: string;
 };
 
 function resolveConfiguredModels(
   configForm: Record<string, unknown> | null,
+  agentId?: string,
 ): ConfiguredModelOption[] {
-  const cfg = configForm as ConfigSnapshot | null;
-  const models = cfg?.agents?.defaults?.models;
-  if (!models || typeof models !== "object") {
-    return [];
-  }
+  const defaultModels = (configForm as ConfigSnapshot | null)?.agents?.defaults?.models;
+  const agentModels = agentId ? resolveAgentConfig(configForm, agentId)?.entry?.models : undefined;
+  const modelIds = Object.keys({ ...defaultModels, ...agentModels });
   const options: ConfiguredModelOption[] = [];
-  for (const [modelId, modelRaw] of Object.entries(models)) {
+  for (const modelId of modelIds) {
     const trimmed = modelId.trim();
     if (!trimmed) {
       continue;
     }
+    const defaultMetadata = defaultModels?.[modelId];
+    const agentMetadata = agentModels?.[modelId];
     const alias =
-      modelRaw && typeof modelRaw === "object" && "alias" in modelRaw
-        ? typeof (modelRaw as { alias?: unknown }).alias === "string"
-          ? (modelRaw as { alias?: string }).alias?.trim()
-          : undefined
-        : undefined;
-    const label = alias && alias !== trimmed ? `${alias} (${trimmed})` : trimmed;
-    options.push({ value: trimmed, label });
+      agentMetadata?.alias !== undefined
+        ? (normalizeOptionalString(agentMetadata.alias) ?? "")
+        : normalizeOptionalString(defaultMetadata?.alias);
+    const separator = trimmed.indexOf("/");
+    options.push({
+      value: trimmed,
+      label: alias && alias !== trimmed ? `${alias} (${trimmed})` : trimmed,
+      provider: separator > 0 ? trimmed.slice(0, separator) : undefined,
+      alias,
+    });
   }
   return options;
 }
@@ -432,135 +520,65 @@ export function buildModelOptions(
   configForm: Record<string, unknown> | null,
   current?: string | null,
   catalog?: ModelCatalogEntry[],
-  selected?: string | null,
+  agentId?: string,
 ) {
   const seen = new Set<string>();
   const options: ConfiguredModelOption[] = [];
-  const selectedKey = selected ? normalizeLowercaseStringOrEmpty(selected) : null;
-  const addOption = (value: string, label: string) => {
-    const key = normalizeLowercaseStringOrEmpty(value);
+  const catalogOptions = new Map<string, ConfiguredModelOption>();
+  const configuredOptions = resolveConfiguredModels(configForm, agentId);
+  const addOption = (option: ConfiguredModelOption) => {
+    const key = normalizeLowercaseStringOrEmpty(option.value);
     if (seen.has(key)) {
       return;
     }
     seen.add(key);
-    options.push({ value, label });
+    options.push(option);
   };
 
-  for (const opt of resolveConfiguredModels(configForm)) {
-    addOption(opt.value, opt.label);
+  if (catalog) {
+    const configuredAliases = new Map(
+      configuredOptions.map(
+        (option) => [normalizeLowercaseStringOrEmpty(option.value), option.alias] as const,
+      ),
+    );
+    const displayCatalog = catalog.map((entry) => {
+      const key = normalizeLowercaseStringOrEmpty(`${entry.provider}/${entry.id}`);
+      const alias = configuredAliases.get(key);
+      if (alias === undefined) {
+        return entry;
+      }
+      return { ...entry, alias: alias || undefined };
+    });
+    const displayLookup = buildCatalogDisplayLookup(displayCatalog);
+    for (const entry of displayCatalog) {
+      const option = buildChatModelOptionFromLookup(entry, displayLookup);
+      catalogOptions.set(normalizeLowercaseStringOrEmpty(option.value), {
+        ...option,
+        provider: entry.provider,
+        tags: entry.tags,
+      });
+    }
   }
 
-  if (catalog) {
-    for (const entry of catalog) {
-      const provider = entry.provider?.trim();
-      const value = buildQualifiedChatModelValue(entry.id, provider);
-      const label = provider ? `${entry.id} · ${provider}` : entry.id;
-      addOption(value, label);
-    }
+  for (const opt of configuredOptions) {
+    // Raw config supplies rows the Gateway catalog lacks and explicit alias edits;
+    // catalog identity and tags remain authoritative for matching rows.
+    const catalogOption = catalogOptions.get(normalizeLowercaseStringOrEmpty(opt.value));
+    addOption(catalogOption ?? opt);
+  }
+
+  for (const option of catalogOptions.values()) {
+    addOption(option);
   }
 
   if (current && !seen.has(normalizeLowercaseStringOrEmpty(current))) {
-    options.unshift({ value: current, label: `Current (${current})` });
-  }
-
-  if (options.length === 0) {
-    return nothing;
-  }
-  return options.map(
-    (option) => html`
-      <option
-        value=${option.value}
-        ?selected=${selectedKey === normalizeLowercaseStringOrEmpty(option.value)}
-      >
-        ${option.label}
-      </option>
-    `,
-  );
-}
-
-type CompiledPattern =
-  | { kind: "all" }
-  | { kind: "exact"; value: string }
-  | { kind: "regex"; value: RegExp };
-
-function compilePattern(pattern: string): CompiledPattern {
-  const normalized = normalizeToolName(pattern);
-  if (!normalized) {
-    return { kind: "exact", value: "" };
-  }
-  if (normalized === "*") {
-    return { kind: "all" };
-  }
-  if (!normalized.includes("*")) {
-    return { kind: "exact", value: normalized };
-  }
-  const escaped = normalized.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&");
-  return { kind: "regex", value: new RegExp(`^${escaped.replaceAll("\\*", ".*")}$`) };
-}
-
-function compilePatterns(patterns?: string[]): CompiledPattern[] {
-  if (!Array.isArray(patterns)) {
-    return [];
-  }
-  return expandToolGroups(patterns)
-    .map(compilePattern)
-    .filter((pattern) => {
-      return pattern.kind !== "exact" || pattern.value.length > 0;
+    const separator = current.indexOf("/");
+    options.unshift({
+      value: current,
+      label: `Current (${current})`,
+      provider: separator > 0 ? current.slice(0, separator) : undefined,
     });
-}
+  }
 
-function matchesAny(name: string, patterns: CompiledPattern[]) {
-  for (const pattern of patterns) {
-    if (pattern.kind === "all") {
-      return true;
-    }
-    if (pattern.kind === "exact" && name === pattern.value) {
-      return true;
-    }
-    if (pattern.kind === "regex" && pattern.value.test(name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export function isAllowedByPolicy(name: string, policy?: ToolPolicy) {
-  if (!policy) {
-    return true;
-  }
-  const normalized = normalizeToolName(name);
-  const deny = compilePatterns(policy.deny);
-  if (matchesAny(normalized, deny)) {
-    return false;
-  }
-  const allow = compilePatterns(policy.allow);
-  if (allow.length === 0) {
-    return true;
-  }
-  if (matchesAny(normalized, allow)) {
-    return true;
-  }
-  if (normalized === "apply_patch" && matchesAny("exec", allow)) {
-    return true;
-  }
-  return false;
-}
-
-export function matchesList(name: string, list?: string[]) {
-  if (!Array.isArray(list) || list.length === 0) {
-    return false;
-  }
-  const normalized = normalizeToolName(name);
-  const patterns = compilePatterns(list);
-  if (matchesAny(normalized, patterns)) {
-    return true;
-  }
-  if (normalized === "apply_patch" && matchesAny("exec", patterns)) {
-    return true;
-  }
-  return false;
-}
-
-export function resolveToolProfile(profile: string) {
-  return resolveToolProfilePolicy(profile) ?? undefined;
+  return options;
 }

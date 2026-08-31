@@ -2,13 +2,16 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AuthProfileStore } from "../agents/auth-profiles.js";
 import type { ProviderAuthChoiceMetadata } from "../plugins/provider-auth-choices.js";
-import type { ProviderWizardOption } from "../plugins/provider-wizard.js";
 import {
   buildAuthChoiceGroups,
-  buildAuthChoiceOptions,
   formatAuthChoiceChoicesForCli,
+  isFeaturedAuthChoiceGroup,
 } from "./auth-choice-options.js";
 import { formatStaticAuthChoiceChoicesForCli } from "./auth-choice-options.static.js";
+
+type ProviderWizardOption = ReturnType<
+  (typeof import("../plugins/provider-wizard.js"))["resolveProviderWizardOptions"]
+>[number];
 
 const resolveManifestProviderAuthChoices = vi.hoisted(() =>
   vi.fn<() => ProviderAuthChoiceMetadata[]>(() => []),
@@ -16,22 +19,16 @@ const resolveManifestProviderAuthChoices = vi.hoisted(() =>
 const resolveProviderWizardOptions = vi.hoisted(() =>
   vi.fn<() => ProviderWizardOption[]>(() => []),
 );
-const resolveLegacyAuthChoiceAliasesForCli = vi.hoisted(() => vi.fn<() => string[]>(() => []));
-
-vi.mock("./auth-choice-legacy.js", () => ({
-  resolveLegacyAuthChoiceAliasesForCli,
-}));
-
 function includesOnboardingScope(
   scopes: readonly ("text-inference" | "image-generation" | "music-generation")[] | undefined,
-  scope: "text-inference" | "image-generation" | "music-generation",
+  scope: "text-inference" | "image-generation" | "music-generation" | "all",
 ): boolean {
-  return scopes ? scopes.includes(scope) : scope === "text-inference";
+  return scope === "all" || (scopes ? scopes.includes(scope) : scope === "text-inference");
 }
 
 vi.mock("../flows/provider-flow.js", () => ({
   resolveProviderSetupFlowContributions: vi.fn(
-    (params?: { scope?: "text-inference" | "image-generation" | "music-generation" }) => {
+    (params?: { scope?: "text-inference" | "image-generation" | "music-generation" | "all" }) => {
       const scope = params?.scope ?? "text-inference";
       return [
         ...resolveManifestProviderAuthChoices()
@@ -90,10 +87,12 @@ vi.mock("../flows/provider-flow.js", () => ({
 const EMPTY_STORE: AuthProfileStore = { version: 1, profiles: {} };
 
 function getOptions(includeSkip = false) {
-  return buildAuthChoiceOptions({
+  const { groups, skipOption } = buildAuthChoiceGroups({
     store: EMPTY_STORE,
     includeSkip,
+    assistantVisibleOnly: false,
   });
+  return [...groups.flatMap((group) => group.options), ...(skipOption ? [skipOption] : [])];
 }
 
 function requireChoiceGroup(
@@ -111,7 +110,6 @@ describe("buildAuthChoiceOptions", () => {
   beforeEach(() => {
     resolveManifestProviderAuthChoices.mockReturnValue([]);
     resolveProviderWizardOptions.mockReturnValue([]);
-    resolveLegacyAuthChoiceAliasesForCli.mockReturnValue([]);
   });
 
   it("includes core and provider-specific auth choices", () => {
@@ -355,7 +353,6 @@ describe("buildAuthChoiceOptions", () => {
     ]);
     const options = getOptions(true);
     const cliChoices = formatAuthChoiceChoicesForCli({
-      includeLegacyAliases: false,
       includeSkip: true,
     }).split("|");
 
@@ -366,18 +363,6 @@ describe("buildAuthChoiceOptions", () => {
     expect(cliChoices).toContain("skip");
     expect(options.map((option) => option.value)).toContain("ollama");
     expect(cliChoices).toContain("ollama");
-  });
-
-  it("can include legacy aliases in cli help choices", () => {
-    resolveLegacyAuthChoiceAliasesForCli.mockReturnValue(["claude-cli", "codex-cli"]);
-
-    const cliChoices = formatAuthChoiceChoicesForCli({
-      includeLegacyAliases: true,
-      includeSkip: true,
-    }).split("|");
-
-    expect(cliChoices).toContain("claude-cli");
-    expect(cliChoices).toContain("codex-cli");
   });
 
   it("keeps static cli help choices off the plugin-backed catalog", () => {
@@ -400,10 +385,7 @@ describe("buildAuthChoiceOptions", () => {
       },
     ]);
 
-    const cliChoices = formatStaticAuthChoiceChoicesForCli({
-      includeLegacyAliases: false,
-      includeSkip: true,
-    }).split("|");
+    const cliChoices = formatStaticAuthChoiceChoicesForCli({ includeSkip: true }).split("|");
 
     expect(cliChoices).not.toContain("ollama");
     expect(cliChoices).not.toContain("openai-api-key");
@@ -521,6 +503,16 @@ describe("buildAuthChoiceOptions", () => {
         groupId: "openrouter",
         groupLabel: "OpenRouter",
       },
+      {
+        pluginId: "meta",
+        providerId: "meta",
+        methodId: "api-key",
+        choiceId: "meta-api-key",
+        choiceLabel: "Meta API key",
+        groupId: "meta",
+        groupLabel: "Meta",
+        onboardingFeatured: true,
+      },
     ]);
 
     const { groups } = buildAuthChoiceGroups({
@@ -530,13 +522,21 @@ describe("buildAuthChoiceOptions", () => {
 
     expect(groups.map((group) => group.label)).toEqual([
       "OpenAI",
-      "Anthropic",
+      "OpenRouter",
       "xAI (Grok)",
       "Google",
-      "OpenRouter",
+      "Anthropic",
       "BytePlus",
       "Custom Provider",
       "LiteLLM",
+      "Meta",
+    ]);
+    expect(groups.filter(isFeaturedAuthChoiceGroup).map((group) => group.label)).toEqual([
+      "OpenAI",
+      "OpenRouter",
+      "xAI (Grok)",
+      "Google",
+      "Anthropic",
     ]);
   });
 
@@ -631,6 +631,37 @@ describe("buildAuthChoiceOptions", () => {
     expect(openAIGroup.options[0]?.onboardingFeatured).toBe(true);
   });
 
+  it("includes manual-only methods when the grouped CLI picker requests them", () => {
+    resolveProviderWizardOptions.mockReturnValue([
+      {
+        value: "openai-device-code",
+        label: "ChatGPT Device Pairing",
+        groupId: "openai",
+        groupLabel: "OpenAI",
+        assistantPriority: -10,
+        assistantVisibility: "manual-only",
+      },
+      {
+        value: "openai-api-key",
+        label: "OpenAI API Key",
+        groupId: "openai",
+        groupLabel: "OpenAI",
+        assistantPriority: 5,
+      },
+    ]);
+
+    const { groups } = buildAuthChoiceGroups({
+      store: EMPTY_STORE,
+      includeSkip: false,
+      assistantVisibleOnly: false,
+    });
+
+    expect(requireChoiceGroup(groups, "openai").options.map((option) => option.value)).toEqual([
+      "openai-device-code",
+      "openai-api-key",
+    ]);
+  });
+
   it("groups OpenCode Zen and Go under one OpenCode entry", () => {
     resolveManifestProviderAuthChoices.mockReturnValue([
       {
@@ -663,7 +694,7 @@ describe("buildAuthChoiceOptions", () => {
     expect(openCodeValues).toContain("opencode-go");
   });
 
-  it("hides media-generation-only providers from the interactive auth picker", () => {
+  it("keeps media-generation auth choices available to the CLI but out of the interactive picker", () => {
     resolveManifestProviderAuthChoices.mockReturnValue([
       {
         pluginId: "fal",
@@ -673,6 +704,16 @@ describe("buildAuthChoiceOptions", () => {
         choiceLabel: "fal API key",
         groupId: "fal",
         groupLabel: "fal",
+        onboardingScopes: ["image-generation", "music-generation"],
+      },
+      {
+        pluginId: "vydra",
+        providerId: "vydra",
+        methodId: "api-key",
+        choiceId: "vydra-api-key",
+        choiceLabel: "Vydra API key",
+        groupId: "vydra",
+        groupLabel: "Vydra",
         onboardingScopes: ["image-generation"],
       },
       {
@@ -720,12 +761,25 @@ describe("buildAuthChoiceOptions", () => {
 
     const options = getOptions();
     const optionValues = options.map((option) => option.value);
+    const cliChoiceValues = formatAuthChoiceChoicesForCli({
+      includeSkip: true,
+    }).split("|");
 
     expect(optionValues).toContain("openai-api-key");
     expect(optionValues).toContain("ollama");
     expect(optionValues).not.toContain("fal-api-key");
+    expect(optionValues).not.toContain("vydra-api-key");
     expect(optionValues).not.toContain("openrouter-api-key");
     expect(optionValues).not.toContain("local-image-runtime");
     expect(optionValues).not.toContain("local-music-runtime");
+    expect(cliChoiceValues).toEqual(
+      expect.arrayContaining([
+        "openai-api-key",
+        "fal-api-key",
+        "vydra-api-key",
+        "openrouter-api-key",
+      ]),
+    );
+    expect(cliChoiceValues.filter((choice) => choice === "fal-api-key")).toHaveLength(1);
   });
 });

@@ -4,34 +4,22 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { resolveOpenClawAgentSqlitePath } from "openclaw/plugin-sdk/sqlite-runtime";
+import { closeOpenClawAgentDatabasesForTest } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetEmbeddingMocks } from "./embedding.test-mocks.js";
-import type { MemoryIndexManager } from "./index.js";
-import { acquireMemoryReindexLock } from "./manager-reindex-lock.js";
+import { tryAcquireMemoryReindexLock, waitForMemoryReindexLock } from "./manager-reindex-lock.js";
 import type { MemoryIndexMeta } from "./manager-reindex-state.js";
+import type { MemoryIndexManager } from "./manager.js";
 
-type SessionDeltaState = { lastSize: number; pendingBytes: number; pendingMessages: number };
-type SyncSessionParams = { needsFullReindex: boolean; targetSessionFiles?: string[] };
-const originalReindexStateDir = process.env.OPENCLAW_STATE_DIR;
-
-function setReindexStateDir(stateDir: string): void {
-  Reflect.set(process.env, "OPENCLAW_STATE_DIR", stateDir);
-}
-
-function restoreReindexStateDir(): void {
-  if (originalReindexStateDir === undefined) {
-    Reflect.deleteProperty(process.env, "OPENCLAW_STATE_DIR");
-  } else {
-    Reflect.set(process.env, "OPENCLAW_STATE_DIR", originalReindexStateDir);
-  }
-}
+type SyncArchiveParams = { needsFullReindex: boolean; targetArchiveFiles?: string[] };
 
 type ReindexHarness = {
   sync: (params: { reason?: string; force?: boolean }) => Promise<void>;
   runInPlaceReindex: (params: { reason?: string; force?: boolean }) => Promise<void>;
   syncMemoryFiles: (params: { needsFullReindex: boolean }) => Promise<unknown>;
-  syncSessionFiles: (params: SyncSessionParams) => Promise<unknown>;
+  syncArchiveFiles: (params: SyncArchiveParams) => Promise<unknown>;
   db: DatabaseSync;
   writeMeta: (meta: MemoryIndexMeta) => void;
   providerKey: string | null;
@@ -40,7 +28,6 @@ type ReindexHarness = {
   sessionsDirty: boolean;
   sessionsFullRetryDirty: boolean;
   sessionsDirtyFiles: Set<string>;
-  sessionDeltas: Map<string, SessionDeltaState>;
 };
 
 describe("memory manager reindex recovery", () => {
@@ -55,11 +42,11 @@ describe("memory manager reindex recovery", () => {
     workspaceDir = path.join(fixtureRoot, "workspace");
     memoryDir = path.join(workspaceDir, "memory");
     await fs.mkdir(memoryDir, { recursive: true });
-    setReindexStateDir(path.join(fixtureRoot, "state"));
+    vi.stubEnv("OPENCLAW_STATE_DIR", path.join(fixtureRoot, "state"));
   });
 
   afterEach(async () => {
-    restoreReindexStateDir();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     if (manager) {
       await manager.close();
@@ -67,6 +54,10 @@ describe("memory manager reindex recovery", () => {
     }
     const { closeAllMemorySearchManagers } = await import("./index.js");
     await closeAllMemorySearchManagers();
+    // The agent close releases its leases through shared state and reopens it, so the
+    // shared handle is released second; otherwise Windows fails the removal with EBUSY.
+    closeOpenClawAgentDatabasesForTest();
+    resetPluginStateStoreForTests();
     await fs.rm(fixtureRoot, { recursive: true, force: true });
   });
 
@@ -75,21 +66,19 @@ describe("memory manager reindex recovery", () => {
     sources?: Array<"memory" | "sessions">;
   }): OpenClawConfig {
     return {
-      memory: { backend: "builtin" },
+      memory: {
+        search: {
+          provider: params.provider ?? "openai",
+          model: "mock-embed",
+          store: { vector: {} },
+          cache: { enabled: false },
+          sources: params.sources,
+          rememberAcrossConversations: params.sources?.includes("sessions") ?? false,
+        },
+      },
       agents: {
         defaults: {
           workspace: workspaceDir,
-          memorySearch: {
-            provider: params.provider ?? "openai",
-            model: "mock-embed",
-            store: { vector: { enabled: false } },
-            chunking: { tokens: 4000, overlap: 0 },
-            sync: { watch: false, onSessionStart: false, onSearch: false },
-            remote: { nonBatchConcurrency: 1 },
-            cache: { enabled: false },
-            sources: params.sources,
-            experimental: { sessionMemory: params.sources?.includes("sessions") ?? false },
-          },
         },
         list: [{ id: "main", default: true }],
       },
@@ -109,6 +98,14 @@ describe("memory manager reindex recovery", () => {
     return manager;
   }
 
+  function acquireTestReindexLock(databasePath: string) {
+    const lock = tryAcquireMemoryReindexLock(databasePath);
+    if (!lock) {
+      throw new Error("expected test to acquire the memory reindex lock");
+    }
+    return lock;
+  }
+
   it("restores retry state after a shadow full reindex fails late", async () => {
     const memoryManager = await openManager(
       createCfg({
@@ -118,27 +115,13 @@ describe("memory manager reindex recovery", () => {
     );
     const harness = memoryManager as unknown as ReindexHarness;
     const dirtySessionFile = path.join(workspaceDir, "sessions", "dirty.jsonl");
-    const originalDelta: SessionDeltaState = {
-      lastSize: 42,
-      pendingBytes: 100,
-      pendingMessages: 2,
-    };
     const emptySyncPlan = { indexItems: [], finalize: () => undefined };
 
     harness.dirty = true;
     harness.sessionsDirty = true;
     harness.sessionsDirtyFiles.add(dirtySessionFile);
-    harness.sessionDeltas.set(dirtySessionFile, { ...originalDelta });
     harness.syncMemoryFiles = async () => emptySyncPlan;
-    harness.syncSessionFiles = async () => {
-      const delta = harness.sessionDeltas.get(dirtySessionFile);
-      if (delta) {
-        delta.lastSize = 500;
-        delta.pendingBytes = 0;
-        delta.pendingMessages = 0;
-      }
-      return emptySyncPlan;
-    };
+    harness.syncArchiveFiles = async () => emptySyncPlan;
     harness.writeMeta = () => {
       throw new Error("late reindex failure");
     };
@@ -151,7 +134,6 @@ describe("memory manager reindex recovery", () => {
     expect(harness.memoryFullRetryDirty).toBe(true);
     expect(harness.sessionsDirty).toBe(true);
     expect(Array.from(harness.sessionsDirtyFiles)).toEqual([dirtySessionFile]);
-    expect(harness.sessionDeltas.get(dirtySessionFile)).toEqual(originalDelta);
   });
 
   it("marks clean full reindex work dirty after a shadow full reindex fails late", async () => {
@@ -165,7 +147,7 @@ describe("memory manager reindex recovery", () => {
     const emptySyncPlan = { indexItems: [], finalize: () => undefined };
 
     harness.syncMemoryFiles = async () => emptySyncPlan;
-    harness.syncSessionFiles = async () => emptySyncPlan;
+    harness.syncArchiveFiles = async () => emptySyncPlan;
     harness.writeMeta = () => {
       throw new Error("late clean reindex failure");
     };
@@ -215,7 +197,7 @@ describe("memory manager reindex recovery", () => {
     const memoryManager = await openManager(createCfg({ provider: "none", sources: ["memory"] }));
     const harness = memoryManager as unknown as ReindexHarness;
     const databasePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
-    const lock = acquireMemoryReindexLock(databasePath);
+    const lock = acquireTestReindexLock(databasePath);
 
     try {
       await expect(harness.runInPlaceReindex({ reason: "test", force: true })).rejects.toThrow(
@@ -223,6 +205,35 @@ describe("memory manager reindex recovery", () => {
       );
     } finally {
       lock.release();
+    }
+  });
+
+  it("waits for the build lock without blocking the event loop", async () => {
+    const databasePath = resolveOpenClawAgentSqlitePath({ agentId: "main" });
+    await fs.mkdir(path.dirname(databasePath), { recursive: true });
+    const lock = acquireTestReindexLock(databasePath);
+    let timerFired = false;
+    let lockReleased = false;
+
+    try {
+      const wait = waitForMemoryReindexLock(databasePath);
+      const timer = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          timerFired = true;
+          resolve();
+        }, 10);
+      });
+
+      await timer;
+      expect(timerFired).toBe(true);
+      lock.release();
+      lockReleased = true;
+      const waitedLock = await wait;
+      waitedLock.release();
+    } finally {
+      if (!lockReleased) {
+        lock.release();
+      }
     }
   });
 
@@ -237,12 +248,12 @@ describe("memory manager reindex recovery", () => {
 
     const harness = memoryManager as unknown as ReindexHarness;
     const emptySyncPlan = { indexItems: [], finalize: () => undefined };
-    const sessionSyncCalls: SyncSessionParams[] = [];
+    const sessionSyncCalls: SyncArchiveParams[] = [];
 
     harness.sessionsDirty = true;
     harness.sessionsFullRetryDirty = true;
     harness.sessionsDirtyFiles.clear();
-    harness.syncSessionFiles = async (params) => {
+    harness.syncArchiveFiles = async (params) => {
       sessionSyncCalls.push(params);
       return emptySyncPlan;
     };
@@ -251,7 +262,7 @@ describe("memory manager reindex recovery", () => {
 
     expect(sessionSyncCalls).toHaveLength(1);
     expect(sessionSyncCalls[0]).toMatchObject({ needsFullReindex: true });
-    expect(sessionSyncCalls[0]?.targetSessionFiles).toBeUndefined();
+    expect(sessionSyncCalls[0]?.targetArchiveFiles).toBeUndefined();
     expect(harness.sessionsDirty).toBe(false);
     expect(harness.sessionsFullRetryDirty).toBe(false);
   });

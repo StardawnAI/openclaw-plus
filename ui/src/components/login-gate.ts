@@ -1,17 +1,19 @@
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 // Control UI component renders the login gate.
-import { LitElement, html, nothing } from "lit";
+import { html, nothing } from "lit";
 import { property } from "lit/decorators.js";
 import { ConnectErrorDetailCodes } from "../../../packages/gateway-protocol/src/connect-error-details.js";
 import { normalizeBasePath } from "../app-route-paths.ts";
 import { controlUiPublicAssetPath } from "../app/public-assets.ts";
 import { t } from "../i18n/index.ts";
-import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "../lib/external-link.ts";
 import {
   resolveAuthHintKind,
   resolvePairingHint,
   shouldShowInsecureContextHint,
-} from "../lib/overview-hints.ts";
-import { normalizeLowercaseStringOrEmpty } from "../lib/string-coerce.ts";
+} from "../lib/connection-hints.ts";
+import { buildExternalLinkRel, EXTERNAL_LINK_TARGET } from "../lib/external-link.ts";
+import { formatUiError } from "../lib/format-error.ts";
+import { OpenClawLightDomContentsElement } from "../lit/openclaw-element.ts";
 import { renderConnectCommand } from "./connect-command.ts";
 import { icons } from "./icons.ts";
 
@@ -22,21 +24,35 @@ type LoginFailureKind =
   | "pairing-required"
   | "insecure-context"
   | "origin-not-allowed"
+  | "build-mismatch"
   | "protocol-mismatch"
   | "network";
+
+type LoginFailureStep = {
+  text: string;
+  commands: string[];
+};
+
+type LoginFailureStepDefinition =
+  | string
+  | {
+      key: string;
+      commands: string[];
+    };
 
 type LoginFailureFeedback = {
   kind: LoginFailureKind;
   title: string;
   summary: string;
-  steps: string[];
+  refreshAction?: { label: string };
+  steps: LoginFailureStep[];
   docsHref: string;
   docsLabel: string;
   rawError: string;
 };
 
 type LoginGateProps = {
-  basePath: string;
+  resourceBasePath: string;
   connected: boolean;
   lastError: string | null;
   lastErrorCode?: string | null;
@@ -73,9 +89,9 @@ function resolveDocsLabel(href: string): string {
   return t("login.failure.docsAuth");
 }
 
-// Shared with the connection banner so no offline surface prints credentials.
+// Shared with offline presentation so no disconnected surface prints credentials.
 export function redactLoginFailureError(value: string): string {
-  return value
+  const redacted = value
     .replace(
       /([?#&])(?:access_token|auth|deviceToken|password|refresh_token|token)=([^&#\s]+)/gi,
       "$1[redacted-credential]",
@@ -85,6 +101,7 @@ export function redactLoginFailureError(value: string): string {
       /(["']?(?:access|accessToken|deviceToken|password|refresh|refreshToken|token)["']?\s*[:=]\s*)["']?[^"',\s}]+/gi,
       "$1[redacted]",
     );
+  return formatUiError(redacted);
 }
 
 function buildFeedback(params: {
@@ -93,15 +110,21 @@ function buildFeedback(params: {
   docsHref?: string;
   titleKey: string;
   summaryKey: string;
-  stepKeys: string[];
+  stepKeys: LoginFailureStepDefinition[];
   stepParams?: Record<string, string>;
+  refreshAction?: { label: string };
 }): LoginFailureFeedback {
   const docsHref = params.docsHref ?? "https://docs.openclaw.ai/web/dashboard";
   return {
     kind: params.kind,
     title: t(params.titleKey, params.stepParams),
     summary: t(params.summaryKey, params.stepParams),
-    steps: params.stepKeys.map((key) => t(key, params.stepParams)),
+    refreshAction: params.refreshAction,
+    steps: params.stepKeys.map((step) =>
+      typeof step === "string"
+        ? { text: t(step, params.stepParams), commands: [] }
+        : { text: t(step.key, params.stepParams), commands: step.commands },
+    ),
     docsHref,
     docsLabel: resolveDocsLabel(docsHref),
     rawError: redactLoginFailureError(params.rawError),
@@ -119,8 +142,23 @@ function resolveLoginFailureFeedback(
   const lastErrorCode = params.lastErrorCode ?? null;
   const lower = normalizeLowercaseStringOrEmpty(rawError);
 
+  if (lastErrorCode === ConnectErrorDetailCodes.CONTROL_UI_BUILD_MISMATCH) {
+    return buildFeedback({
+      kind: "build-mismatch",
+      rawError,
+      titleKey: "chat.sidebar.serverUpdatedTitle",
+      summaryKey: "chat.sidebar.serverUpdatedRefresh",
+      refreshAction: { label: t("login.failure.protocol.refresh") },
+      stepKeys: [],
+      docsHref: "https://docs.openclaw.ai/web/control-ui",
+    });
+  }
+
   const pairing = resolvePairingHint(false, rawError, lastErrorCode);
   if (pairing) {
+    const approvalCommand = pairing.requestId
+      ? `openclaw devices approve ${pairing.requestId}`
+      : null;
     return buildFeedback({
       kind: "pairing-required",
       rawError,
@@ -138,9 +176,16 @@ function resolveLoginFailureFeedback(
           ? "login.failure.pairing.summary"
           : "login.failure.pairing.upgradeSummary",
       stepKeys: [
-        "login.failure.pairing.stepList",
-        pairing.requestId
-          ? "login.failure.pairing.stepApproveId"
+        {
+          key: "login.failure.pairing.stepDashboard",
+          commands: ["openclaw dashboard"],
+        },
+        {
+          key: "login.failure.pairing.stepList",
+          commands: ["openclaw devices list"],
+        },
+        approvalCommand
+          ? { key: "login.failure.pairing.stepApproveId", commands: [approvalCommand] }
           : "login.failure.pairing.stepApprove",
         "login.failure.pairing.stepReconnect",
       ],
@@ -173,11 +218,7 @@ function resolveLoginFailureFeedback(
       docsHref: "https://docs.openclaw.ai/web/control-ui#insecure-http",
       titleKey: "login.failure.insecure.title",
       summaryKey: "login.failure.insecure.summary",
-      stepKeys: [
-        "login.failure.insecure.stepHttps",
-        "login.failure.insecure.stepLocalCompat",
-        "login.failure.insecure.stepAvoidDisable",
-      ],
+      stepKeys: ["login.failure.insecure.stepHttps", "login.failure.insecure.stepAvoidDisable"],
     });
   }
 
@@ -208,9 +249,16 @@ function resolveLoginFailureFeedback(
         "https://docs.openclaw.ai/web/control-ui#debuggingtesting-dev-server--remote-gateway",
       titleKey: "login.failure.protocol.title",
       summaryKey: "login.failure.protocol.summary",
+      refreshAction: { label: t("login.failure.protocol.refresh") },
       stepKeys: [
-        "login.failure.protocol.stepDashboard",
-        "login.failure.protocol.stepDevUi",
+        {
+          key: "login.failure.protocol.stepDashboard",
+          commands: ["openclaw dashboard"],
+        },
+        {
+          key: "login.failure.protocol.stepDevUi",
+          commands: ["pnpm ui:dev"],
+        },
         "login.failure.protocol.stepRestart",
       ],
     });
@@ -230,8 +278,14 @@ function resolveLoginFailureFeedback(
       titleKey: "login.failure.authRequired.title",
       summaryKey: "login.failure.authRequired.summary",
       stepKeys: [
-        "login.failure.authRequired.stepPaste",
-        "login.failure.authRequired.stepGenerate",
+        {
+          key: "login.failure.authRequired.stepPaste",
+          commands: ["openclaw gateway auth-token --show"],
+        },
+        {
+          key: "login.failure.authRequired.stepGenerate",
+          commands: ["openclaw doctor --generate-gateway-token"],
+        },
         "login.failure.authRequired.stepConnect",
       ],
     });
@@ -243,7 +297,10 @@ function resolveLoginFailureFeedback(
       titleKey: "login.failure.authFailed.title",
       summaryKey: "login.failure.authFailed.summary",
       stepKeys: [
-        "login.failure.authFailed.stepDashboard",
+        {
+          key: "login.failure.authFailed.stepDashboard",
+          commands: ["openclaw dashboard --no-open", "openclaw gateway auth-token --show"],
+        },
         "login.failure.authFailed.stepReplace",
         "login.failure.authFailed.stepMode",
       ],
@@ -256,11 +313,65 @@ function resolveLoginFailureFeedback(
     titleKey: "login.failure.network.title",
     summaryKey: "login.failure.network.summary",
     stepKeys: [
-      "login.failure.network.stepGateway",
+      {
+        key: "login.failure.network.stepGateway",
+        commands: ["openclaw status", "openclaw gateway run"],
+      },
       "login.failure.network.stepUrl",
-      "login.failure.network.stepDashboard",
+      {
+        key: "login.failure.network.stepDashboard",
+        commands: ["openclaw dashboard --no-open"],
+      },
     ],
   });
+}
+
+function refreshLoginGatePage() {
+  // The login gate blocks before the composer mounts, so there is no draft to preserve.
+  window.location.reload();
+}
+
+type LoginFailureStepSegment = { kind: "text"; value: string } | { kind: "command"; value: string };
+
+function segmentLoginFailureStep(text: string, commands: string[]): LoginFailureStepSegment[] {
+  const unmatchedCommands = new Set(commands);
+  const matches = [...unmatchedCommands]
+    .map((command) => ({ command, index: text.indexOf(command) }))
+    .filter((match) => match.index >= 0)
+    .toSorted(
+      (left, right) => left.index - right.index || right.command.length - left.command.length,
+    );
+  const segments: LoginFailureStepSegment[] = [];
+  let cursor = 0;
+
+  for (const match of matches) {
+    if (match.index < cursor) {
+      continue;
+    }
+    if (match.index > cursor) {
+      segments.push({ kind: "text", value: text.slice(cursor, match.index) });
+    }
+    segments.push({ kind: "command", value: match.command });
+    unmatchedCommands.delete(match.command);
+    cursor = match.index + match.command.length;
+  }
+
+  if (cursor < text.length || !segments.length) {
+    segments.push({ kind: "text", value: text.slice(cursor) });
+  }
+  for (const command of unmatchedCommands) {
+    if (segments.length) {
+      segments.push({ kind: "text", value: " " });
+    }
+    segments.push({ kind: "command", value: command });
+  }
+  return segments;
+}
+
+function renderLoginFailureStep(step: LoginFailureStep) {
+  return segmentLoginFailureStep(step.text, step.commands).map((segment) =>
+    segment.kind === "command" ? renderConnectCommand(segment.value) : segment.value,
+  );
 }
 
 function renderLoginFailure(feedback: LoginFailureFeedback) {
@@ -273,8 +384,19 @@ function renderLoginFailure(feedback: LoginFailureFeedback) {
     >
       <div class="login-gate__failure-title">${feedback.title}</div>
       <div class="login-gate__failure-summary">${feedback.summary}</div>
+      ${feedback.refreshAction
+        ? html`
+            <button
+              type="button"
+              class="btn primary login-gate__failure-refresh"
+              @click=${refreshLoginGatePage}
+            >
+              ${feedback.refreshAction.label}
+            </button>
+          `
+        : nothing}
       <ol class="login-gate__failure-steps">
-        ${feedback.steps.map((step) => html`<li>${step}</li>`)}
+        ${feedback.steps.map((step) => html`<li>${renderLoginFailureStep(step)}</li>`)}
       </ol>
       <details class="login-gate__failure-detail">
         <summary>${t("login.failure.rawError")}</summary>
@@ -292,8 +414,8 @@ function renderLoginFailure(feedback: LoginFailureFeedback) {
 }
 
 function renderLoginGate(props: LoginGateProps) {
-  const basePath = normalizeBasePath(props.basePath);
-  const faviconSrc = controlUiPublicAssetPath("favicon.svg", basePath);
+  const resourceBasePath = normalizeBasePath(props.resourceBasePath);
+  const faviconSrc = controlUiPublicAssetPath("favicon.svg", resourceBasePath);
   const failure = resolveLoginFailureFeedback({
     connected: props.connected,
     lastError: props.lastError,
@@ -312,7 +434,7 @@ function renderLoginGate(props: LoginGateProps) {
         </div>
         <div class="login-gate__form">
           <label class="field">
-            <span>${t("overview.access.wsUrl")}</span>
+            <span>${t("connection.access.wsUrl")}</span>
             <input
               inputmode="url"
               autocapitalize="none"
@@ -333,8 +455,8 @@ function renderLoginGate(props: LoginGateProps) {
             />
           </label>
           <label class="field">
-            <span>${t("overview.access.token")}</span>
-            <div class="login-gate__secret-row">
+            <span>${t("connection.access.token")}</span>
+            <span class="settings-secret">
               <input
                 type=${props.showGatewayToken ? "text" : "password"}
                 autocomplete="off"
@@ -356,7 +478,7 @@ function renderLoginGate(props: LoginGateProps) {
               >
                 <button
                   type="button"
-                  class="btn btn--icon ${props.showGatewayToken ? "active" : ""}"
+                  class="settings-secret__toggle"
                   aria-label=${t("login.toggleTokenVisibility")}
                   aria-pressed=${props.showGatewayToken}
                   @click=${props.onToggleGatewayToken}
@@ -364,11 +486,11 @@ function renderLoginGate(props: LoginGateProps) {
                   ${props.showGatewayToken ? icons.eye : icons.eyeOff}
                 </button>
               </openclaw-tooltip>
-            </div>
+            </span>
           </label>
           <label class="field">
-            <span>${t("overview.access.password")}</span>
-            <div class="login-gate__secret-row">
+            <span>${t("connection.access.password")}</span>
+            <span class="settings-secret">
               <input
                 type=${props.showGatewayPassword ? "text" : "password"}
                 autocomplete="off"
@@ -392,7 +514,7 @@ function renderLoginGate(props: LoginGateProps) {
               >
                 <button
                   type="button"
-                  class="btn btn--icon ${props.showGatewayPassword ? "active" : ""}"
+                  class="settings-secret__toggle"
                   aria-label=${t("login.togglePasswordVisibility")}
                   aria-pressed=${props.showGatewayPassword}
                   @click=${props.onToggleGatewayPassword}
@@ -400,7 +522,7 @@ function renderLoginGate(props: LoginGateProps) {
                   ${props.showGatewayPassword ? icons.eye : icons.eyeOff}
                 </button>
               </openclaw-tooltip>
-            </div>
+            </span>
           </label>
           <button class="btn primary login-gate__connect" @click=${props.onConnect}>
             ${t("common.connect")}
@@ -408,13 +530,11 @@ function renderLoginGate(props: LoginGateProps) {
         </div>
         ${failure ? renderLoginFailure(failure) : ""}
         <details class="login-gate__help">
-          <summary class="login-gate__help-title">${t("overview.connection.title")}</summary>
+          <summary class="login-gate__help-title">${t("connection.help.title")}</summary>
           <ol class="login-gate__steps">
-            <li>
-              ${t("overview.connection.step1")}${renderConnectCommand("openclaw gateway run")}
-            </li>
-            <li>${t("overview.connection.step2")} ${renderConnectCommand("openclaw dashboard")}</li>
-            <li>${t("overview.connection.step3")}</li>
+            <li>${t("connection.help.step1")}${renderConnectCommand("openclaw gateway run")}</li>
+            <li>${t("connection.help.step2")} ${renderConnectCommand("openclaw dashboard")}</li>
+            <li>${t("connection.help.step3")}</li>
           </ol>
           <div class="login-gate__docs">
             <a
@@ -422,7 +542,7 @@ function renderLoginGate(props: LoginGateProps) {
               href="https://docs.openclaw.ai/web/dashboard"
               target="_blank"
               rel="noreferrer"
-              >${t("overview.connection.docsLink")}</a
+              >${t("connection.help.docsLink")}</a
             >
           </div>
         </details>
@@ -431,17 +551,8 @@ function renderLoginGate(props: LoginGateProps) {
   `;
 }
 
-class LoginGate extends LitElement {
-  override createRenderRoot() {
-    return this;
-  }
-
+class LoginGate extends OpenClawLightDomContentsElement {
   @property({ attribute: false }) props?: LoginGateProps;
-
-  override connectedCallback() {
-    super.connectedCallback();
-    this.style.display = "contents";
-  }
 
   override render() {
     return this.props ? renderLoginGate(this.props) : nothing;

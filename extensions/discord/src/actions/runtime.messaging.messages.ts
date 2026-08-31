@@ -4,7 +4,8 @@ import {
   readPositiveIntegerParam,
   readStringArrayParam,
   readStringParam,
-} from "../runtime-api.js";
+} from "openclaw/plugin-sdk/channel-actions";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { discordMessagingActionRuntime } from "./runtime.messaging.runtime.js";
 import type { DiscordMessagingActionContext } from "./runtime.messaging.shared.js";
 
@@ -112,6 +113,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       );
       return jsonResult({
         ok: true,
+        channelId,
         messages: messages.map((message) => ctx.normalizeMessage(message)),
       });
     }
@@ -126,6 +128,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const content = readStringParam(ctx.params, "content", {
         required: true,
       });
+      await ctx.assertReadTargetAllowed({ channelId });
       const message = await discordMessagingActionRuntime.editMessageDiscord(
         channelId,
         messageId,
@@ -142,6 +145,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
+      await ctx.assertReadTargetAllowed({ channelId });
       await discordMessagingActionRuntime.deleteMessageDiscord(
         channelId,
         messageId,
@@ -157,6 +161,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
+      await ctx.assertReadTargetAllowed({ channelId });
       await discordMessagingActionRuntime.pinMessageDiscord(channelId, messageId, ctx.withOpts());
       return jsonResult({ ok: true });
     }
@@ -168,6 +173,7 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
       const messageId = readStringParam(ctx.params, "messageId", {
         required: true,
       });
+      await ctx.assertReadTargetAllowed({ channelId });
       await discordMessagingActionRuntime.unpinMessageDiscord(channelId, messageId, ctx.withOpts());
       return jsonResult({ ok: true });
     }
@@ -203,9 +209,8 @@ export async function handleDiscordMessageManagementAction(ctx: DiscordMessaging
               inferChannelId,
               ctx.withOpts(),
             );
-            if (channelInfo && typeof channelInfo === "object") {
-              const record = channelInfo as unknown as Record<string, unknown>;
-              const resolved = record.guild_id ?? record.guildId;
+            if (isRecord(channelInfo)) {
+              const resolved = channelInfo.guild_id ?? channelInfo.guildId;
               if (typeof resolved === "string" && resolved.trim()) {
                 guildId = resolved.trim();
               }

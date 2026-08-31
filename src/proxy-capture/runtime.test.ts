@@ -1,12 +1,11 @@
 // Proxy capture runtime tests cover session creation and capture lifecycle.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  registerSecretValueForRedaction,
-  resetSecretRedactionRegistryForTest,
-} from "../logging/secret-redaction-registry.js";
+import { registerSecretValueForRedaction } from "../logging/secret-redaction-registry.js";
+import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.test-support.js";
 import type { DebugProxySettings } from "./env.js";
 import {
   captureHttpExchange,
+  captureWsEvent,
   finalizeDebugProxyCapture,
   initializeDebugProxyCapture,
   type DebugProxyCaptureRuntimeDeps,
@@ -54,7 +53,11 @@ const deps: DebugProxyCaptureRuntimeDeps = {
     payload: { data?: Buffer | string | null; contentType?: string },
   ) => ({
     contentType: payload.contentType,
-    ...(typeof payload.data === "string" ? { dataText: payload.data } : {}),
+    ...(typeof payload.data === "string"
+      ? { dataText: payload.data }
+      : Buffer.isBuffer(payload.data)
+        ? { dataText: payload.data.toString("utf8") }
+        : {}),
   }),
   safeJsonString: (value: unknown) => (value == null ? undefined : JSON.stringify(value)),
 };
@@ -168,8 +171,10 @@ describe("debug proxy runtime", () => {
           Cookie: "sid=session-token",
           "x-api-key": "provider-key",
           "content-type": "application/json",
+          "X-Routing-Target": "staging-private-route",
           "x-safe": "visible",
         },
+        meta: { sensitiveRequestHeaderNames: ["x-routing-target"] },
         response: new Response("{}", {
           status: 200,
           headers: {
@@ -192,6 +197,7 @@ describe("debug proxy runtime", () => {
       Cookie: "[REDACTED]",
       "x-api-key": "[REDACTED]",
       "content-type": "application/json",
+      "X-Routing-Target": "[REDACTED]",
       "x-safe": "visible",
     });
     const response = events.find((event) => event.kind === "response");
@@ -225,6 +231,107 @@ describe("debug proxy runtime", () => {
     expect(JSON.parse(String(request?.headersJson))).toStrictEqual({
       "X-Managed": "Bearer [REDACTED]",
     });
+  });
+
+  it("redacts registered values from every persisted WebSocket field", () => {
+    const secret = 'mattermost-"capture\\secret\nline';
+    registerSecretValueForRedaction(secret);
+
+    captureWsEvent(
+      {
+        url: `wss://chat.example.test/api/v4/websocket?token=${encodeURIComponent(secret)}`,
+        direction: "outbound",
+        kind: "ws-frame",
+        flowId: "mattermost-auth",
+        payload: JSON.stringify({ action: "authentication_challenge", data: { token: secret } }),
+        errorText: `failed with ${secret}`,
+        meta: { subsystem: "mattermost-websocket", detail: secret },
+      },
+      settings,
+      deps,
+    );
+    captureWsEvent(
+      {
+        url: "wss://chat.example.test/api/v4/websocket",
+        direction: "inbound",
+        kind: "ws-frame",
+        flowId: "mattermost-auth",
+        payload: Buffer.from(JSON.stringify({ echoedToken: secret })),
+      },
+      settings,
+      deps,
+    );
+
+    const [outbound, inbound] = events;
+    expect(outbound?.path).toBe("/api/v4/websocket?token=%5BREDACTED%5D");
+    expect(outbound?.dataText).toContain('"token":"[REDACTED]"');
+    expect(outbound?.errorText).toBe("failed with [REDACTED]");
+    expect(JSON.parse(String(outbound?.metaJson))).toStrictEqual({
+      subsystem: "mattermost-websocket",
+      detail: "[REDACTED]",
+    });
+    expect(inbound?.dataText).toContain('"echoedToken":"[REDACTED]"');
+    expect(JSON.stringify(events)).not.toContain(secret);
+    expect(JSON.stringify(events)).not.toContain(JSON.stringify(secret).slice(1, -1));
+  });
+
+  it("redacts registered credential bytes from otherwise non-UTF-8 frames", () => {
+    const secret = "binary-frame-capture-secret";
+    registerSecretValueForRedaction(secret);
+    const payload = Buffer.concat([
+      Buffer.from([0xff, 0x00]),
+      Buffer.from(secret, "utf8"),
+      Buffer.from([0xfe]),
+    ]);
+
+    captureWsEvent(
+      {
+        url: "wss://chat.example.test/api/v4/websocket",
+        direction: "outbound",
+        kind: "ws-frame",
+        flowId: "binary-auth",
+        payload,
+      },
+      settings,
+      deps,
+    );
+
+    expect(events[0]?.dataText).toBe("[REDACTED BINARY PAYLOAD]");
+    expect(events[0]?.dataText).not.toContain(secret);
+  });
+
+  it("redacts registered values from HTTP payloads and metadata", async () => {
+    const secret = 'http-"capture\\secret\nline';
+    const contentTypeSecret = "http-content-type-secret";
+    registerSecretValueForRedaction(secret);
+    registerSecretValueForRedaction(contentTypeSecret);
+
+    captureHttpExchange(
+      {
+        url: "https://api.example.test/v1/messages",
+        method: "POST",
+        requestHeaders: { "content-type": `application/json; token=${contentTypeSecret}` },
+        requestBody: JSON.stringify({ credential: secret }),
+        response: new Response(JSON.stringify({ echoedCredential: secret }), {
+          status: 200,
+          headers: { "content-type": `application/json; token=${contentTypeSecret}` },
+        }),
+        meta: { credential: secret },
+      },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+
+    const request = events.find((event) => event.kind === "request");
+    const response = events.find((event) => event.kind === "response");
+    expect(request?.dataText).toContain('"credential":"[REDACTED]"');
+    expect(request?.metaJson).toContain('"credential":"[REDACTED]"');
+    expect(request?.contentType).toBe("application/json; token=[REDACTED]");
+    expect(response?.dataText).toContain('"echoedCredential":"[REDACTED]"');
+    expect(response?.metaJson).toContain('"credential":"[REDACTED]"');
+    expect(response?.contentType).toBe("application/json; token=[REDACTED]");
+    expect(JSON.stringify(events)).not.toContain(secret);
   });
 
   it("redacts registered values from failed global-fetch capture events", async () => {
@@ -301,6 +408,135 @@ describe("debug proxy runtime", () => {
     expect(events.some((event) => event.kind === "error")).toBe(false);
   });
 
+  it("gives up on a stalled response body and lets the caller's cancellation settle", async () => {
+    vi.useFakeTimers();
+    try {
+      initializeDebugProxyCapture("test", settings, deps);
+      // Headers plus one chunk, then the remote stops without EOF. clone() tees
+      // the body, and a tee branch cancels only once both branches cancel or the
+      // source ends — so a capture read with no idle bound holds the caller's
+      // branch open for as long as the remote stays silent.
+      const upstream = new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode("partial"));
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+      // Capture clones internally, exactly as the patched fetch does, so the
+      // caller keeps the branch this response already holds. Cloning here first
+      // would leave a third, unread branch that no one ever cancels.
+      captureHttpExchange(
+        { url: "https://api.example.com/stalls", method: "GET", response: upstream },
+        settings,
+        deps,
+      );
+
+      let cancellationSettled = false;
+      void upstream.body
+        ?.cancel()
+        .catch(() => undefined)
+        .finally(() => {
+          cancellationSettled = true;
+        });
+
+      await vi.advanceTimersByTimeAsync(9_000);
+      expect(cancellationSettled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(cancellationSettled).toBe(true));
+
+      const response = events.find((event) => event.kind === "response");
+      expect(response?.status).toBe(200);
+      expect(JSON.parse(String(response?.metaJson))).toMatchObject({ bodyCapture: "stalled" });
+      expect(response).not.toHaveProperty("dataText");
+      expect(events.some((event) => event.kind === "error")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      finalizeDebugProxyCapture(settings, deps);
+    }
+  });
+
+  it("records a failing response stream as an error rather than a stall", async () => {
+    initializeDebugProxyCapture("test", settings, deps);
+    // A reset mid-body is the exchange failing, not the capture deciding to stop:
+    // it has to stay distinguishable from the idle deadline.
+    const upstream = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("partial"));
+          controller.error(new Error("socket hang up"));
+        },
+      }),
+      { status: 200 },
+    );
+
+    captureHttpExchange(
+      { url: "https://api.example.com/resets", method: "GET", response: upstream },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+    finalizeDebugProxyCapture(settings, deps);
+
+    const errorEvent = events.find((event) => event.kind === "error");
+    expect(errorEvent?.errorText).toContain("socket hang up");
+    expect(events.some((event) => event.kind === "response")).toBe(false);
+  });
+
+  it("skips capturing decimal Content-Length values above the safe integer range", async () => {
+    initializeDebugProxyCapture("test", settings, deps);
+    captureHttpExchange(
+      {
+        url: "https://api.openai.com/v1/files/huge",
+        method: "GET",
+        response: new Response("{}", {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "content-length": "9007199254740993",
+          },
+        }),
+      },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+    finalizeDebugProxyCapture(settings, deps);
+
+    const response = events.find((event) => event.kind === "response");
+    expect(JSON.parse(String(response?.metaJson))).toMatchObject({ bodyCapture: "too-large" });
+    expect(response).not.toHaveProperty("dataText");
+    expect(events.some((event) => event.kind === "error")).toBe(false);
+  });
+
+  it("streams non-decimal Content-Length values through the body cap", async () => {
+    initializeDebugProxyCapture("test", settings, deps);
+    captureHttpExchange(
+      {
+        url: "https://api.openai.com/v1/files/small",
+        method: "GET",
+        response: new Response("captured", {
+          status: 200,
+          headers: {
+            "content-type": "text/plain",
+            "content-length": "1e9",
+          },
+        }),
+      },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+    finalizeDebugProxyCapture(settings, deps);
+
+    const response = events.find((event) => event.kind === "response");
+    expect(response).toBeDefined();
+    expect(response?.dataText).toBe("captured");
+    expect(response?.metaJson).toBeUndefined();
+    expect(events.some((event) => event.kind === "error")).toBe(false);
+  });
+
   it("fails closed on chunked responses that stream past the cap", async () => {
     initializeDebugProxyCapture("test", settings, deps);
     // 20 MiB streamed without a Content-Length header: the bounded reader must
@@ -371,12 +607,58 @@ describe("debug proxy runtime", () => {
     expect(events.some((event) => event.kind === "error")).toBe(false);
   });
 
+  it("captures a spec-compliant null response body as empty", async () => {
+    initializeDebugProxyCapture("test", settings, deps);
+    captureHttpExchange(
+      {
+        url: "https://api.example.test/no-content",
+        method: "HEAD",
+        response: new Response(null, { status: 204 }),
+      },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+    finalizeDebugProxyCapture(settings, deps);
+
+    const response = events.find((event) => event.kind === "response");
+    expect(response?.status).toBe(204);
+    expect(response?.dataText).toBe("");
+    expect(response?.metaJson).toBeUndefined();
+    expect(events.some((event) => event.kind === "error")).toBe(false);
+  });
+
+  it("captures a clone-only Response-like readable body", async () => {
+    initializeDebugProxyCapture("test", settings, deps);
+    const headers = new Headers({ "content-type": "text/plain" });
+    const clone = vi.fn(() => new Response("captured", { headers }));
+    captureHttpExchange(
+      {
+        url: "https://api.example.test/clone-only",
+        method: "GET",
+        response: { status: 200, headers, clone } as unknown as Response,
+      },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+    finalizeDebugProxyCapture(settings, deps);
+
+    const response = events.find((event) => event.kind === "response");
+    expect(clone).toHaveBeenCalledOnce();
+    expect(response?.dataText).toBe("captured");
+    expect(response?.metaJson).toBeUndefined();
+    expect(events.some((event) => event.kind === "error")).toBe(false);
+  });
+
   it("records metadata-only for non-cloneable Response-like objects", async () => {
     initializeDebugProxyCapture("test", settings, deps);
     // Some seams hand capture a Response-like object that cannot be cloned. It
     // must still be observable (status/headers) via the shared metadata path,
     // tagged bodyCapture: "unavailable" (distinct from the "too-large" cap path).
-    const headers = new Headers({ "content-type": "application/json" });
+    const secret = "metadata-only-content-type-secret";
+    registerSecretValueForRedaction(secret);
+    const headers = new Headers({ "content-type": `application/json; token=${secret}` });
     captureHttpExchange(
       {
         url: "https://api.openai.com/v1/uncloneable",
@@ -392,8 +674,29 @@ describe("debug proxy runtime", () => {
     const response = events.find((event) => event.kind === "response");
     expect(response).toBeDefined();
     expect(response?.status).toBe(503);
+    expect(response?.contentType).toBe("application/json; token=[REDACTED]");
     expect(JSON.parse(String(response?.metaJson))).toMatchObject({ bodyCapture: "unavailable" });
     expect(response).not.toHaveProperty("dataText");
     expect(events.some((event) => event.kind === "error")).toBe(false);
+  });
+
+  it("records Response-like status metadata when the Headers API is absent", async () => {
+    initializeDebugProxyCapture("test", settings, deps);
+    captureHttpExchange(
+      {
+        url: "https://api.openai.com/v1/no-headers-api",
+        method: "GET",
+        response: { status: 204 } as unknown as Response,
+      },
+      settings,
+      deps,
+    );
+    await waitForResponseSettled();
+    finalizeDebugProxyCapture(settings, deps);
+
+    const response = events.find((event) => event.kind === "response");
+    expect(response?.status).toBe(204);
+    expect(response?.contentType).toBeUndefined();
+    expect(JSON.parse(String(response?.metaJson))).toMatchObject({ bodyCapture: "unavailable" });
   });
 });

@@ -1,7 +1,7 @@
 // Control UI tests cover cron schedule presentation.
 import { describe, expect, it } from "vitest";
-import { formatCronSchedule } from "./presenter.ts";
 import type { CronJob } from "../api/types.ts";
+import { formatCronSchedule } from "./presenter.ts";
 
 function job(schedule: CronJob["schedule"]): CronJob {
   return {
@@ -14,6 +14,7 @@ function job(schedule: CronJob["schedule"]): CronJob {
     sessionTarget: "main",
     wakeMode: "next-heartbeat",
     payload: { kind: "systemEvent", text: "test" },
+    state: {},
   };
 }
 

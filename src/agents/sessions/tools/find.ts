@@ -1,15 +1,16 @@
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { releaseChildProcessOutputAfterExit } from "../../../process/child-process.js";
+import { spawnCommand } from "../../../process/exec.js";
 /**
  * Built-in find session tool.
  *
  * Searches files by glob through fd/local operations and returns bounded, renderable results.
  */
-import { toPosixPath } from "../../../shared/ignore-rules.js";
+import { normalizeNativePathSeparators } from "../../../shared/ignore-rules.js";
 import type { AgentTool } from "../../runtime/index.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
@@ -27,7 +28,7 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 import { DEFAULT_MAX_BYTES, formatSize, truncateHead } from "./truncate.js";
 
 function isInsideGitRepository(searchPath: string): boolean {
-  for (let current = searchPath; ; ) {
+  for (let current = searchPath; ;) {
     if (existsSync(path.join(current, ".git"))) {
       return true;
     }
@@ -41,15 +42,11 @@ function isInsideGitRepository(searchPath: string): boolean {
 
 const findSchema = Type.Object({
   pattern: Type.String({
-    description: "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'",
+    description: "File glob, e.g. **/*.ts.",
   }),
-  path: Type.Optional(
-    Type.String({ description: "Directory to search in (default: current directory)" }),
-  ),
-  limit: Type.Optional(Type.Number({ description: "Maximum number of results (default: 1000)" })),
+  path: Type.Optional(Type.String({ description: "Search dir; default cwd." })),
+  limit: Type.Optional(Type.Integer({ description: "Max results; default 1000." })),
 });
-export type { FindToolDetails, FindToolInput } from "./tool-contracts.js";
-
 const DEFAULT_LIMIT = 1000;
 
 /**
@@ -80,7 +77,7 @@ export interface FindToolOptions {
 
 function formatFindCall(
   args: { pattern: string; path?: string; limit?: number } | undefined,
-  theme: typeof import("../../modes/interactive/theme/theme.js").theme,
+  theme: typeof import("../../modes/interactive/theme/theme.js").interactiveAgentTheme,
 ): string {
   const pattern = str(args?.pattern);
   const rawPath = str(args?.path);
@@ -104,7 +101,7 @@ function formatFindResult(
     details?: FindToolDetails;
   },
   options: ToolRenderResultOptions,
-  theme: typeof import("../../modes/interactive/theme/theme.js").theme,
+  theme: typeof import("../../modes/interactive/theme/theme.js").interactiveAgentTheme,
   showImages: boolean,
 ): string {
   const resultLimit = result.details?.resultLimitReached;
@@ -119,15 +116,29 @@ function formatFindResult(
 }
 
 function buildFindResult(params: {
-  relativized: string[];
+  paths: string[];
+  searchPath: string;
   effectiveLimit: number;
   limitNotice: string;
 }): {
   content: Array<{ type: "text"; text: string }>;
   details: FindToolDetails | undefined;
 } {
-  const resultLimitReached = params.relativized.length >= params.effectiveLimit;
-  const rawOutput = params.relativized.join("\n");
+  const resultLimitReached = params.paths.length > params.effectiveLimit;
+  const rawOutput = params.paths
+    .slice(0, params.effectiveLimit)
+    .map((foundPath) => {
+      // Backends may return search-relative paths; only absolute paths need relativizing.
+      // Preserve directory markers and filename whitespace when formatting either backend.
+      const normalized = normalizeNativePathSeparators(foundPath);
+      const relativePath = path.isAbsolute(foundPath)
+        ? normalizeNativePathSeparators(path.relative(params.searchPath, foundPath) || ".")
+        : normalized;
+      return normalized.endsWith("/") && !relativePath.endsWith("/")
+        ? `${relativePath}/`
+        : relativePath;
+    })
+    .join("\n");
   const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
   let resultOutput = truncation.content;
   const details: FindToolDetails = {};
@@ -157,7 +168,7 @@ export function createFindToolDefinition(
   return {
     name: "find",
     label: "find",
-    description: `Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} results or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first).`,
+    description: `Find by glob; paths relative to search dir. Respects .gitignore. Caps ${DEFAULT_LIMIT} results/${DEFAULT_MAX_BYTES / 1024}KB.`,
     promptSnippet: "Find files by glob pattern (respects .gitignore)",
     parameters: findSchema,
     async execute(
@@ -195,8 +206,14 @@ export function createFindToolDefinition(
 
         void (async () => {
           try {
+            if (Number.isFinite(limit) && !Number.isInteger(limit)) {
+              settle(() => reject(new Error("Limit must be an integer")));
+              return;
+            }
             const searchPath = resolveToCwd(searchDir || ".", cwd);
             const effectiveLimit = normalizePositiveLimit(limit, DEFAULT_LIMIT);
+            // One extra candidate distinguishes an exact-size result from a truncated one.
+            const observationLimit = effectiveLimit + 1;
             const ops = customOps ?? defaultFindOperations;
 
             // If custom operations provide glob(), use that instead of fd.
@@ -211,7 +228,7 @@ export function createFindToolDefinition(
               }
               const results = await ops.glob(pattern, searchPath, {
                 ignore: ["**/node_modules/**", "**/.git/**"],
-                limit: effectiveLimit,
+                limit: observationLimit,
               });
               if (signal?.aborted) {
                 settle(() => reject(new Error("Operation aborted")));
@@ -227,17 +244,11 @@ export function createFindToolDefinition(
                 return;
               }
 
-              // Relativize paths against the search root for stable output.
-              const relativized = results.map((p) => {
-                if (p.startsWith(searchPath)) {
-                  return toPosixPath(p.slice(searchPath.length + 1));
-                }
-                return toPosixPath(path.relative(searchPath, p));
-              });
               settle(() =>
                 resolve(
                   buildFindResult({
-                    relativized,
+                    paths: results,
+                    searchPath,
                     effectiveLimit,
                     limitNotice: `${effectiveLimit} results limit reached`,
                   }),
@@ -263,7 +274,7 @@ export function createFindToolDefinition(
             if (!isInsideGitRepository(searchPath)) {
               args.push("--no-require-git");
             }
-            args.push("--max-results", String(effectiveLimit));
+            args.push("--max-results", String(observationLimit));
 
             // fd --glob matches against the basename unless --full-path is set; in --full-path
             // mode it matches against the absolute candidate path, so a path-containing
@@ -277,13 +288,18 @@ export function createFindToolDefinition(
             }
             args.push("--", effectivePattern, searchPath);
 
-            const child = spawn(fdPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+            const child = spawnCommand([fdPath, ...args], {
+              buffer: false,
+              reject: false,
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            releaseChildProcessOutputAfterExit(child.nodeChildProcess);
             const rl = createInterface({ input: child.stdout });
             let stderr = "";
             const lines: string[] = [];
 
             stopChild = () => {
-              if (!child.killed) {
+              if (!child.nodeChildProcess.killed) {
                 child.kill();
               }
             };
@@ -300,8 +316,11 @@ export function createFindToolDefinition(
               settle(() => reject(new Error(`fd ${stream} error: ${error.message}`)));
             };
 
-            child.stderr?.on("data", (chunk) => {
-              stderr = appendBoundedTextTail(stderr, chunk);
+            // Decode stderr as UTF-8 at the stream so pipe chunk boundaries
+            // cannot split multibyte characters into U+FFFD replacement noise.
+            child.stderr?.setEncoding("utf8");
+            child.stderr?.on("data", (chunk: string) => {
+              stderr = appendBoundedTextTail(stderr, chunk).tail;
             });
             // Readline re-emits input failures, while the stream listener also catches
             // implementations that do not. settle() keeps the shared failure path one-shot.
@@ -313,12 +332,12 @@ export function createFindToolDefinition(
               lines.push(line);
             });
 
-            child.on("error", (error) => {
+            child.nodeChildProcess.on("error", (error) => {
               cleanup();
               settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
             });
 
-            child.on("close", (code) => {
+            child.nodeChildProcess.on("close", (code) => {
               cleanup();
               if (signal?.aborted) {
                 settle(() => reject(new Error("Operation aborted")));
@@ -340,29 +359,11 @@ export function createFindToolDefinition(
                 return;
               }
 
-              const relativized: string[] = [];
-              for (const rawLine of lines) {
-                const line = rawLine.replace(/\r$/, "").trim();
-                if (!line) {
-                  continue;
-                }
-                const hadTrailingSlash = line.endsWith("/") || line.endsWith("\\");
-                let relativePath;
-                if (line.startsWith(searchPath)) {
-                  relativePath = line.slice(searchPath.length + 1);
-                } else {
-                  relativePath = path.relative(searchPath, line);
-                }
-                if (hadTrailingSlash && !relativePath.endsWith("/")) {
-                  relativePath += "/";
-                }
-                relativized.push(toPosixPath(relativePath));
-              }
-
               settle(() =>
                 resolve(
                   buildFindResult({
-                    relativized,
+                    paths: lines,
+                    searchPath,
                     effectiveLimit,
                     limitNotice: `${effectiveLimit} results limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
                   }),

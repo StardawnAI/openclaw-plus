@@ -4,6 +4,8 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { pruneMapToMaxSize } from "../infra/map-size.js";
+import { escapeRegExp } from "../shared/regexp.js";
 
 export type ParsedAgentSessionKey = {
   agentId: string;
@@ -15,12 +17,17 @@ export type ParsedThreadSessionSuffix = {
   threadId: string | undefined;
 };
 
-export type ParsedSessionDeliveryRoute = {
+type ParsedSessionDeliveryRoute = {
   accountId?: string;
   channel: string;
   peerId: string;
   peerKind: "channel" | "direct" | "dm" | "group";
   threadId?: string;
+};
+
+type ParsedCronRunScopeSuffix = {
+  baseSessionKey: string | undefined;
+  runId: string | undefined;
 };
 
 export type RawSessionConversationRef = {
@@ -60,7 +67,7 @@ const CASE_PRESERVING_PEERS: readonly CasePreservingPeerDescriptor[] = [
 ];
 
 /** True when (channel, peerKind) owns a case-sensitive opaque peer ID. */
-export function isCasePreservingPeer(
+function isCasePreservingPeer(
   channel: string | undefined | null,
   peerKind: string | undefined | null,
 ): boolean {
@@ -119,10 +126,6 @@ export function normalizeSessionPeerId(params: {
     : normalizeLowercaseStringOrEmpty(peerId);
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 type PreservedSpan = { start: number; end: number; trim: boolean };
 
 const NORMALIZED_SESSION_KEY_CACHE_MAX_ENTRIES = 2048;
@@ -140,13 +143,7 @@ function writeNormalizedSessionKeyCache(raw: string, normalized: string): void {
     return;
   }
   normalizedSessionKeyCache.set(raw, normalized);
-  while (normalizedSessionKeyCache.size > NORMALIZED_SESSION_KEY_CACHE_MAX_ENTRIES) {
-    const oldest = normalizedSessionKeyCache.keys().next().value;
-    if (oldest === undefined) {
-      return;
-    }
-    normalizedSessionKeyCache.delete(oldest);
-  }
+  pruneMapToMaxSize(normalizedSessionKeyCache, NORMALIZED_SESSION_KEY_CACHE_MAX_ENTRIES);
 }
 
 function mayContainCasePreservingPeer(raw: string): boolean {
@@ -266,16 +263,16 @@ export function parseAgentSessionKey(
   if (!raw) {
     return null;
   }
-  const parts = raw.split(":");
-  if (parts.length < 3 || !parts[1] || !parts[2]) {
+  if (!raw.startsWith("agent:")) {
     return null;
   }
-  if (parts[0] !== "agent") {
+  const agentIdEnd = raw.indexOf(":", "agent:".length);
+  if (agentIdEnd === -1) {
     return null;
   }
-  const agentId = normalizeOptionalString(parts[1]);
-  const rest = parts.slice(2).join(":");
-  if (!agentId || !rest) {
+  const agentId = normalizeOptionalString(raw.slice("agent:".length, agentIdEnd));
+  const rest = raw.slice(agentIdEnd + 1);
+  if (!agentId || !rest || rest.startsWith(":")) {
     return null;
   }
   return { agentId, rest };
@@ -287,6 +284,32 @@ export function isCronRunSessionKey(sessionKey: string | undefined | null): bool
     return false;
   }
   return /^cron:[^:]+:run:[^:]+(?::|$)/.test(parsed.rest);
+}
+
+/**
+ * Splits the terminal per-run `:run:<id>` scope off an isolated cron session key
+ * (`agent:<id>:cron:<job>:run:<runId>`), yielding the cache-stable base key.
+ * The run scope is only ever appended to cron keys, so this is gated to that exact
+ * shape: any other key (including channel ids that embed a `:run:` segment) is returned
+ * unchanged with `runId` undefined, never truncating an unrelated session identity.
+ */
+export function parseCronRunScopeSuffix(
+  sessionKey: string | undefined | null,
+): ParsedCronRunScopeSuffix {
+  const raw = normalizeOptionalString(sessionKey);
+  if (!raw) {
+    return { baseSessionKey: undefined, runId: undefined };
+  }
+  const parsed = parseAgentSessionKey(raw);
+  if (!parsed || !/^cron:[^:]+:run:[^:]+$/.test(parsed.rest)) {
+    return { baseSessionKey: raw, runId: undefined };
+  }
+  const runMarker = ":run:";
+  const markerIndex = raw.toLowerCase().lastIndexOf(runMarker);
+  return {
+    baseSessionKey: raw.slice(0, markerIndex),
+    runId: raw.slice(markerIndex + runMarker.length),
+  };
 }
 
 export function isCronSessionKey(sessionKey: string | undefined | null): boolean {
@@ -332,6 +355,14 @@ export function isAcpSessionKey(sessionKey: string | undefined | null): boolean 
   }
   const parsed = parseAgentSessionKey(raw);
   return normalizeOptionalLowercaseString(parsed?.rest)?.startsWith("acp:") === true;
+}
+
+/** Stored ACP bindings and stale ACP keys both belong to ACP dispatch, never local fallback. */
+export function resolveSessionDispatchKind(
+  sessionKey: string | undefined | null,
+  entry?: { acp?: unknown },
+): "agent" | "acp" {
+  return entry?.acp || isAcpSessionKey(sessionKey) ? "acp" : "agent";
 }
 
 export function parseThreadSessionSuffix(

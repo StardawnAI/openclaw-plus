@@ -8,8 +8,10 @@ export const SKILL_WORKSHOP_TOOL_NAME = "skill_workshop";
 export function buildSkillWorkshopPromptSection(): string[] {
   return [
     "## Skill Workshop",
-    "Route durable skill work — creating, updating, or managing reusable skills, playbooks, or standing workflows — through the `skill_workshop` tool; never write proposal or skill files directly.",
-    "Generated skills are pending proposals. Apply, reject, or quarantine only when the user explicitly asks.",
+    "Durable reusable skill/playbook/workflow work: `skill_workshop`; never write proposal/skill files directly.",
+    "Used skill proved wrong or incomplete: call `skill_workshop` read, then patch it now; the configured autonomous mode disables repair, leaves it pending, or applies it immediately. Capture only durable, evidenced procedure changes—never task artifacts, transient failures, or unresolved guesses.",
+    "Other generated work = pending proposal. Apply/reject/quarantine only explicit user ask.",
+    "proposal_content = complete final skill body, never plan/diff; update/revise preserves unchanged content.",
     "",
   ];
 }

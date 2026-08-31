@@ -2,6 +2,7 @@
  * Brave Search request normalization and result mapping. It validates Brave
  * country/language params and converts LLM-context responses into web results.
  */
+import { resolveSiteName } from "openclaw/plugin-sdk/provider-web-search";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -167,6 +168,9 @@ function normalizeBraveUiLang(value: string | undefined): string | undefined {
     return undefined;
   }
   const [, language, region] = match;
+  if (!language || !region) {
+    return undefined;
+  }
   return `${normalizeLowercaseStringOrEmpty(language)}-${region.toUpperCase()}`;
 }
 
@@ -208,17 +212,6 @@ export function normalizeBraveLanguageParams(params: { search_lang?: string; ui_
   }
 
   return { search_lang, ui_lang };
-}
-
-function resolveSiteName(url: string | undefined): string | undefined {
-  if (!url) {
-    return undefined;
-  }
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return undefined;
-  }
 }
 
 /** Map Brave LLM Context API grounding results into web-search result rows. */

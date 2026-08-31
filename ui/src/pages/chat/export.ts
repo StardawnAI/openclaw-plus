@@ -2,13 +2,15 @@
 import { timestampMsToIsoString } from "@openclaw/normalization-core/number-coercion";
 import { extractTextCached } from "../../lib/chat/message-extract.ts";
 
+export type ChatExportResult = "downloaded" | "empty";
+
 /**
  * Export chat history as markdown file.
  */
-export function exportChatMarkdown(messages: unknown[], assistantName: string): void {
+export function exportChatMarkdown(messages: unknown[], assistantName: string): ChatExportResult {
   const markdown = buildChatMarkdown(messages, assistantName);
   if (!markdown) {
-    return;
+    return "empty";
   }
   const blob = new Blob([markdown], { type: "text/markdown" });
   const url = URL.createObjectURL(blob);
@@ -17,9 +19,10 @@ export function exportChatMarkdown(messages: unknown[], assistantName: string): 
   link.download = `chat-${assistantName}-${Date.now()}.md`;
   link.click();
   URL.revokeObjectURL(url);
+  return "downloaded";
 }
 
-export function buildChatMarkdown(messages: unknown[], assistantName: string): string | null {
+function buildChatMarkdown(messages: unknown[], assistantName: string): string | null {
   const history = Array.isArray(messages) ? messages : [];
   if (history.length === 0) {
     return null;

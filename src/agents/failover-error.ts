@@ -5,23 +5,38 @@
  */
 import { parseStrictNonNegativeInteger } from "@openclaw/normalization-core/number-coercion";
 import { formatCliCommand } from "../cli/command-format.js";
-import { readErrorName } from "../infra/errors.js";
+import { isAgentRunStaleLifecycleError } from "../infra/agent-lifecycle-error.js";
+import { collectErrorGraphCandidates, formatErrorMessage, readErrorName } from "../infra/errors.js";
 import {
   classifyFailoverSignal,
   extractFailoverSignalDetails,
-  inferSignalStatus,
+  isProviderRequestSizeCeilingError,
   isUnclassifiedNoBodyHttpSignal,
-  type FailoverClassification,
-  type FailoverSignal,
-} from "./embedded-agent-helpers/errors.js";
-import { isTimeoutErrorMessage } from "./embedded-agent-helpers/errors.js";
-import type { FailoverReason } from "./embedded-agent-helpers/types.js";
-import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
+  isTimeoutErrorMessage,
+} from "./failover/classify.js";
+import type { FailoverClassification, FailoverReason, FailoverSignal } from "./failover/signal.js";
+import { AgentHarnessSessionSupersededError } from "./harness/errors.js";
 
 const ABORT_TIMEOUT_RE = /request was aborted|request aborted/i;
 const MAX_FAILOVER_CAUSE_DEPTH = 25;
 const MISSING_TOOL_RESULT_REASON = "missing_tool_result";
 const MISSING_TOOL_RESULT_TEXT_RE = /native Codex tool\.call without a matching tool\.result/i;
+
+export type CliTimeoutContext = {
+  mode: "overall" | "no-output";
+  timeoutSeconds: number;
+  observedActivity: boolean;
+  activeToolCount: number;
+  backgroundTaskCount: number;
+};
+
+export type FallbackAttemptRecord = {
+  provider: string;
+  model: string;
+  reason: FailoverReason;
+  status?: number;
+  error?: string;
+};
 
 /** Structured error used to carry model fallback/failover metadata across layers. */
 export class FailoverError extends Error {
@@ -33,6 +48,11 @@ export class FailoverError extends Error {
   readonly status?: number;
   readonly code?: string;
   readonly rawError?: string;
+  /**
+   * Recorded at construction because the fact is only legible in the provider's own text: by the
+   * time this error reaches the fallback boundary `message` carries user-facing copy instead.
+   */
+  readonly requestSizeCeiling: boolean;
   readonly authProfileFailure?: { allInCooldown: boolean };
   // Originating request attribution propagated through wrapper errors so
   // structured log ingestion (e.g. api_health_log) can attribute exhausted
@@ -41,6 +61,9 @@ export class FailoverError extends Error {
   readonly sessionId?: string;
   readonly lane?: string;
   readonly suspend?: boolean;
+  readonly cliTimeout?: CliTimeoutContext;
+  readonly attempts?: readonly FallbackAttemptRecord[];
+  readonly soonestCooldownExpiry?: number | null;
 
   constructor(
     message: string,
@@ -58,6 +81,9 @@ export class FailoverError extends Error {
       lane?: string;
       cause?: unknown;
       suspend?: boolean;
+      cliTimeout?: CliTimeoutContext;
+      attempts?: readonly FallbackAttemptRecord[];
+      soonestCooldownExpiry?: number | null;
     },
   ) {
     super(message, { cause: params.cause });
@@ -70,10 +96,14 @@ export class FailoverError extends Error {
     this.status = params.status;
     this.code = params.code;
     this.rawError = params.rawError;
+    this.requestSizeCeiling = isProviderRequestSizeCeilingError(params.rawError ?? message);
     this.authProfileFailure = params.authProfileFailure;
     this.sessionId = params.sessionId;
     this.lane = params.lane;
     this.suspend = params.suspend;
+    this.cliTimeout = params.cliTimeout;
+    this.attempts = params.attempts;
+    this.soonestCooldownExpiry = params.soonestCooldownExpiry;
   }
 }
 
@@ -88,6 +118,96 @@ export function isFailoverError(err: unknown): err is FailoverError {
     (err as { name?: unknown }).name === "FailoverError" &&
     typeof (err as { reason?: unknown }).reason === "string",
   );
+}
+
+function resolveNestedErrors(candidate: Record<string, unknown>): unknown[] {
+  const errors = candidate.errors;
+  return [candidate.error, candidate.cause, ...(Array.isArray(errors) ? errors : [])];
+}
+
+/**
+ * True when the provider refused the request for its own size rather than for context pressure or
+ * bucket state.  An error that never became a `FailoverError` still carries the provider's text in
+ * its message, so it is read directly.
+ */
+export function hasProviderRequestSizeCeiling(err: unknown): boolean {
+  return collectErrorGraphCandidates(err, resolveNestedErrors).some((candidate) =>
+    isFailoverError(candidate)
+      ? candidate.requestSizeCeiling
+      : isProviderRequestSizeCeilingError(formatErrorMessage(candidate)),
+  );
+}
+
+export function findCliMaxTurnsError(
+  err: unknown,
+  seen: Set<object> = new Set(),
+): FailoverError | undefined {
+  if (isFailoverError(err) && err.code === "cli_max_turns") {
+    return err;
+  }
+  if (!err || typeof err !== "object" || seen.has(err)) {
+    return undefined;
+  }
+  // Fork persistence can aggregate a terminal run error with its own failure.
+  // Keep max-turn replay protection intact across those wrapper boundaries.
+  seen.add(err);
+  const candidate = err as { error?: unknown; cause?: unknown; errors?: unknown };
+  const nested = [
+    candidate.error,
+    candidate.cause,
+    ...(Array.isArray(candidate.errors) ? candidate.errors : []),
+  ];
+  for (const value of nested) {
+    const found = findCliMaxTurnsError(value, seen);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+function hasCliTimeoutContext(error: FailoverError): error is FailoverError & {
+  cliTimeout: CliTimeoutContext;
+} {
+  const context = error.cliTimeout;
+  return Boolean(
+    context &&
+    (context.mode === "overall" || context.mode === "no-output") &&
+    Number.isFinite(context.timeoutSeconds) &&
+    context.timeoutSeconds >= 0 &&
+    typeof context.observedActivity === "boolean" &&
+    Number.isInteger(context.activeToolCount) &&
+    context.activeToolCount >= 0 &&
+    Number.isInteger(context.backgroundTaskCount) &&
+    context.backgroundTaskCount >= 0,
+  );
+}
+
+export function findCliTimeoutError(
+  err: unknown,
+  seen: Set<object> = new Set(),
+): (FailoverError & { cliTimeout: CliTimeoutContext }) | undefined {
+  if (isFailoverError(err) && hasCliTimeoutContext(err)) {
+    return err;
+  }
+  if (!err || typeof err !== "object" || seen.has(err)) {
+    return undefined;
+  }
+  // Failover summaries and persistence failures can wrap the terminal CLI error.
+  seen.add(err);
+  const candidate = err as { error?: unknown; cause?: unknown; errors?: unknown };
+  const nested = [
+    candidate.error,
+    candidate.cause,
+    ...(Array.isArray(candidate.errors) ? candidate.errors : []),
+  ];
+  for (const value of nested) {
+    const found = findCliTimeoutError(value, seen);
+    if (found) {
+      return found;
+    }
+  }
+  return undefined;
 }
 
 /** Map a failover reason to the closest HTTP-like status code. */
@@ -107,6 +227,8 @@ export function resolveFailoverStatus(reason: FailoverReason): number | undefine
       return 403;
     case "timeout":
       return 408;
+    case "tls_certificate":
+      return 502;
     case "context_overflow":
       return 413;
     case "format":
@@ -303,8 +425,15 @@ function normalizeDirectErrorSignal(err: unknown): FailoverSignal {
   };
 }
 
-function hasSessionWriteLockContention(err: unknown, seen: Set<object> = new Set()): boolean {
-  if (isSessionWriteLockAcquireError(err)) {
+function hasSessionTranscriptWriterClaimRebound(
+  err: unknown,
+  seen: Set<object> = new Set(),
+): boolean {
+  if (
+    err &&
+    typeof err === "object" &&
+    readErrorName(err) === "SessionTranscriptWriterClaimReboundError"
+  ) {
     return true;
   }
   if (!err || typeof err !== "object") {
@@ -316,35 +445,9 @@ function hasSessionWriteLockContention(err: unknown, seen: Set<object> = new Set
   seen.add(err);
   const candidate = err as { error?: unknown; cause?: unknown; reason?: unknown };
   return (
-    hasSessionWriteLockContention(candidate.error, seen) ||
-    hasSessionWriteLockContention(candidate.cause, seen) ||
-    hasSessionWriteLockContention(candidate.reason, seen)
-  );
-}
-
-function isEmbeddedAttemptSessionTakeover(err: unknown): boolean {
-  // Match by name to avoid importing embedded-agent-runner here (would create a cycle).
-  return Boolean(
-    err && typeof err === "object" && readErrorName(err) === "EmbeddedAttemptSessionTakeoverError",
-  );
-}
-
-function hasEmbeddedAttemptSessionTakeover(err: unknown, seen: Set<object> = new Set()): boolean {
-  if (isEmbeddedAttemptSessionTakeover(err)) {
-    return true;
-  }
-  if (!err || typeof err !== "object") {
-    return false;
-  }
-  if (seen.has(err)) {
-    return false;
-  }
-  seen.add(err);
-  const candidate = err as { error?: unknown; cause?: unknown; reason?: unknown };
-  return (
-    hasEmbeddedAttemptSessionTakeover(candidate.error, seen) ||
-    hasEmbeddedAttemptSessionTakeover(candidate.cause, seen) ||
-    hasEmbeddedAttemptSessionTakeover(candidate.reason, seen)
+    hasSessionTranscriptWriterClaimRebound(candidate.error, seen) ||
+    hasSessionTranscriptWriterClaimRebound(candidate.cause, seen) ||
+    hasSessionTranscriptWriterClaimRebound(candidate.reason, seen)
   );
 }
 
@@ -355,7 +458,7 @@ function readField(value: unknown, key: string): unknown {
   return (value as Record<string, unknown>)[key];
 }
 
-function readStringField(value: unknown, key: string): string | undefined {
+function readErrorStringField(value: unknown, key: string): string | undefined {
   const field = readField(value, key);
   return typeof field === "string" ? field : undefined;
 }
@@ -374,17 +477,17 @@ function readMissingToolResultMarker(err: unknown): true | undefined {
     return true;
   }
   for (const key of ["code", "reason", "status"] as const) {
-    const value = readStringField(err, key);
+    const value = readErrorStringField(err, key);
     if (value && isMissingToolResultMarker(value)) {
       return true;
     }
   }
-  const output = readStringField(err, "output");
+  const output = readErrorStringField(err, "output");
   if (output && isMissingToolResultMessage(output)) {
     return true;
   }
-  const resultReason = readStringField(readField(err, "result"), "reason");
-  const detailReason = readStringField(readField(err, "detail"), "reason");
+  const resultReason = readErrorStringField(readField(err, "result"), "reason");
+  const detailReason = readErrorStringField(readField(err, "detail"), "reason");
   if (resultReason === MISSING_TOOL_RESULT_REASON || detailReason === MISSING_TOOL_RESULT_REASON) {
     return true;
   }
@@ -395,6 +498,40 @@ function hasMissingToolResultFailure(err: unknown): boolean {
   return findErrorProperty(err, readMissingToolResultMarker) === true;
 }
 
+function hasStaleAgentRunLifecycleFailure(err: unknown): boolean {
+  return (
+    findErrorProperty(err, (candidate) =>
+      isAgentRunStaleLifecycleError(candidate) ? true : undefined,
+    ) === true
+  );
+}
+
+function errorGraphHasName(err: unknown, name: string): boolean {
+  return collectErrorGraphCandidates(err, resolveNestedErrors).some(
+    (candidate) => readErrorName(candidate) === name,
+  );
+}
+
+function hasGatewayDrainingFailure(err: unknown): boolean {
+  return errorGraphHasName(err, "GatewayDrainingError");
+}
+
+function hasWorkerRunnerCoordinationFailure(err: unknown): boolean {
+  return [
+    "WorkerRunnerUnavailableError",
+    "WorkerRunnerCapacityError",
+    "WorkerWorkspaceReconciliationError",
+  ].some((name) => errorGraphHasName(err, name));
+}
+
+function hasDirectProviderFailureIdentity(err: unknown): boolean {
+  if (isFailoverError(err)) {
+    return true;
+  }
+  const signal = normalizeDirectErrorSignal(err);
+  return Boolean(signal.status || signal.code || signal.errorType || signal.provider);
+}
+
 /**
  * True when the error is a local runtime coordination/tool-execution error
  * rather than a provider/model failure. The model fallback chain must abort on
@@ -402,27 +539,11 @@ function hasMissingToolResultFailure(err: unknown): boolean {
  * same local condition. See #83510 and #95474.
  */
 export function isNonProviderRuntimeCoordinationError(err: unknown): boolean {
-  if (
-    !hasSessionWriteLockContention(err) &&
-    !hasEmbeddedAttemptSessionTakeover(err) &&
-    !hasMissingToolResultFailure(err)
-  ) {
-    return false;
-  }
-  if (isFailoverError(err)) {
-    return false;
-  }
-  if (isEmbeddedAttemptSessionTakeover(err)) {
-    return true;
-  }
-  return resolveFailoverClassificationFromError(err) === null;
+  return resolveModelFallbackError(err).kind === "coordination";
 }
 
 function hasTimeoutHint(err: unknown): boolean {
   if (!err) {
-    return false;
-  }
-  if (hasSessionWriteLockContention(err)) {
     return false;
   }
   if (readErrorName(err) === "TimeoutError") {
@@ -441,9 +562,6 @@ export function isTimeoutError(err: unknown): boolean {
     return false;
   }
   if (readErrorName(err) !== "AbortError") {
-    return false;
-  }
-  if (hasSessionWriteLockContention(err)) {
     return false;
   }
   const message = getErrorMessage(err);
@@ -555,14 +673,6 @@ function resolveFailoverClassificationFromErrorInternal(
     };
   }
   const signal = normalizeErrorSignal(err, providerHint);
-  const codeReason = signal.code
-    ? failoverReasonFromClassification(classifyFailoverSignal({ code: signal.code }))
-    : null;
-  const hasExplicitFailoverMetadata =
-    typeof inferSignalStatus(signal) === "number" ||
-    (codeReason !== null && codeReason !== "timeout");
-  const hasSessionLock = hasSessionWriteLockContention(err);
-
   const classification = classifyFailoverSignal(signal);
   const nestedCandidates = getNestedErrorCandidates(err);
 
@@ -575,9 +685,6 @@ function resolveFailoverClassificationFromErrorInternal(
         providerHint,
       );
       if (nestedClassification) {
-        if (hasSessionLock && !hasExplicitFailoverMetadata) {
-          return null;
-        }
         return nestedClassification;
       }
     }
@@ -601,14 +708,7 @@ function resolveFailoverClassificationFromErrorInternal(
   }
 
   if (classification) {
-    if (hasSessionLock && !hasExplicitFailoverMetadata) {
-      return null;
-    }
     return classification;
-  }
-
-  if (hasSessionLock) {
-    return null;
   }
 
   if (isTimeoutError(err)) {
@@ -657,6 +757,9 @@ export function buildFailoverRemediationHint(err: unknown): string | undefined {
   const provider = err.provider?.trim();
   if (!provider) {
     return undefined;
+  }
+  if (provider === "google-gemini-cli") {
+    return `Authenticate in Gemini CLI directly, or configure a supported Google API key with: ${formatCliCommand("openclaw configure")}`;
   }
   const command = buildProviderReauthCommand(provider);
   return command ? `Re-authenticate with: ${command}` : undefined;
@@ -731,46 +834,58 @@ export function describeFailoverError(err: unknown): {
   };
 }
 
+type FailoverErrorContext = {
+  provider?: string;
+  model?: string;
+  profileId?: string;
+  authMode?: string;
+  sessionId?: string;
+  lane?: string;
+};
+
+type ModelFallbackErrorResolution =
+  | { kind: "failover"; error: FailoverError }
+  | { kind: "coordination"; error: unknown }
+  | { kind: "unknown"; error: unknown };
+
 /** Convert a classified raw error into a FailoverError with optional request context. */
 export function coerceToFailoverError(
   err: unknown,
-  context?: {
-    provider?: string;
-    model?: string;
-    profileId?: string;
-    authMode?: string;
-    sessionId?: string;
-    lane?: string;
-  },
+  context?: FailoverErrorContext,
 ): FailoverError | null {
-  if (isFailoverError(err)) {
-    if (context?.authMode && !err.authMode) {
-      const message = typeof err.message === "string" ? err.message : String(err);
+  const sourceError = err;
+  if (isFailoverError(sourceError)) {
+    if (context?.authMode && !sourceError.authMode) {
+      const message =
+        typeof sourceError.message === "string" ? sourceError.message : String(sourceError);
       return new FailoverError(message, {
-        reason: err.reason,
-        provider: err.provider,
-        model: err.model,
-        profileId: err.profileId,
+        reason: sourceError.reason,
+        provider: sourceError.provider,
+        model: sourceError.model,
+        profileId: sourceError.profileId,
         authMode: context.authMode,
-        status: err.status,
-        code: err.code,
-        rawError: err.rawError,
-        authProfileFailure: err.authProfileFailure,
-        sessionId: err.sessionId,
-        lane: err.lane,
-        cause: err.cause,
-        suspend: err.suspend,
+        status: sourceError.status,
+        code: sourceError.code,
+        rawError: sourceError.rawError,
+        authProfileFailure: sourceError.authProfileFailure,
+        sessionId: sourceError.sessionId,
+        lane: sourceError.lane,
+        cause: sourceError.cause,
+        suspend: sourceError.suspend,
+        cliTimeout: sourceError.cliTimeout,
+        attempts: sourceError.attempts,
+        soonestCooldownExpiry: sourceError.soonestCooldownExpiry,
       });
     }
-    return err;
+    return sourceError;
   }
-  const reason = resolveFailoverReasonFromError(err, context?.provider);
+  const reason = resolveFailoverReasonFromError(sourceError, context?.provider);
   if (!reason) {
     return null;
   }
 
-  const signal = normalizeErrorSignal(err);
-  const message = signal.message ?? String(err);
+  const signal = normalizeErrorSignal(sourceError);
+  const message = signal.message ?? String(sourceError);
   const status = signal.status ?? resolveFailoverStatus(reason);
   const code = signal.code;
 
@@ -793,3 +908,39 @@ export function coerceToFailoverError(
     suspend: shouldSuspend,
   });
 }
+
+/** Classify one candidate failure once so fallback routing and diagnostics share it. */
+export function resolveModelFallbackError(
+  err: unknown,
+  context?: FailoverErrorContext,
+): ModelFallbackErrorResolution {
+  if (err instanceof AgentHarnessSessionSupersededError) {
+    return { kind: "coordination", error: err };
+  }
+  // Gateway admission can fail before any provider turn starts. Preserve that
+  // identity through wrappers and aggregates so fallback cannot blame a model.
+  if (hasGatewayDrainingFailure(err) || hasWorkerRunnerCoordinationFailure(err)) {
+    return { kind: "coordination", error: err };
+  }
+  const staleLifecycleFailure = hasStaleAgentRunLifecycleFailure(err);
+  if (
+    staleLifecycleFailure &&
+    (isAgentRunStaleLifecycleError(err) || !hasDirectProviderFailureIdentity(err))
+  ) {
+    return { kind: "coordination", error: err };
+  }
+  // The in-transaction transcript fence owns writer supersession. A rebound is
+  // local coordination failure even when provider-looking wrappers contain it.
+  if (hasSessionTranscriptWriterClaimRebound(err)) {
+    return { kind: "coordination", error: err };
+  }
+  const failoverError = coerceToFailoverError(err, context);
+  if (failoverError) {
+    return { kind: "failover", error: failoverError };
+  }
+  if (hasMissingToolResultFailure(err) || staleLifecycleFailure) {
+    return { kind: "coordination", error: err };
+  }
+  return { kind: "unknown", error: err };
+}
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

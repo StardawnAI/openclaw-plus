@@ -1,11 +1,29 @@
 // Reads HTTP request and response bodies with timeout and byte limits.
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { clearTimeout as clearNodeTimeout, setTimeout as setNodeTimeout } from "node:timers";
-import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
-import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
+import { decodeTextPrefix } from "@openclaw/normalization-core";
+import {
+  parseStrictNonNegativeInteger,
+  resolveTimerTimeoutMs,
+} from "@openclaw/normalization-core/number-coercion";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { formatErrorMessage } from "./errors.js";
-import { parseStrictNonNegativeInteger } from "./parse-finite-number.js";
+import {
+  isHttpConnectionClosing,
+  selectHttpRequestRejection,
+  sendHttpRequestRejection,
+} from "./http-request-lifecycle.js";
+import { readChunkWithIdleTimeout, withResponseBodyTimeout } from "./http-response-body-timeout.js";
+
+export { readChunkWithIdleTimeout } from "./http-response-body-timeout.js";
+
+/** Requests cancellation only when no consumer has started reading the body. */
+export async function cancelUnreadResponseBody(response: Response | undefined): Promise<void> {
+  if (response && !response.bodyUsed) {
+    // A capture tee must not delay errors or the caller's bounded dispatcher release.
+    void response.body?.cancel().catch(() => undefined);
+  }
+}
 
 export const DEFAULT_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
 export const DEFAULT_WEBHOOK_BODY_TIMEOUT_MS = 30_000;
@@ -74,16 +92,18 @@ function parseContentLengthHeader(req: IncomingMessage): number | null {
     return null;
   }
   const parsed = parseStrictNonNegativeInteger(raw);
-  if (parsed === undefined) {
-    return null;
+  if (parsed !== undefined) {
+    return parsed;
   }
-  return parsed;
+  return /^\d+$/.test(raw.trim()) ? Number.MAX_SAFE_INTEGER : null;
 }
 
 export type ReadRequestBodyOptions = {
   maxBytes: number;
   timeoutMs?: number;
   encoding?: BufferEncoding;
+  /** Pause instead of destroying on size/timeout failures so a caller can flush a response first. */
+  destroyOnLimit?: boolean;
 };
 
 type RequestBodyLimitValues = {
@@ -128,51 +148,17 @@ function advanceRequestBodyChunk(
   };
 }
 
-/** Reads one chunk, rejecting and cancelling the reader after an idle timeout. */
-export async function readChunkWithIdleTimeout(
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  chunkTimeoutMs: number,
-  onIdleTimeout?: (params: { chunkTimeoutMs: number }) => Error,
-): Promise<Awaited<ReturnType<typeof reader.read>>> {
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
-
-  return await new Promise((resolve, reject) => {
-    const clear = () => {
-      if (timeoutId !== undefined) {
-        clearTimeout(timeoutId);
-        timeoutId = undefined;
-      }
-    };
-
-    const resolvedChunkTimeoutMs = resolveTimerTimeoutMs(chunkTimeoutMs, 1);
-    timeoutId = setTimeout(() => {
-      timedOut = true;
-      const error =
-        onIdleTimeout?.({ chunkTimeoutMs: resolvedChunkTimeoutMs }) ??
-        new Error(`Media download stalled: no data received for ${resolvedChunkTimeoutMs}ms`);
-      clear();
-      // Cancel with the timeout error so fetch-backed streams release sockets
-      // and buffers instead of continuing after the caller has failed.
-      void reader.cancel(error).catch(() => undefined);
-      reject(error);
-    }, resolvedChunkTimeoutMs);
-
-    void reader.read().then(
-      (result) => {
-        clear();
-        if (!timedOut) {
-          resolve(result);
-        }
-      },
-      (error: unknown) => {
-        clear();
-        if (!timedOut) {
-          reject(toErrorObject(error, "Non-Error rejection"));
-        }
-      },
-    );
-  });
+function stopRequestBodyAfterLimit(req: IncomingMessage, destroyOnLimit: boolean): void {
+  if (req.destroyed) {
+    return;
+  }
+  if (destroyOnLimit) {
+    // Limit violations are expected user input; destroying with an Error causes
+    // an async 'error' event which can crash the process if no listener remains.
+    req.destroy();
+    return;
+  }
+  selectHttpRequestRejection(req);
 }
 
 type ReadResponsePrefixResult = {
@@ -181,35 +167,29 @@ type ReadResponsePrefixResult = {
   truncated: boolean;
 };
 
+export type ReadResponseTextPrefixOptions = {
+  chunkTimeoutMs?: number;
+  onIdleTimeout?: (params: { chunkTimeoutMs: number }) => Error;
+  /** Static timeout or lazy resolver evaluated immediately before body consumption. */
+  timeoutMs?: number | (() => number);
+  onTimeout?: (params: { timeoutMs: number }) => Error;
+};
+
+type ReadResponsePrefixOptions = ReadResponseTextPrefixOptions & {
+  stopAtLimit?: boolean;
+};
+
 function validateMaxBytes(maxBytes: number): void {
   if (!Number.isFinite(maxBytes) || maxBytes < 0) {
     throw new RangeError(`maxBytes must be a non-negative finite number: ${maxBytes}`);
   }
 }
 
-async function readResponsePrefix(
-  response: Response,
+async function readResponsePrefixFromReader(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
   maxBytes: number,
-  options?: {
-    chunkTimeoutMs?: number;
-    onIdleTimeout?: (params: { chunkTimeoutMs: number }) => Error;
-  },
+  options?: ReadResponsePrefixOptions,
 ): Promise<ReadResponsePrefixResult> {
-  validateMaxBytes(maxBytes);
-  const body = response.body;
-  if (!body || typeof body.getReader !== "function") {
-    const fallback = Buffer.from(await response.arrayBuffer());
-    if (fallback.length > maxBytes) {
-      return {
-        buffer: fallback.subarray(0, maxBytes),
-        size: fallback.length,
-        truncated: true,
-      };
-    }
-    return { buffer: fallback, size: fallback.length, truncated: false };
-  }
-
-  const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   let size = 0;
@@ -227,7 +207,7 @@ async function readResponsePrefix(
         continue;
       }
       const nextTotal = total + value.length;
-      if (nextTotal > maxBytes) {
+      if (nextTotal > maxBytes || (options?.stopAtLimit && nextTotal === maxBytes)) {
         const remaining = maxBytes - total;
         if (remaining > 0) {
           chunks.push(value.subarray(0, remaining));
@@ -235,9 +215,8 @@ async function readResponsePrefix(
         }
         size = nextTotal;
         truncated = true;
-        try {
-          await reader.cancel();
-        } catch {}
+        // A capture tee can retain cancellation until the caller releases its request.
+        void reader.cancel().catch(() => undefined);
         break;
       }
       chunks.push(value);
@@ -260,14 +239,77 @@ async function readResponsePrefix(
   };
 }
 
-/** Reads a response body under a byte cap, cancelling the stream on overflow or idle timeout. */
+async function readResponsePrefix(
+  response: Response,
+  maxBytes: number,
+  options?: ReadResponsePrefixOptions,
+): Promise<ReadResponsePrefixResult> {
+  validateMaxBytes(maxBytes);
+  let timeoutMs: number | undefined;
+  try {
+    timeoutMs = typeof options?.timeoutMs === "function" ? options.timeoutMs() : options?.timeoutMs;
+  } catch (error) {
+    void response.body?.cancel(error).catch(() => undefined);
+    throw error;
+  }
+  const body = response.body;
+  if (!body || typeof body.getReader !== "function") {
+    return await withResponseBodyTimeout({
+      timeoutMs,
+      onTimeout: options?.onTimeout,
+      cancel: async (error) => await body?.cancel(error),
+      read: async () => {
+        const fallback = Buffer.from(await response.arrayBuffer());
+        if (fallback.length > maxBytes) {
+          return {
+            buffer: fallback.subarray(0, maxBytes),
+            size: fallback.length,
+            truncated: true,
+          };
+        }
+        return { buffer: fallback, size: fallback.length, truncated: false };
+      },
+    });
+  }
+
+  const reader = body.getReader();
+  return await withResponseBodyTimeout({
+    timeoutMs,
+    onTimeout: options?.onTimeout,
+    cancel: async (error) => await reader.cancel(error),
+    read: async () => await readResponsePrefixFromReader(reader, maxBytes, options),
+  });
+}
+
+export type ReadResponseTextPrefixResult = {
+  text: string;
+  size: number;
+  truncated: boolean;
+};
+
+/** Reads and decodes a bounded text prefix while cancelling unread overflow. */
+export async function readResponseTextPrefix(
+  response: Response,
+  maxBytes: number,
+  options?: ReadResponseTextPrefixOptions,
+): Promise<ReadResponseTextPrefixResult> {
+  const prefix = await readResponsePrefix(response, maxBytes, {
+    ...options,
+    stopAtLimit: true,
+  });
+  return {
+    text: decodeTextPrefix(prefix.buffer, { truncated: prefix.truncated }),
+    size: prefix.size,
+    truncated: prefix.truncated,
+  };
+}
+
+/** Reads a response body under byte, idle, and overall timeout bounds. */
 export async function readResponseWithLimit(
   response: Response,
   maxBytes: number,
-  options?: {
+  options?: ReadResponseTextPrefixOptions & {
     onOverflow?: (params: { size: number; maxBytes: number; res: Response }) => Error;
-    chunkTimeoutMs?: number;
-    onIdleTimeout?: (params: { chunkTimeoutMs: number }) => Error;
   },
 ): Promise<Buffer> {
   const onOverflow =
@@ -277,6 +319,8 @@ export async function readResponseWithLimit(
   const prefix = await readResponsePrefix(response, maxBytes, {
     chunkTimeoutMs: options?.chunkTimeoutMs,
     onIdleTimeout: options?.onIdleTimeout,
+    timeoutMs: options?.timeoutMs,
+    onTimeout: options?.onTimeout,
   });
   if (prefix.truncated) {
     throw onOverflow({ size: prefix.size, maxBytes, res: response });
@@ -287,29 +331,24 @@ export async function readResponseWithLimit(
 /** Reads a small collapsed text prefix from a response body for diagnostics/errors. */
 export async function readResponseTextSnippet(
   response: Response,
-  options?: {
+  options?: ReadResponseTextPrefixOptions & {
     maxBytes?: number;
     maxChars?: number;
-    chunkTimeoutMs?: number;
-    onIdleTimeout?: (params: { chunkTimeoutMs: number }) => Error;
   },
 ): Promise<string | undefined> {
   const maxBytes = options?.maxBytes ?? 8 * 1024;
   const maxChars = options?.maxChars ?? 200;
-  const prefix = await readResponsePrefix(response, maxBytes, {
+  const prefix = await readResponseTextPrefix(response, maxBytes, {
     chunkTimeoutMs: options?.chunkTimeoutMs,
     onIdleTimeout: options?.onIdleTimeout,
+    timeoutMs: options?.timeoutMs,
+    onTimeout: options?.onTimeout,
   });
-  if (prefix.buffer.length === 0) {
+  if (!prefix.text) {
     return undefined;
   }
 
-  const text = new TextDecoder().decode(prefix.buffer);
-  if (!text) {
-    return undefined;
-  }
-
-  const collapsed = text.replace(/\s+/g, " ").trim();
+  const collapsed = prefix.text.replace(/\s+/g, " ").trim();
   if (!collapsed) {
     return undefined;
   }
@@ -325,21 +364,21 @@ export async function readRequestBodyWithLimit(
 ): Promise<string> {
   const { maxBytes, timeoutMs } = resolveRequestBodyLimitValues(options);
   const encoding = options.encoding ?? "utf-8";
+  const destroyOnLimit = options.destroyOnLimit !== false;
+
+  if (isHttpConnectionClosing(req.socket)) {
+    throw new RequestBodyLimitError({ code: "CONNECTION_CLOSED" });
+  }
 
   const declaredLength = parseContentLengthHeader(req);
   if (declaredLength !== null && declaredLength > maxBytes) {
     const error = new RequestBodyLimitError({ code: "PAYLOAD_TOO_LARGE" });
-    if (!req.destroyed) {
-      // Limit violations are expected user input; destroying with an Error causes
-      // an async 'error' event which can crash the process if no listener remains.
-      req.destroy();
-    }
+    stopRequestBodyAfterLimit(req, destroyOnLimit);
     throw error;
   }
 
   return await new Promise((resolve, reject) => {
     let done = false;
-    let ended = false;
     let totalBytes = 0;
     const chunks: Buffer[] = [];
 
@@ -366,9 +405,7 @@ export async function readRequestBodyWithLimit(
 
     const timer = setNodeTimeout(() => {
       const error = new RequestBodyLimitError({ code: "REQUEST_BODY_TIMEOUT" });
-      if (!req.destroyed) {
-        req.destroy();
-      }
+      stopRequestBodyAfterLimit(req, destroyOnLimit);
       fail(error);
     }, timeoutMs);
 
@@ -380,9 +417,7 @@ export async function readRequestBodyWithLimit(
       totalBytes = progress.totalBytes;
       if (progress.exceeded) {
         const error = new RequestBodyLimitError({ code: "PAYLOAD_TOO_LARGE" });
-        if (!req.destroyed) {
-          req.destroy();
-        }
+        stopRequestBodyAfterLimit(req, destroyOnLimit);
         fail(error);
         return;
       }
@@ -390,8 +425,17 @@ export async function readRequestBodyWithLimit(
     };
 
     const onEnd = () => {
-      ended = true;
-      finish(() => resolve(Buffer.concat(chunks).toString(encoding)));
+      if (isHttpConnectionClosing(req.socket)) {
+        fail(new RequestBodyLimitError({ code: "CONNECTION_CLOSED" }));
+        return;
+      }
+      finish(() =>
+        resolve(
+          chunks.length === 1
+            ? chunks[0]!.toString(encoding)
+            : Buffer.concat(chunks).toString(encoding),
+        ),
+      );
     };
 
     const onError = (error: Error) => {
@@ -402,9 +446,6 @@ export async function readRequestBodyWithLimit(
     };
 
     const onClose = () => {
-      if (done || ended) {
-        return;
-      }
       fail(new RequestBodyLimitError({ code: "CONNECTION_CLOSED" }));
     };
 
@@ -412,6 +453,9 @@ export async function readRequestBodyWithLimit(
     req.on("end", onEnd);
     req.on("error", onError);
     req.on("close", onClose);
+    if (req.destroyed && !req.readableEnded) {
+      onClose();
+    }
   });
 }
 
@@ -451,8 +495,8 @@ export async function readJsonBodyWithLimit(
     }
     return {
       ok: false,
-      code: "INVALID_JSON",
-      error: formatErrorMessage(error),
+      code: "CONNECTION_CLOSED",
+      error: requestBodyErrorToText("CONNECTION_CLOSED"),
     };
   }
 }
@@ -482,14 +526,13 @@ export function installRequestBodyLimitGuard(
   let tripped = false;
   let reason: RequestBodyLimitErrorCode | null = null;
   let done = false;
-  let ended = false;
   let totalBytes = 0;
 
   const cleanup = () => {
     req.removeListener("data", onData);
-    req.removeListener("end", onEnd);
-    req.removeListener("close", onClose);
-    req.removeListener("error", onError);
+    req.removeListener("end", finish);
+    req.removeListener("close", finish);
+    req.removeListener("error", finish);
     clearNodeTimeout(timer);
   };
 
@@ -503,16 +546,15 @@ export function installRequestBodyLimitGuard(
 
   const respond = (error: RequestBodyLimitError) => {
     const text = customText[error.code] ?? requestBodyErrorToText(error.code);
-    if (!res.headersSent) {
-      res.statusCode = error.statusCode;
-      if (responseFormat === "text") {
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.end(text);
-      } else {
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.end(JSON.stringify({ error: text }));
-      }
-    }
+    const body = responseFormat === "text" ? text : JSON.stringify({ error: text });
+    const contentType = responseFormat === "text" ? "text/plain" : "application/json";
+    void sendHttpRequestRejection(
+      req,
+      res,
+      error.statusCode,
+      body,
+      `${contentType}; charset=utf-8`,
+    );
   };
 
   const trip = (error: RequestBodyLimitError) => {
@@ -523,11 +565,6 @@ export function installRequestBodyLimitGuard(
     reason = error.code;
     finish();
     respond(error);
-    if (!req.destroyed) {
-      // Limit violations are expected user input; destroying with an Error causes
-      // an async 'error' event which can crash the process if no listener remains.
-      req.destroy();
-    }
   };
 
   const onData = (chunk: Buffer | string) => {
@@ -541,33 +578,23 @@ export function installRequestBodyLimitGuard(
     }
   };
 
-  const onEnd = () => {
-    ended = true;
-    finish();
-  };
-
-  const onClose = () => {
-    if (done || ended) {
-      return;
-    }
-    finish();
-  };
-
-  const onError = () => {
-    finish();
-  };
-
   const timer = setNodeTimeout(() => {
     trip(new RequestBodyLimitError({ code: "REQUEST_BODY_TIMEOUT" }));
   }, timeoutMs);
 
   req.on("data", onData);
-  req.on("end", onEnd);
-  req.on("close", onClose);
-  req.on("error", onError);
+  req.on("end", finish);
+  req.on("close", finish);
+  req.on("error", finish);
 
   const declaredLength = parseContentLengthHeader(req);
-  if (declaredLength !== null && declaredLength > maxBytes) {
+  if (isHttpConnectionClosing(req.socket)) {
+    tripped = true;
+    reason = "CONNECTION_CLOSED";
+    finish();
+  } else if (req.destroyed && !req.readableEnded) {
+    finish();
+  } else if (declaredLength !== null && declaredLength > maxBytes) {
     trip(new RequestBodyLimitError({ code: "PAYLOAD_TOO_LARGE" }));
   }
 

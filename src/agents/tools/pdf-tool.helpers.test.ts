@@ -28,7 +28,8 @@ vi.mock("../../plugins/plugin-registry.js", () => ({
   }),
 }));
 
-vi.mock("../../plugins/current-plugin-metadata-snapshot.js", () => ({
+vi.mock("../../plugins/current-plugin-metadata-snapshot.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../plugins/current-plugin-metadata-snapshot.js")>()),
   getCurrentPluginMetadataSnapshot: () => ({
     plugins: pdfMetadataPlugins,
   }),
@@ -77,6 +78,17 @@ describe("parsePageRange", () => {
   it("throws on fractional page numbers", () => {
     expect(() => parsePageRange("1.5", 20)).toThrow('Invalid page number: "1.5"');
     expect(() => parsePageRange("1,2.5", 20)).toThrow('Invalid page number: "2.5"');
+  });
+
+  it("throws on unsafe integer page numbers and ranges", () => {
+    const unsafePage = String(Number.MAX_SAFE_INTEGER + 1);
+    const maxPages = 20;
+    expect(() => parsePageRange(unsafePage, maxPages)).toThrow(
+      `Invalid page number: "${unsafePage}"`,
+    );
+    expect(() => parsePageRange(`1-${unsafePage}`, maxPages)).toThrow(
+      `Invalid page range: "${unsafePage}"`,
+    );
   });
 
   it("throws on invalid range (start > end)", () => {

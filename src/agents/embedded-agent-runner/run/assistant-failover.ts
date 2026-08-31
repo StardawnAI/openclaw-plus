@@ -4,6 +4,10 @@
 import { sanitizeForLog } from "../../../../packages/terminal-core/src/ansi.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
 import type { AssistantMessage } from "../../../llm/types.js";
+import {
+  projectAgentRunAttemptTerminal,
+  type AgentRunAttemptTerminal,
+} from "../../agent-run-terminal-outcome.js";
 import type { AuthProfileFailureReason } from "../../auth-profiles.js";
 import {
   formatAssistantErrorText,
@@ -12,6 +16,8 @@ import {
   type FailoverReason,
 } from "../../embedded-agent-helpers.js";
 import { FailoverError, resolveFailoverStatus } from "../../failover-error.js";
+import type { PreparedProviderFailoverOwner } from "../../failover/provider-patterns.js";
+import { classifyRateLimitWindow } from "../../failover/retry-evidence.js";
 import {
   mergeRetryFailoverReason,
   resolveRunFailoverDecision,
@@ -27,7 +33,7 @@ type AssistantFailoverOutcome =
       action: "retry";
       overloadProfileRotations: number;
       lastRetryFailoverReason: FailoverReason | null;
-      retryKind?: "same_model_idle_timeout" | "same_model_rate_limit";
+      retryKind: "profile_rotation" | "same_model_idle_timeout" | "same_model_rate_limit";
     }
   | {
       action: "throw";
@@ -38,76 +44,16 @@ type ShortWindowRateLimitRetry = {
   retryAfterSeconds?: number;
 };
 
-const LONG_WINDOW_RATE_LIMIT_RE =
-  /\b(?:daily|weekly|monthly|tokens per day|requests per day|usage limit|subscription|insufficient[_ -]?quota|current quota|quota[_ -]?exceeded|quota exceeded)\b/i;
-const SHORT_RATE_LIMIT_WINDOW_RE =
-  /\b(?:requests per minute|tokens per minute|per-minute|rpm|tpm)\b/i;
-const SHORT_WINDOW_RATE_LIMIT_RE =
-  /\b(?:requests per minute|tokens per minute|per-minute|rpm|tpm|model_cooldown)\b|请求过于频繁|调用频率|频率限制/i;
-const RETRY_AFTER_VALUE_RE = /\bretry[- ]after\b\s*:?\s*(?:in\s*)?([^\r\n;]+)/i;
-const RETRY_AFTER_SECONDS_RE =
-  /^(\d+(?:\.\d+)?)(?:\s*(milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m))?\b/i;
-const MAX_SHORT_WINDOW_RETRY_AFTER_SECONDS = 60;
-
-function parseRetryAfterSeconds(message: string): number | null {
-  const valueText = RETRY_AFTER_VALUE_RE.exec(message)?.[1]?.trim();
-  if (!valueText) {
-    return null;
-  }
-  const secondsMatch = RETRY_AFTER_SECONDS_RE.exec(valueText);
-  if (secondsMatch?.[1]) {
-    const value = Number(secondsMatch[1]);
-    if (!Number.isFinite(value) || value < 0) {
-      return null;
-    }
-    const unit = secondsMatch[2]?.toLowerCase();
-    if (
-      unit?.startsWith("m") &&
-      unit !== "ms" &&
-      !unit.startsWith("msec") &&
-      !unit.startsWith("millisecond")
-    ) {
-      return value * 60;
-    }
-    if (unit === "ms" || unit?.startsWith("msec") || unit?.startsWith("millisecond")) {
-      return value / 1000;
-    }
-    return value;
-  }
-  const retryAtMs = Date.parse(valueText);
-  if (!Number.isFinite(retryAtMs)) {
-    return null;
-  }
-  return Math.max(0, (retryAtMs - Date.now()) / 1000);
-}
-
 function resolveShortWindowRateLimitRetry(
   message: string | undefined,
 ): ShortWindowRateLimitRetry | null {
-  const raw = message?.trim();
-  if (!raw) {
+  const window = classifyRateLimitWindow(message);
+  if (window.kind !== "short") {
     return null;
   }
-  const retryAfterSeconds = parseRetryAfterSeconds(raw);
-  if (retryAfterSeconds !== null && retryAfterSeconds > MAX_SHORT_WINDOW_RETRY_AFTER_SECONDS) {
-    return null;
-  }
-  const shortRetryAfter =
-    retryAfterSeconds !== null && retryAfterSeconds <= MAX_SHORT_WINDOW_RETRY_AFTER_SECONDS;
-  const hasShortWindowSignal = SHORT_RATE_LIMIT_WINDOW_RE.test(raw);
-  if (RETRY_AFTER_VALUE_RE.test(raw) && retryAfterSeconds === null && !hasShortWindowSignal) {
-    return null;
-  }
-  if (LONG_WINDOW_RATE_LIMIT_RE.test(raw) && !hasShortWindowSignal && !shortRetryAfter) {
-    return null;
-  }
-  // Providers such as Gemini use quota wording for per-minute RPM/TPM
-  // throttles. Treat quota as long-window only when no short-window hint is
-  // present; hard daily/usage/subscription limits are filtered above.
-  if (!SHORT_WINDOW_RATE_LIMIT_RE.test(raw) && !shortRetryAfter) {
-    return null;
-  }
-  return retryAfterSeconds !== null ? { retryAfterSeconds } : {};
+  return window.retryAfterSeconds === undefined
+    ? {}
+    : { retryAfterSeconds: window.retryAfterSeconds };
 }
 
 export function isShortWindowRateLimitMessage(message: string | undefined): boolean {
@@ -121,22 +67,18 @@ export function isShortWindowRateLimitMessage(message: string | undefined): bool
  */
 export async function handleAssistantFailover(params: {
   initialDecision: AssistantFailoverDecision;
-  aborted: boolean;
-  externalAbort: boolean;
+  terminal: AgentRunAttemptTerminal;
+  signalOwnedInterruption: boolean;
   fallbackConfigured: boolean;
   failoverFailure: boolean;
   failoverReason: FailoverReason | null;
-  timedOut: boolean;
-  idleTimedOut: boolean;
-  timedOutDuringCompaction: boolean;
-  timedOutDuringToolExecution: boolean;
-  timedOutByRunBudget: boolean;
+  harnessOwnsTransport: boolean;
   allowSameModelIdleTimeoutRetry: boolean;
-  allowSameModelRateLimitRetry: boolean;
   assistantProfileFailureReason: AuthProfileFailureReason | null;
   lastProfileId?: string;
   modelId: string;
   provider: string;
+  providerOwner?: PreparedProviderFailoverOwner;
   activeErrorContext: { provider: string; model: string };
   lastAssistant: AssistantMessage | undefined;
   config: OpenClawConfig | undefined;
@@ -161,15 +103,17 @@ export async function handleAssistantFailover(params: {
     reason?: AuthProfileFailureReason | null;
     modelId?: string;
   }) => Promise<void>;
-  maybeEscalateRateLimitProfileFallback: (params: {
-    failoverProvider: string;
-    failoverModel: string;
-    logFallbackDecision: (decision: "fallback_model", extra?: { status?: number }) => void;
-  }) => void;
   maybeRetrySameModelRateLimit: (retry?: ShortWindowRateLimitRetry) => Promise<boolean>;
   maybeBackoffBeforeOverloadFailover: (reason: FailoverReason | null) => Promise<void>;
   advanceAuthProfile: () => Promise<boolean>;
+  advanceRateLimitAuthProfile: (context: {
+    failoverProvider: string;
+    failoverModel: string;
+    logFallbackDecision: (decision: "fallback_model", extra?: { status?: number }) => void;
+  }) => Promise<boolean>;
 }): Promise<AssistantFailoverOutcome> {
+  const terminal = projectAgentRunAttemptTerminal(params.terminal);
+  const externalAbort = terminal.externalAbort || params.signalOwnedInterruption;
   let overloadProfileRotations = params.overloadProfileRotations;
   let decision = params.initialDecision;
   const sameModelIdleTimeoutRetry = (): AssistantFailoverOutcome => {
@@ -194,16 +138,16 @@ export async function handleAssistantFailover(params: {
     lastRetryFailoverReason: mergeRetryFailoverReason({
       previous: params.previousRetryFailoverReason,
       failoverReason: params.failoverReason,
-      timedOut: params.timedOut || params.idleTimedOut,
+      timedOut: terminal.timedOut,
     }),
   });
 
   if (decision.action === "rotate_profile") {
     const failedProfileId = params.lastProfileId;
-    const timeoutFailure = params.timedOut || params.idleTimedOut;
+    const timeoutFailure = terminal.timedOut;
     const failureReason = params.assistantProfileFailureReason;
     const markFailedProfile = async () => {
-      if (!failedProfileId || !failureReason) {
+      if (!failureReason) {
         return;
       }
       try {
@@ -247,30 +191,35 @@ export async function handleAssistantFailover(params: {
       }
     }
 
+    let rotated: boolean;
     if (params.failoverReason === "rate_limit") {
       // Minute-scale RPM windows can clear without spending a profile rotation
       // or model fallback. Keep the retry bounded; once exhausted, continue
       // through the existing rate-limit escalation path.
       const shortWindowRetry = resolveShortWindowRateLimitRetry(params.lastAssistant?.errorMessage);
-      if (
-        params.allowSameModelRateLimitRetry &&
-        shortWindowRetry &&
-        (await params.maybeRetrySameModelRateLimit(shortWindowRetry))
-      ) {
+      if (shortWindowRetry && (await params.maybeRetrySameModelRateLimit(shortWindowRetry))) {
         return sameModelRateLimitRetry();
       }
-      params.maybeEscalateRateLimitProfileFallback({
+      rotated = await params.advanceRateLimitAuthProfile({
         failoverProvider: params.activeErrorContext.provider,
         failoverModel: params.activeErrorContext.model,
         logFallbackDecision: params.logAssistantFailoverDecision,
       });
+    } else {
+      rotated = await params.advanceAuthProfile();
     }
 
-    const rotated = await params.advanceAuthProfile();
     const markFailedProfilePromise = markFailedProfile();
     if (timeoutFailure && !params.isProbeSession && failedProfileId) {
-      const timeoutLabel = params.idleTimedOut ? "idle timeout (model silent)" : "timed out";
-      params.warn(`Profile ${failedProfileId} ${timeoutLabel}. Trying next account...`);
+      const timeoutLabel = terminal.idleTimedOut ? "idle timeout (model silent)" : "timed out";
+      // Only promise a next account when one was actually selected. Credentials
+      // that config does not authorize are not rotation targets, so this can end
+      // with no further account even when one exists in the environment.
+      params.warn(
+        rotated
+          ? `Profile ${failedProfileId} ${timeoutLabel}. Trying next account...`
+          : `Profile ${failedProfileId} ${timeoutLabel}. No further authorized account for this provider; create a backup auth profile and add its id to auth.order to enable failover.`,
+      );
     }
     if (params.cloudCodeAssistFormatError && failedProfileId) {
       params.warn(
@@ -286,31 +235,28 @@ export async function handleAssistantFailover(params: {
       return {
         action: "retry",
         overloadProfileRotations,
+        retryKind: "profile_rotation",
         lastRetryFailoverReason: mergeRetryFailoverReason({
           previous: params.previousRetryFailoverReason,
           failoverReason: params.failoverReason,
-          timedOut: params.timedOut || params.idleTimedOut,
+          timedOut: terminal.timedOut,
         }),
       };
     }
     await markFailedProfilePromise;
-    if (params.idleTimedOut && params.allowSameModelIdleTimeoutRetry) {
+    if (terminal.idleTimedOut && params.allowSameModelIdleTimeoutRetry) {
       return sameModelIdleTimeoutRetry();
     }
 
     decision = resolveRunFailoverDecision({
       stage: "assistant",
       allowFormatRetry: params.cloudCodeAssistFormatError,
-      aborted: params.aborted,
-      externalAbort: params.externalAbort,
+      terminal: params.terminal,
+      signalOwnedInterruption: params.signalOwnedInterruption,
       fallbackConfigured: params.fallbackConfigured,
       failoverFailure: params.failoverFailure,
       failoverReason: params.failoverReason,
-      timedOut: params.timedOut,
-      idleTimedOut: params.idleTimedOut,
-      timedOutDuringCompaction: params.timedOutDuringCompaction,
-      timedOutDuringToolExecution: params.timedOutDuringToolExecution,
-      timedOutByRunBudget: params.timedOutByRunBudget,
+      harnessOwnsTransport: params.harnessOwnsTransport,
       profileRotated: true,
     });
   }
@@ -344,14 +290,14 @@ export async function handleAssistantFailover(params: {
   }
 
   if (decision.action === "surface_error") {
-    if (!params.externalAbort && params.idleTimedOut && params.allowSameModelIdleTimeoutRetry) {
+    if (!externalAbort && terminal.idleTimedOut && params.allowSameModelIdleTimeoutRetry) {
       return sameModelIdleTimeoutRetry();
     }
     params.logAssistantFailoverDecision("surface_error");
     // Only current provider failures throw here. External aborts, timeout
     // payload synthesis, and stale classified text without failoverFailure
     // keep the normal payload path.
-    if (!params.externalAbort && !params.timedOut && params.failoverFailure) {
+    if (!externalAbort && !terminal.timedOut && params.failoverFailure) {
       const message = resolveAssistantFailoverErrorMessage(params);
       const reason = resolveSurfaceErrorReason(decision.reason, params);
       const status =
@@ -387,21 +333,23 @@ function resolveAssistantFailoverErrorMessage(params: {
   config: OpenClawConfig | undefined;
   sessionKey?: string;
   activeErrorContext: { provider: string; model: string };
-  timedOut: boolean;
-  idleTimedOut: boolean;
+  providerOwner?: PreparedProviderFailoverOwner;
+  terminal: AgentRunAttemptTerminal;
   rateLimitFailure: boolean;
   billingFailure: boolean;
   authFailure: boolean;
   /** Credential auth mode passed through to billing copy formatter (#80877). */
   authMode?: string;
 }): string {
-  const timeoutFailure = params.timedOut || params.idleTimedOut;
+  const timeoutFailure =
+    params.terminal.kind === "timeout" && params.terminal.source !== "observation";
   return (
     (params.lastAssistant
       ? formatAssistantErrorText(params.lastAssistant, {
           cfg: params.config,
           sessionKey: params.sessionKey,
           provider: params.activeErrorContext.provider,
+          providerOwner: params.providerOwner,
           model: params.activeErrorContext.model,
           authMode: params.authMode,
         })

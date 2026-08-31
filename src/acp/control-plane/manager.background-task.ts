@@ -1,4 +1,7 @@
 /** Mirrors child ACP turns into detached-task status for requester-facing progress. */
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import type { AdmittedRunContext } from "../../agents/admitted-run-context.js";
+import { isRetainedExecutionOwnerBinding } from "../../audit/execution-owner-binding.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
 import {
@@ -7,9 +10,16 @@ import {
   failTaskRunByRunId,
   startTaskRunByRunId,
 } from "../../tasks/detached-task-runtime.js";
+import { createNextAcpTaskBackingDetail } from "../../tasks/task-backing-authority.js";
 import { resolveRequiredCompletionTerminalResult } from "../../tasks/task-completion-contract.js";
-import type { DeliveryContext } from "../../utils/delivery-context.js";
+import { bindTaskFlowExecution } from "../../tasks/task-flow-registry.store.sqlite.js";
+import { bindTaskRunExecution } from "../../tasks/task-registry.store.sqlite.js";
+import {
+  deliveryContextFromSession,
+  type DeliveryContext,
+} from "../../utils/delivery-context.shared.js";
 import { AcpRuntimeError } from "../runtime/errors.js";
+import { ACP_TURN_TIMEOUT_DETAIL_CODE } from "./manager.turn-timeout.js";
 import type { AcpSessionManagerDeps } from "./manager.types.js";
 import { normalizeText } from "./runtime-options.js";
 
@@ -26,13 +36,18 @@ type BackgroundTaskContext = {
   task: string;
 };
 
+type BackgroundTaskRecord = {
+  taskId: string;
+  parentFlowId?: string;
+};
+
 /** Produces the bounded task label shown for a child ACP background run. */
 function summarizeBackgroundTaskText(text: string): string {
   const normalized = normalizeText(text) ?? "ACP background task";
   if (normalized.length <= ACP_BACKGROUND_TASK_TEXT_MAX_LENGTH) {
     return normalized;
   }
-  return `${normalized.slice(0, ACP_BACKGROUND_TASK_TEXT_MAX_LENGTH - 1)}…`;
+  return `${truncateUtf16Safe(normalized, ACP_BACKGROUND_TASK_TEXT_MAX_LENGTH - 1)}…`;
 }
 
 /** Appends bounded progress text while preserving a single-line task summary. */
@@ -49,24 +64,24 @@ export function appendBackgroundTaskProgressSummary(current: string, chunk: stri
   if (combined.length <= ACP_BACKGROUND_TASK_PROGRESS_MAX_LENGTH) {
     return combined;
   }
-  return `${combined.slice(0, ACP_BACKGROUND_TASK_PROGRESS_MAX_LENGTH - 1)}…`;
+  return `${truncateUtf16Safe(combined, ACP_BACKGROUND_TASK_PROGRESS_MAX_LENGTH - 1)}…`;
 }
 
 /** Maps ACP runtime failures to detached-task terminal states. */
 export function resolveBackgroundTaskFailureStatus(error: AcpRuntimeError): "failed" | "timed_out" {
-  return /\btimed out\b/i.test(error.message) ? "timed_out" : "failed";
+  return error.detailCode === ACP_TURN_TIMEOUT_DETAIL_CODE ? "timed_out" : "failed";
 }
 
-/** Infers blocked terminal outcomes from final progress text when the child turn reports one. */
-export function resolveBackgroundTaskTerminalResult(progressSummary: string): {
+/** Infers blocked terminal outcomes from final completion text when the child turn reports one. */
+export function resolveBackgroundTaskTerminalResult(completionText: string): {
   terminalOutcome?: "blocked";
   terminalSummary?: string;
 } {
-  const requiredCompletionResult = resolveRequiredCompletionTerminalResult(progressSummary);
+  const requiredCompletionResult = resolveRequiredCompletionTerminalResult(completionText);
   if (requiredCompletionResult.terminalOutcome) {
     return requiredCompletionResult;
   }
-  const normalized = normalizeText(progressSummary)?.replace(/\s+/g, " ").trim();
+  const normalized = normalizeText(completionText)?.replace(/\s+/g, " ").trim();
   if (!normalized) {
     return {};
   }
@@ -101,7 +116,7 @@ export function resolveBackgroundTaskContext(params: {
   requestId: string;
   text: string;
 }): BackgroundTaskContext | null {
-  const childEntry = params.deps.readSessionEntry({
+  const childEntry = params.deps.loadSessionEntry({
     cfg: params.cfg,
     sessionKey: params.sessionKey,
   })?.entry;
@@ -110,13 +125,14 @@ export function resolveBackgroundTaskContext(params: {
   if (!requesterSessionKey) {
     return null;
   }
-  const parentEntry = params.deps.readSessionEntry({
+  const parentEntry = params.deps.loadSessionEntry({
     cfg: params.cfg,
     sessionKey: requesterSessionKey,
   })?.entry;
   return {
     requesterSessionKey,
-    requesterOrigin: parentEntry?.deliveryContext ?? childEntry?.deliveryContext,
+    requesterOrigin:
+      deliveryContextFromSession(parentEntry) ?? deliveryContextFromSession(childEntry),
     childSessionKey: params.sessionKey,
     runId: params.requestId,
     label: normalizeText(childEntry?.label),
@@ -127,7 +143,8 @@ export function resolveBackgroundTaskContext(params: {
 export function createBackgroundTaskRecord(
   context: BackgroundTaskContext,
   startedAt: number,
-): void {
+  instanceId: string,
+): BackgroundTaskRecord | undefined {
   try {
     const task = createRunningTaskRun({
       runtime: "acp",
@@ -140,16 +157,46 @@ export function createBackgroundTaskRecord(
       label: context.label,
       task: context.task,
       startedAt,
+      detail: createNextAcpTaskBackingDetail({
+        childSessionKey: context.childSessionKey,
+        instanceId,
+      }),
     });
     if (!task) {
       logVerbose(
         `acp-manager: failed creating background task for ${context.runId}: persist_failed`,
       );
+      return undefined;
     }
+    return {
+      taskId: task.taskId,
+      ...(task.parentFlowId ? { parentFlowId: task.parentFlowId } : {}),
+    };
   } catch (error) {
     logVerbose(
       `acp-manager: failed creating background task for ${context.runId}: ${String(error)}`,
     );
+    return undefined;
+  }
+}
+
+/** Links ACP owner rows only when the runtime reaches its prompt-submitted boundary. */
+export function bindBackgroundTaskExecution(
+  record: BackgroundTaskRecord,
+  admitted: AdmittedRunContext,
+): void {
+  try {
+    const taskResult = bindTaskRunExecution({ admitted, taskId: record.taskId });
+    const flowResult = record.parentFlowId
+      ? isRetainedExecutionOwnerBinding(taskResult)
+        ? bindTaskFlowExecution({ admitted, flowId: record.parentFlowId })
+        : taskResult
+      : undefined;
+    if ([taskResult, flowResult].some((result) => result === "mismatch" || result === "missing")) {
+      logVerbose("acp-manager: exact task execution binding was not retained");
+    }
+  } catch (error) {
+    logVerbose(`acp-manager: failed binding background task execution: ${String(error)}`);
   }
 }
 

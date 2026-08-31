@@ -1,16 +1,44 @@
 import type { FastMode } from "@openclaw/normalization-core/string-coerce";
+import type { AgentRunTerminalOutcome } from "../agents/agent-run-terminal-outcome.js";
 /** Public option types for reply generation callbacks, streaming, and delivery policy. */
+import type { ExecutionIdentityAdmissionToken } from "../audit/execution-identity-admission.js";
+import type { AgentPlanStep } from "../channels/streaming.js";
+import type { TranscriptEntryAnchor } from "../config/sessions/transcript-entry-anchor.js";
 import type { ImageContent } from "../llm/types.js";
+import type { MediaFact } from "../media/media-facts.js";
 import type { PromptImageOrderEntry } from "../media/prompt-image-order.js";
 import type { UserTurnTranscriptRecorder } from "../sessions/user-turn-transcript.types.js";
 import type { ReplyPayload } from "./reply-payload.js";
 import type { TypingController } from "./reply/typing.js";
+import type { SourceReplyDeliveryMode } from "./source-reply-delivery-mode.types.js";
+
+export type { SourceReplyDeliveryMode } from "./source-reply-delivery-mode.types.js";
+
+/** A successful runtime append, independent of optional active-path projection anchors. */
+export type ReplyDispatchAssistantTranscript = Pick<
+  TranscriptEntryAnchor,
+  "agentId" | "sessionId" | "sessionKey" | "storePath"
+> & {
+  messageId: string;
+  anchor?: TranscriptEntryAnchor;
+  idempotencyKey: string;
+};
+
+export type ReplyDispatchRun = {
+  completionSource: "reply-dispatch";
+  getResult: () => {
+    assistantTranscript?: ReplyDispatchAssistantTranscript;
+    terminalOutcome?: AgentRunTerminalOutcome;
+  };
+};
 
 export type BlockReplyContext = {
   abortSignal?: AbortSignal;
   timeoutMs?: number;
   /** Source assistant message index from the upstream stream, when available. */
   assistantMessageIndex?: number;
+  /** @internal Stable durable outbound intent owned by the producing runtime. */
+  deliveryIntentId?: string;
 };
 
 /** Context passed to onModelSelected callback with actual model used. */
@@ -34,28 +62,59 @@ export type ReplyThreadingPolicy = {
   implicitCurrentMessage?: "default" | "allow" | "deny";
 };
 
-export type SourceReplyDeliveryMode = "automatic" | "message_tool_only";
+/** Action sink available for model-proposed follow-up tasks during this turn. */
+export type TaskSuggestionDeliveryMode = "gateway";
 
 /** Correlates queued reply ownership transfer with later delivery drains. */
 export type QueuedReplyDeliveryCorrelation = {
   begin: () => (() => void) | void;
 };
 
-/** Lifecycle hooks for queued follow-up replies. */
-export type QueuedReplyLifecycle = {
-  /** Stable cancellation owner used to keep collect-mode batches authorization-safe. */
-  ownerKey?: string;
-  /** Return false when the external owner rejects this queue identity. */
-  onEnqueued?: () => boolean | void;
-  /** Retires this source's cancellation ownership while retaining its live identity. */
+/**
+ * Exclusive: each lifecycle is its own collect-admission identity.
+ * Cancel-only: share collect identity via ownerKey (gateway chat.send).
+ */
+type TurnAdoptionAdmission = "exclusive" | "cancel-only";
+
+/**
+ * Canonical turn-ownership lifecycle (adopt / defer / abandon / settle).
+ * Single surface for durable ingress, gateway cancel identity, and reply-lane transfer.
+ */
+export type TurnAdoptionLifecycle = {
+  /**
+   * Admission isolation mode (closed). Exclusive isolates collect identity per
+   * lifecycle; cancel-only shares via ownerKey. Never inferred from onAbandoned.
+   * Durable ingress sets exclusive; gateway cancel identity sets cancel-only.
+   */
+  admission?: TurnAdoptionAdmission;
+  /** Transcript branch leaf from which this turn was admitted. */
+  originatingLeafEntryId?: string | null;
+  onAdopted: () => void | Promise<void>;
+  /** Return false to reject followup enqueue. */
+  onDeferred?: () => boolean | void;
+  /** Reports that a deferred turn is still queued behind an active turn. */
+  onDeferredHeartbeat?: () => void;
+  /** Deferred turn finished without owning the reply lane. */
+  onAbandoned?: () => void;
+  /** Always fires when the followup ownership cycle ends (admitted or not). Gateway cleanup. */
+  onSettled?: () => void;
+  /** Retires cancellation ownership while retaining live identity. */
   onCancellationRetired?: () => void;
-  /** Called after the queued turn owns the reply lane, before model/tool execution. */
-  onAdmitted?: () => void | Promise<void>;
-  onComplete?: () => void;
+  /** Stable cancellation owner for collect-mode batches. */
+  ownerKey?: string;
+  abortSignal?: AbortSignal;
+  /** Ephemeral fact: a direct local operator turn lost fresh cron authority when queued. */
+  cronCreatorAuthorityUnavailable?: "queued-local-operator";
 };
 
 /** Partial assistant payload emitted during streaming or replacement updates. */
-export type PartialReplyPayload = Pick<ReplyPayload, "text" | "mediaUrls"> & {
+export type PartialReplyPayload = {
+  /**
+   * Sanitized text, which may be an enumerable memoized getter. Content materializes on first
+   * read: direct-delivery consumers pay per partial, while throttled consumers pay per flush.
+   */
+  text?: ReplyPayload["text"];
+  mediaUrls?: ReplyPayload["mediaUrls"];
   delta?: string;
   replace?: true;
 };
@@ -71,6 +130,9 @@ type ReasoningProgressPayload = {
   progressTokens: number;
 };
 
+/** Return false until the channel has accepted operator-visible progress. */
+type ProgressCallbackResult = boolean | void;
+
 /** Reply generation options shared by auto-reply, webchat, channels, and tests. */
 export type GetReplyOptions = {
   /** Override run id for agent events (defaults to random UUID). */
@@ -83,16 +145,29 @@ export type GetReplyOptions = {
   images?: ImageContent[];
   /** Original inline/offloaded attachment order for inbound images. */
   imageOrder?: PromptImageOrderEntry[];
-  /** Notifies when an agent run actually starts (useful for webchat command handling). */
-  onAgentRunStart?: (runId: string) => void;
+  /** Ordered media facts whose model-facing text projection is already present in the prompt. */
+  media?: MediaFact[];
   /**
-   * Called after the restart-recovery delivery-context persist attempt
-   * completes (context may be absent when source delivery is suppressed).
-   * Channels may complete ingress ownership here without waiting for settle.
+   * Notifies when an agent run starts. Return "reply-dispatch" synchronously to accept
+   * completion ownership offered in options; all other legacy callback results are ignored.
    */
-  onTurnAdopted?: () => void | Promise<void>;
+  onAgentRunStart?: (
+    runId: string,
+    executionIdentityToken?: ExecutionIdentityAdmissionToken,
+    options?: ReplyDispatchRun,
+  ) => unknown;
+  /** Reports the terminal agent-run classification to the shared dispatch owner. */
+  onAgentRunTerminalOutcome?: (outcome: "completed" | "failed") => void;
+  /**
+   * Canonical adoption lifecycle (adopted / deferred / abandoned / settled + pre-adoption abort).
+   */
+  turnAdoptionLifecycle?: TurnAdoptionLifecycle;
   /** Shared lifecycle owner for the current user-turn transcript append. */
   userTurnTranscriptRecorder?: UserTurnTranscriptRecorder;
+  /** Gateway-owned start-or-steer decision for this turn. */
+  messageInjectionDisposition?: "none" | "accepted" | "rejected";
+  /** Current user turn is already durable; replay it without appending another copy. */
+  suppressNextUserMessagePersistence?: boolean;
   onReplyStart?: () => Promise<void> | void;
   /** Called when the typing controller cleans up (e.g., run ended with NO_REPLY). */
   onTypingCleanup?: () => void;
@@ -116,8 +191,6 @@ export type GetReplyOptions = {
   bootstrapContextMode?: "full" | "lightweight";
   /** If true, suppress tool error warning payloads for this run. */
   suppressToolErrorWarnings?: boolean;
-  /** Dynamic form used when verbose progress visibility can change mid-run. */
-  shouldSuppressToolErrorWarnings?: () => boolean | undefined;
   /** If true, run the model without OpenClaw tools for this turn. */
   disableTools?: boolean;
   /** Runtime tool allow-list for this turn. Empty means no tools. */
@@ -131,6 +204,8 @@ export type GetReplyOptions = {
    * channel to surface progress via its own streaming/edit UX.
    */
   suppressDefaultToolProgressMessages?: boolean;
+  /** Suppress standalone tool/progress text even when verbose progress is enabled. */
+  suppressToolProgressMessages?: boolean;
   /** Allow channel-owned tool lifecycle feedback while text progress remains hidden. */
   allowToolLifecycleWhenProgressHidden?: boolean;
   /**
@@ -141,20 +216,31 @@ export type GetReplyOptions = {
    * both lanes at once.
    */
   onVerboseProgressVisibility?: (isActive: () => boolean) => void;
-  onPartialReply?: (payload: PartialReplyPayload) => Promise<void> | void;
-  onReasoningStream?: (payload: ReasoningStreamPayload) => Promise<void> | void;
+  /** Preserve source-event callback start order for stateful channel progress renderers. */
+  preserveProgressCallbackStartOrder?: boolean;
+  onPartialReply?: (
+    payload: PartialReplyPayload,
+  ) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
+  onReasoningStream?: (
+    payload: ReasoningStreamPayload,
+  ) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   onReasoningProgress?: (payload: ReasoningProgressPayload) => Promise<void> | void;
   streamReasoningInNonStreamModes?: boolean;
   /** Called when a thinking/reasoning block ends. */
-  onReasoningEnd?: () => Promise<void> | void;
+  onReasoningEnd?: () => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when a new assistant message starts (e.g., after tool call or thinking block). */
-  onAssistantMessageStart?: () => Promise<void> | void;
+  onAssistantMessageStart?: () => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called synchronously when a block reply is logically emitted, before async
    * delivery drains. Useful for channels that need to rotate preview state at
    * block boundaries without waiting for transport acks. */
-  onBlockReplyQueued?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
+  onBlockReplyQueued?: (
+    payload: ReplyPayload,
+    context?: BlockReplyContext,
+  ) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   onBlockReply?: (payload: ReplyPayload, context?: BlockReplyContext) => Promise<void> | void;
-  onToolResult?: (payload: ReplyPayload) => Promise<void> | void;
+  onToolResult?: (
+    payload: ReplyPayload,
+  ) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when a tool phase starts/updates, before summary payloads are emitted. */
   onToolStart?: (payload: {
     itemId?: string;
@@ -163,7 +249,7 @@ export type GetReplyOptions = {
     phase?: string;
     args?: Record<string, unknown>;
     detailMode?: "explain" | "raw";
-  }) => Promise<void> | void;
+  }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when a concrete work item starts, updates, or completes. */
   onItemEvent?: (payload: {
     itemId?: string;
@@ -176,23 +262,52 @@ export type GetReplyOptions = {
     summary?: string;
     progressText?: string;
     meta?: string;
+    commandBearing?: boolean;
     approvalId?: string;
     approvalSlug?: string;
-  }) => Promise<void> | void;
+    suppressDurableProgress?: true;
+  }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
+  /**
+   * Called when the utility-model narration of the in-progress turn changes.
+   * Providing this callback opts the channel into progress narration; core
+   * only generates narration when a utility model resolves (explicit
+   * config or the provider-declared default; utilityModel: "" disables).
+   * An empty text clears narration; a retained model preamble still wins before
+   * the channel falls back to raw tool progress.
+   */
+  onNarrationUpdate?: (payload: { text: string }) => Promise<void> | void;
+  /** Channel-owned final and queued-turn boundaries for the current narrator. */
+  onProgressNarratorLifecycle?: (lifecycle: {
+    beginTurn: () => void;
+    stopTurn: () => void;
+  }) => void;
+  /** False while utility-model narration has no visible progress draft. */
+  isProgressDraftVisible?: () => boolean;
+  /**
+   * Omit exec/bash command text from narration model input, mirroring the
+   * channel's `streaming.progress.commandText: "status"` display policy so
+   * narration never receives more command detail than the draft shows.
+   */
+  narrationHideCommandText?: boolean;
   /** In progress mode, classify Claude pre-tool text; true also renders it as commentary. */
   commentaryProgressEnabled?: boolean;
+  /** Bridge typed preambles to a channel-owned progress headline without commentary. */
+  progressPreambleEnabled?: boolean;
   /** Deliver durable reasoning payloads to channels that own a separate reasoning lane. */
   reasoningPayloadsEnabled?: boolean;
   /** Deliver durable commentary (💬) payloads to channels that own a separate commentary lane. */
   commentaryPayloadsEnabled?: boolean;
+  /** Optional turn-frozen commentary owner; visibility is live by default.
+   * With the static opt-in and this callback, core freezes, evaluates once, and snapshots. */
+  shouldDeliverCommentaryPayloads?: () => boolean;
   /** Called when the agent emits a structured plan update. */
   onPlanUpdate?: (payload: {
     phase?: string;
     title?: string;
     explanation?: string;
-    steps?: string[];
+    steps?: AgentPlanStep[];
     source?: string;
-  }) => Promise<void> | void;
+  }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when an approval becomes pending or resolves. */
   onApprovalEvent?: (payload: {
     phase?: string;
@@ -208,7 +323,7 @@ export type GetReplyOptions = {
     reason?: string;
     scope?: "turn" | "session";
     message?: string;
-  }) => Promise<void> | void;
+  }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when command output streams or completes. */
   onCommandOutput?: (payload: {
     itemId?: string;
@@ -221,7 +336,7 @@ export type GetReplyOptions = {
     exitCode?: number | null;
     durationMs?: number;
     cwd?: string;
-  }) => Promise<void> | void;
+  }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when a patch completes with a file summary. */
   onPatchSummary?: (payload: {
     itemId?: string;
@@ -233,11 +348,11 @@ export type GetReplyOptions = {
     modified?: string[];
     deleted?: string[];
     summary?: string;
-  }) => Promise<void> | void;
+  }) => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when context auto-compaction starts (allows UX feedback during the pause). */
-  onCompactionStart?: () => Promise<void> | void;
+  onCompactionStart?: () => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when context auto-compaction completes. */
-  onCompactionEnd?: () => Promise<void> | void;
+  onCompactionEnd?: () => Promise<ProgressCallbackResult> | ProgressCallbackResult;
   /** Called when the actual model is selected (including after fallback).
    * Use this to get model/provider/thinkLevel for responsePrefix template interpolation. */
   onModelSelected?: (ctx: ModelSelectedContext) => void;
@@ -248,10 +363,14 @@ export type GetReplyOptions = {
    * private unless dispatch explicitly marks a source reply as deliverable.
    */
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
+  /** Enables task-suggestion tools only when the initiating surface can action Gateway events. */
+  taskSuggestionDeliveryMode?: TaskSuggestionDeliveryMode;
   /** Starts delivery tracking when this turn later drains as a queued followup. */
   queuedDeliveryCorrelations?: QueuedReplyDeliveryCorrelation[];
-  /** Tracks ownership transfer when this turn later drains as a queued followup. */
-  queuedFollowupLifecycle?: QueuedReplyLifecycle;
+  /** Called after a queued followup owns the reply lane, before its model run starts. */
+  onQueuedFollowupAdmitted?: () => Promise<void> | void;
+  /** Called after an admitted queued followup finishes, including failed attempts. */
+  onQueuedFollowupSettled?: () => Promise<void> | void;
   /** Allow channel-owned progress UI while final/source reply delivery remains message-tool-only. */
   allowProgressCallbacksWhenSourceDeliverySuppressed?: boolean;
   /** Called when a suppressed source reply mode observes visible delivery through another path. */
