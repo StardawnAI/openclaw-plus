@@ -551,24 +551,31 @@ export async function sendSubagentAnnounceDirectly(params: {
     const terminalDelivery = normalizeAgentRunTerminalDeliverySnapshot(
       directAnnounceResult?.deliveryStatus,
     );
-    // A session-only requester receives its final through the transcript. Requiring an
-    // external send here retries an already-visible answer after sessions_yield.
     const requesterVisibleFinalDelivered = Boolean(
       directAnnounceResult &&
       (hasMessagingToolDeliveryToSource(directAnnounceResult, deliveryTarget, {
         requireFinalReply: true,
       }) ||
-        (!requiresMessageToolDelivery &&
-          hasVisibleNonSilentGatewayPayload &&
-          directAnnounceResult.deliveryStatus?.status !== "suppressed") ||
         (shouldDeliverAgentFinal &&
-          terminalDelivery?.status === "sent" &&
-          terminalDelivery.resultCount > 0)),
+          ((hasVisibleNonSilentGatewayPayload &&
+            directAnnounceResult.deliveryStatus?.status !== "suppressed") ||
+            (terminalDelivery?.status === "sent" && terminalDelivery.resultCount > 0)))),
     );
     const hasVisibleCompletionReply =
       requesterVisibleFinalDelivered ||
       (!params.requireVisibleReply &&
-        (hasMessagingToolDelivery || hasVisibleNonSilentGatewayPayload));
+        (hasMessagingToolDelivery || hasVisibleNonSilentGatewayPayload)) ||
+      // Nested requesters and internal sessions observe the final in their transcript.
+      // Unresolved external origins still require delivery evidence.
+      (!requiresMessageToolDelivery &&
+        hasVisibleNonSilentGatewayPayload &&
+        directAnnounceResult?.deliveryStatus?.status !== "suppressed" &&
+        (params.requesterIsSubagent ||
+          [effectiveDirectOrigin, requesterSessionOrigin].every((origin) =>
+            origin?.channel
+              ? normalizeMessageChannel(origin.channel) === INTERNAL_MESSAGE_CHANNEL
+              : !origin?.to,
+          )));
     const acceptsIntentionalSilentCompletion =
       hasIntentionalSilentCompletionReply && !isSubagentCompletion;
     if (
