@@ -3,9 +3,9 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { withTestAdmittedRunContext } from "../../agents/admitted-run-context.test-support.js";
+import { createCliTimeoutError } from "../../agents/cli-runner/no-output-timeout-policy.js";
 import { clearCliSessionInStore } from "../../agents/cli-session-store.js";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
-import { FailoverError } from "../../agents/failover-error.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import {
@@ -52,6 +52,57 @@ afterEach(() => {
 });
 
 describe("runCliAgentWithLifecycle", () => {
+  it("bridges completed CLI compaction lifecycles to reply callbacks", async () => {
+    cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "start", backend: "claude-cli" },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "end", backend: "claude-cli", completed: false },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "start", backend: "claude-cli" },
+      });
+      emitAgentEvent({
+        runId: params.runId,
+        stream: "compaction",
+        data: { phase: "end", backend: "claude-cli", completed: true },
+      });
+      return { payloads: [], meta: { durationMs: 1 } };
+    });
+    const callbacks: string[] = [];
+
+    await runCliAgentWithLifecycle({
+      runId: "run-compaction-bridge",
+      provider: "claude-cli",
+      onCompactionStart: async () => {
+        callbacks.push("start");
+      },
+      onCompactionEnd: async (payload) => {
+        callbacks.push(payload?.completed === false ? "incomplete" : "end");
+      },
+      runParams: {
+        sessionId: "session-1",
+        sessionFile: "/tmp/session.jsonl",
+        workspaceDir: "/tmp/workspace",
+        prompt: "hello",
+        provider: "claude-cli",
+        model: "claude-opus-4-8",
+        thinkLevel: "high",
+        timeoutMs: 1_000,
+        runId: "run-compaction-bridge",
+      },
+    });
+
+    expect(callbacks).toEqual(["start", "incomplete", "start", "end"]);
+  });
+
   it("bridges typed CLI plan events", async () => {
     cliDispatchState.runCliAgentMock.mockImplementationOnce(async (params: { runId: string }) => {
       emitAgentEvent({
@@ -546,7 +597,16 @@ describe("runCliAgentWithLifecycle", () => {
       }
     });
     cliDispatchState.runCliAgentMock.mockRejectedValueOnce(
-      new FailoverError("CLI produced no output", { reason: "timeout" }),
+      createCliTimeoutError(
+        { provider: "claude-cli", model: "claude", sessionId: "session-1" },
+        {
+          mode: "no-output",
+          timeoutSeconds: 1,
+          observedActivity: false,
+          activeToolCount: 0,
+          backgroundTaskCount: 0,
+        },
+      ),
     );
 
     await expect(
