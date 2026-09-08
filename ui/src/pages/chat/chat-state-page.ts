@@ -162,7 +162,6 @@ export function createPageState(
     assistantIdentityRequestVersion: 0,
     userName: identity.name,
     userAvatar: identity.avatar,
-    localMediaPreviewRoots: appConfig.localMediaPreviewRoots,
     embedSandboxMode: appConfig.embedSandboxMode,
     allowExternalEmbedUrls: appConfig.allowExternalEmbedUrls,
     automaticallyFetchFavicons: appConfig.automaticallyFetchFavicons,
@@ -393,6 +392,13 @@ export function createPageState(
   };
   state.updateSidebarLayout = (layout) => {
     const normalized = normalizeSidebarLayout(layout);
+    // Every close route commits here; tab switches retain the pending selection.
+    if (
+      state.sidebarContent?.kind === "loading" &&
+      !normalized.columns.some((column) => column.panels.some((panel) => panel.slot === "detail"))
+    ) {
+      state.sidebarContent = null;
+    }
     state.sidebarLayout = normalized;
     state.settings = patchSettings({
       sidebarSessionLayouts: updateSidebarSessionLayout(
