@@ -38,9 +38,5 @@
   {
     "source": "iMessage",
     "target": "iMessage"
-  },
-  {
-    "source": "parent session",
-    "target": "sessione padre"
   }
 ]

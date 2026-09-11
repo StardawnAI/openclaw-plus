@@ -6,10 +6,16 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { expect } from "vitest";
 import { resolveAgentDir } from "../agents/agent-scope.js";
+import {
+  buildAnnounceIdFromChildRun,
+  buildAnnounceIdempotencyKey,
+} from "../agents/announce-idempotency.js";
 import { saveAuthProfileStore } from "../agents/auth-profiles/store-runtime.js";
 import { loadCliSessionHistoryMessages } from "../agents/cli-runner/session-history.js";
 import { computeCacheHitRate } from "../agents/live-cache-test-support.js";
 import { listSubagentRunsForRequester } from "../agents/subagents/registry/subagent-registry.test-helpers.js";
+import { normalizeReplyPayload } from "../auto-reply/reply/normalize-reply.js";
+import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { resolveSessionTranscriptRuntimeTarget } from "../config/sessions/session-accessor.js";
 import { loadOpenClawPlugins } from "../plugins/loader.js";
@@ -249,9 +255,9 @@ export function prepareClaudeCacheProbeBackend(params: {
   };
 }
 
-async function waitFor<T>(resolve: () => T | undefined): Promise<T> {
+async function waitFor<T>(resolve: () => T | undefined | Promise<T | undefined>): Promise<T> {
   for (let attempt = 0; attempt < 480; attempt += 1) {
-    const value = resolve();
+    const value = await resolve();
     if (value !== undefined) {
       return value;
     }
@@ -275,12 +281,13 @@ export async function verifyCliBackendAnnounceOrdering({
   const announceSessionKey = `agent:dev:cli-announce-${announceNonce.toLowerCase()}`;
   const announceChildToken = `CLI_ANNOUNCE_CHILD_${announceNonce}`;
   const announceParentToken = `CLI_ANNOUNCE_PARENT_${announceNonce}`;
+  const parentRunId = `cli-announce-order-${randomUUID()}`;
   let announceParentObservedAt: number | undefined;
   const announceRequest = client.request(
     "agent",
     {
       sessionKey: announceSessionKey,
-      idempotencyKey: `cli-announce-order-${randomUUID()}`,
+      idempotencyKey: parentRunId,
       deliver: false,
       timeout: 240,
       message: [
@@ -342,32 +349,63 @@ export async function verifyCliBackendAnnounceOrdering({
     deliveredAnnounceChild.delivery?.deliveredAt,
   );
   // CLI requesters use an ordered agent handoff, not the embedded steer queue.
-  // The committed parent reply must precede the completion in canonical history.
+  // Persisted turn identities prove order even when the model summarizes the
+  // child result instead of copying its nonce; copied prose is not a receipt.
+  const completionRunId = buildAnnounceIdempotencyKey(
+    buildAnnounceIdFromChildRun({
+      childSessionKey: deliveredAnnounceChild.childSessionKey,
+      childRunId: deliveredAnnounceChild.runId,
+    }),
+  );
   const announceEntry = loadGatewaySessionEntryReadOnly(announceSessionKey).entry;
   if (!announceEntry?.sessionId) {
     throw new Error("CLI announce probe lost its requester session");
   }
-  const announceHistory = await loadCliSessionHistoryMessages({
-    sessionTarget: await resolveSessionTranscriptRuntimeTarget({
-      agentId: "dev",
-      sessionId: announceEntry.sessionId,
-      sessionKey: announceSessionKey,
-    }),
+  const sessionTarget = await resolveSessionTranscriptRuntimeTarget({
+    agentId: "dev",
+    sessionId: announceEntry.sessionId,
+    sessionKey: announceSessionKey,
   });
-  const assistantReplies = announceHistory.flatMap((message) => {
-    const record = message as { role?: unknown; content?: unknown };
-    return record.role === "assistant"
-      ? [extractTextFromChatContent(record.content, { joinWith: "" }) ?? ""]
-      : [];
+  const { parentReplyIndex, completionReplyIndex } = await waitFor(async () => {
+    const announceHistory = await loadCliSessionHistoryMessages({ sessionTarget });
+    const assistantReplies = announceHistory.flatMap((message) => {
+      const record = message as { role?: unknown; content?: unknown; idempotencyKey?: unknown };
+      return record.role === "assistant"
+        ? [
+            {
+              idempotencyKey: record.idempotencyKey,
+              text: extractTextFromChatContent(record.content, { joinWith: "" }) ?? "",
+            },
+          ]
+        : [];
+    });
+    const observedParentReplyIndex = assistantReplies.findIndex(
+      (reply) => reply.idempotencyKey === `cli-assistant:${parentRunId}`,
+    );
+    const observedCompletionReplyIndex = assistantReplies.findIndex(
+      (reply) => reply.idempotencyKey === `cli-assistant:${completionRunId}`,
+    );
+    if (observedParentReplyIndex < 0 || observedCompletionReplyIndex < 0) {
+      return undefined;
+    }
+    expect(assistantReplies[observedParentReplyIndex]?.text).toContain(announceParentToken);
+    const completionText = parseReplyDirectives(
+      assistantReplies[observedCompletionReplyIndex]?.text ?? "",
+    ).text;
+    const completionPayload = normalizeReplyPayload(
+      { text: completionText },
+      { applyChannelTransforms: false },
+    );
+    expect(completionPayload?.text?.trim()).toBeTruthy();
+    return {
+      parentReplyIndex: observedParentReplyIndex,
+      completionReplyIndex: observedCompletionReplyIndex,
+    };
   });
-  const parentReplyIndex = assistantReplies.findIndex((reply) =>
-    reply.includes(announceParentToken),
-  );
-  const completionReplyIndex = assistantReplies.findIndex((reply) =>
-    reply.includes(announceChildToken),
-  );
   logStep("announce-child:transcript-order", {
     runId: deliveredAnnounceChild.runId,
+    parentRunId,
+    completionRunId,
     parentObservedAt: announceParentObservedAt,
     delivery: deliveredAnnounceChild.delivery,
     parentReplyIndex,

@@ -3,7 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { admitUpdateCommandRun } from "../cli/update-cli/update-command-run.js";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../config/config.js";
+import { getUpdateRun } from "../infra/update-run-ledger.js";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { makeTempWorkspace } from "../test-helpers/workspace.js";
 import { captureEnv } from "../test-utils/env.js";
 import { mockProcessPlatform } from "../test-utils/vitest-spies.js";
@@ -189,6 +192,35 @@ describe("resolveGatewayService", () => {
 });
 
 describe("readGatewayServiceState", () => {
+  it("passes update loaded-only admission to every native inspection adapter", async () => {
+    const readCommand = vi.fn(async () => null);
+    const readRuntime = vi.fn(async () => ({ status: "stopped" }));
+    const readDefinitionMutationCapability = vi.fn<
+      NonNullable<GatewayService["readDefinitionMutationCapability"]>
+    >(async () => ({ kind: "writable" }));
+    const service = createService({ readCommand, readRuntime, readDefinitionMutationCapability });
+    await readGatewayServiceState(service, {
+      requireEffective: true,
+      requireLoadedCommand: true,
+      timeoutMs: 100,
+    });
+    expect(readCommand).toHaveBeenCalledWith(expect.anything(), {
+      requireEffective: true,
+      requireLoaded: true,
+      timeoutMs: 100,
+    });
+    expect(readRuntime).toHaveBeenCalledWith(expect.anything(), {
+      requireLoaded: true,
+      timeoutMs: 100,
+    });
+    expect(readDefinitionMutationCapability).toHaveBeenCalledWith({
+      env: expect.anything(),
+      environment: expect.anything(),
+      requireLoaded: true,
+      timeoutMs: 100,
+    });
+  });
+
   it.each(managerlessPreflightCases)(
     "handles managerless Linux inspection for $updateInstallKind restart=$shouldRestart ($condition)",
     async ({ updateInstallKind, shouldRestart, condition, portUsage, portSource }) => {
@@ -306,6 +338,14 @@ describe("readGatewayServiceState", () => {
           }
           return;
         }
+        if (condition === "absent") {
+          const run = await admitUpdateCommandRun({
+            opts: { restart: shouldRestart },
+            root: home,
+          });
+          expect(run.env.HOME).toBe(home);
+          expect(getUpdateRun(run.runId, { env: run.env })?.status).toBe("running");
+        }
         const result = await maybeStopManagedServiceBeforeMutableUpdate({
           root: home,
           updateInstallKind,
@@ -334,6 +374,7 @@ describe("readGatewayServiceState", () => {
           expect(probePortUsage).not.toHaveBeenCalled();
         }
       } finally {
+        closeOpenClawStateDatabaseForTest();
         snapshot.restore();
         await fs.rm(home, { recursive: true, force: true });
       }

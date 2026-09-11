@@ -38,9 +38,5 @@
   {
     "source": "iMessage",
     "target": "iMessage"
-  },
-  {
-    "source": "subagent",
-    "target": "alt ajan"
   }
 ]

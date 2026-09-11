@@ -118,6 +118,15 @@ export function createControlUiLocaleSyncPlan(input: {
 
     if (cached && shouldReuse) {
       nextFlat.set(key, cached.translated);
+      if (cached.segment_id !== key) {
+        // Retain reused aliases before a selected primary overwrites their grouped record.
+        const { segment_ids: _aliases, ...retained } = cached;
+        translationMemory.set(segmentCacheKey, {
+          ...retained,
+          cache_key: segmentCacheKey,
+          segment_id: key,
+        });
+      }
       if (shouldRefreshFallback) {
         fallbackKeys.push(key);
       }

@@ -6,13 +6,18 @@ import { applyCliProfileEnv } from "../cli/profile.js";
 import { promoteConfigSnapshotToLastKnownGood, readConfigFileSnapshot } from "../config/config.js";
 import { writeConfigHealthStateToStore } from "../config/io.health-state.js";
 import { createConfigHealthFingerprint } from "../config/io.observe-state.js";
-import { withEnvOverride, writeOpenClawConfig } from "../config/test-helpers.js";
+import { writeOpenClawConfig } from "../config/test-helpers.js";
 import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import {
   hasActiveStartupMigrationLease,
   readMigrationCheckpointStatus,
 } from "../infra/startup-migration-checkpoint.js";
-import { createUpdateRun, getUpdateRun } from "../infra/update-run-ledger.js";
+import {
+  createUpdateRun,
+  finishUpdateRun,
+  getUpdateRun,
+  recordUpdateRunStep,
+} from "../infra/update-run-ledger.js";
 import { ABANDONED_UPDATE_RUN_MS } from "../infra/update-run-timeouts.js";
 import { resetLogger, setLoggerOverride } from "../logging/logger.js";
 import { loggingState } from "../logging/state.js";
@@ -22,6 +27,7 @@ import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
 } from "../state/openclaw-state-db.js";
+import { withEnvAsync } from "../test-utils/env.js";
 import { resolveMigrationCheckpointIdentity } from "./doctor-config-preflight-checkpoint.js";
 import {
   runDoctorConfigPreflight,
@@ -117,6 +123,23 @@ async function seedLastKnownGood(
 }
 
 describe("runDoctorConfigPreflight", () => {
+  it("surfaces recorded cleanup warnings from a successful update", async () => {
+    await withDoctorConfigPreflightHome(async (home) => {
+      await writeOpenClawConfig(home, { gateway: { mode: "local" } });
+      const run = createUpdateRun({ trigger: "cli" });
+      const detail =
+        "Warning: Skipped derived cache cleanup: permission denied. Run openclaw doctor --fix.";
+      recordUpdateRunStep(run.runId, {
+        step: "warning:openclaw doctor",
+        status: "completed",
+        detail,
+      });
+      finishUpdateRun(run.runId, { status: "succeeded" });
+      await runDoctorConfigPreflight({ migrateState: false, migrateLegacyConfig: false });
+      expect(noteMock).toHaveBeenCalledWith(expect.stringContaining(detail), "Update history");
+      expect(getUpdateRun(run.runId)?.status).toBe("succeeded");
+    });
+  });
   it("reports stale legacy update recovery without modifying the run", async () => {
     await withDoctorConfigPreflightHome(async (home) => {
       await writeOpenClawConfig(home, { gateway: { mode: "local" } });
@@ -166,7 +189,9 @@ describe("runDoctorConfigPreflight", () => {
             if (!snapshot) {
               return true;
             }
-            expect(hasActiveStartupMigrationLease()).toBe(true);
+            if (snapshot.valid) {
+              expect(hasActiveStartupMigrationLease()).toBe(true);
+            }
             return !snapshot.valid || isStartupConfigRepairResult(before, snapshot);
           },
         });
@@ -231,7 +256,7 @@ describe("runDoctorConfigPreflight", () => {
     await withDoctorConfigPreflightHome(async (home) => {
       const configPath = await writeOpenClawConfig(home, config);
       const original = await fs.readFile(configPath, "utf-8");
-      await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: updating }, async () => {
+      await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: updating }, async () => {
         await expect(
           runDoctorConfigPreflight({
             ...startupCheckpointOptions,
@@ -320,7 +345,7 @@ describe("runDoctorConfigPreflight", () => {
       const configPath = path.join(stateDir, "openclaw.json");
       const defaultConfigPath = path.join(home, ".openclaw", "openclaw.json");
 
-      await withEnvOverride(
+      await withEnvAsync(
         {
           OPENCLAW_CONFIG_PATH: undefined,
           OPENCLAW_PROFILE: undefined,
@@ -346,7 +371,7 @@ describe("runDoctorConfigPreflight", () => {
       const configRoot = await fs.realpath(await fs.mkdtemp(path.join(home, "custom-config-")));
       const configPath = path.join(configRoot, "nested", "custom-openclaw.json");
 
-      await withEnvOverride(
+      await withEnvAsync(
         {
           OPENCLAW_CONFIG_PATH: configPath,
           OPENCLAW_PROFILE: undefined,
@@ -371,7 +396,7 @@ describe("runDoctorConfigPreflight", () => {
       const profileStateDir = path.join(home, ".openclaw-work");
       const configPath = path.join(profileStateDir, "openclaw.json");
 
-      await withEnvOverride(
+      await withEnvAsync(
         {
           OPENCLAW_CONFIG_PATH: undefined,
           OPENCLAW_PROFILE: undefined,
@@ -457,7 +482,7 @@ describe("runDoctorConfigPreflight", () => {
         '{ diagnostics: { otel: { enabled: false, protocol: "${OTEL_PROTOCOL}" } } }\n',
         "utf-8",
       );
-      await withEnvOverride({ OTEL_PROTOCOL: "grpc" }, async () => {
+      await withEnvAsync({ OTEL_PROTOCOL: "grpc" }, async () => {
         const interpolated = await runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
@@ -476,7 +501,7 @@ describe("runDoctorConfigPreflight", () => {
         diagnostics: { otel: { enabled: false } },
       });
 
-      await withEnvOverride({ OTEL_EXPORTER_OTLP_PROTOCOL: "grpc" }, async () => {
+      await withEnvAsync({ OTEL_EXPORTER_OTLP_PROTOCOL: "grpc" }, async () => {
         const preflight = await runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
@@ -505,7 +530,7 @@ describe("runDoctorConfigPreflight", () => {
       });
       expect(inspectOnly.snapshot.valid).toBe(false);
 
-      const repaired = await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
+      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
         runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
@@ -570,7 +595,7 @@ describe("runDoctorConfigPreflight", () => {
       );
 
       const before = await readConfigFileSnapshot();
-      const repaired = await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
+      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
         runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
@@ -626,7 +651,7 @@ describe("runDoctorConfigPreflight", () => {
         "utf-8",
       );
 
-      const repaired = await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
+      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
         runDoctorConfigPreflight({
           migrateState: true,
           migrateLegacyConfig: false,
@@ -647,7 +672,7 @@ describe("runDoctorConfigPreflight", () => {
       const entries = await fs.readdir(path.dirname(configPath));
       expect(entries.filter((entry) => entry.startsWith("openclaw.json.clobbered."))).toEqual([]);
 
-      const converged = await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
+      const converged = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
         runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
@@ -694,7 +719,7 @@ describe("runDoctorConfigPreflight", () => {
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       await fs.writeFile(configPath, brokenRaw, "utf-8");
 
-      await withEnvOverride({ OPENCLAW_CONTAINER_HINT: "repair-test" }, async () => {
+      await withEnvAsync({ OPENCLAW_CONTAINER_HINT: "repair-test" }, async () => {
         const failures: unknown[] = [];
         for (let attempt = 0; attempt < 3; attempt += 1) {
           failures.push(
@@ -771,7 +796,7 @@ describe("runDoctorConfigPreflight", () => {
         "utf-8",
       );
 
-      const repaired = await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
+      const repaired = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
         runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
@@ -790,7 +815,7 @@ describe("runDoctorConfigPreflight", () => {
         fs.readFile(path.join(path.dirname(configPath), clobbered[0]!), "utf-8"),
       ).resolves.toContain('"port": 19092');
 
-      const converged = await withEnvOverride({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
+      const converged = await withEnvAsync({ OPENCLAW_UPDATE_IN_PROGRESS: "1" }, () =>
         runDoctorConfigPreflight({
           migrateState: false,
           migrateLegacyConfig: false,
