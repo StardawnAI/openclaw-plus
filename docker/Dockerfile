@@ -4,7 +4,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Stage 1: Build OpenClaw from source ──────────────────────────────────────
-FROM node:22-bookworm AS openclaw-build
+FROM node:24-bookworm AS openclaw-build
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -40,7 +40,7 @@ RUN pnpm ui:install && pnpm ui:build
 
 
 # ── Stage 2: Runtime image ───────────────────────────────────────────────────
-FROM node:22-bookworm
+FROM node:24-bookworm
 
 ENV NODE_ENV=production
 
