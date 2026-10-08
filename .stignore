@@ -1,0 +1,222 @@
+// A shard of the work folder (awg-sync/work-shards.json): the work folder's
+// exclusions, without its top-level bar. Written by awg-tools/work-shards.mjs
+// and the hub's work-shards-hub.py from projects.stignore - edit that file.
+
+// Boundary of the work folder (awg-projects, C:\AWG).
+//
+// GOAL: sync the source. Not the third-party packages, not the model weights,
+// not the git database.
+//
+// -------------------------------------------------------------------------
+// THE ORDER IS THE WHOLE TRICK.
+//
+// Syncthing takes the FIRST matching rule and stops looking. If an include
+// such as "!/Github" sits at the top, it expands to "!/github/**" -- "all of
+// it, unconditionally" -- and every exclusion further down is never reached.
+// That is exactly how 1,002,137 node_modules files landed on the hub on
+// 2026-08-05.
+//
+// So: ALL exclusions first, then the includes, then the bar. Whoever edits
+// this file has to keep that order.
+// -------------------------------------------------------------------------
+//
+// WHY THIS FOLDER DOES NOT LIVE IN ONEDRIVE
+// OneDrive keeps files as placeholders: visible, but empty on disk. Only when
+// something reads a file does OneDrive fetch it. Syncthing reads every file
+// to check it -- so OneDrive fetches every file. On 2026-08-06 that filled the
+// disk, OneDrive freed space, Syncthing asked again, endlessly. The two must
+// never share a folder.
+//
+// WHAT IS DELIBERATELY *NOT* EXCLUDED: .env files, keys, credentials.
+// Until 2026-09-02 a "secrets" section kept them off the sync, and the owner
+// found his .env in one copy of a project and not in the other. His decision:
+// this sync runs between his own machines and his own server, transport is
+// encrypted, the backup is encrypted -- so everything in a project travels
+// with it. (The GitHub safety net is a different matter: GitHub is a third
+// party, and safety-net-push.mjs keeps secrets out of what it pushes.)
+
+// ====================================================== 1. The git database
+// .git is deliberately NOT synced. Git writes many small files in a fixed
+// order when it tidies up; a sync landing in the middle leaves the directory
+// broken. A travelling index.lock also freezes the repository on the other
+// machine. The source travels, the history does not -- every machine builds
+// its own .git from the remote and keeps it in line with it
+// (awg-tools/git-here.mjs, docs/notes/git-on-every-computer.md).
+.git
+.git/**
+
+// ================================================ 2. Re-installable
+// Third-party packages and build output. Rebuilt from the source, and the
+// lion's share of the file count: 2,089,916 of 2,377,476 files.
+node_modules
+.next
+.turbo
+.nuxt
+.svelte-kit
+.angular
+dist
+build
+out
+target
+bin/Debug
+bin/Release
+obj
+__pycache__
+*.pyc
+venv
+.venv
+env
+.tox
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.cache
+.parcel-cache
+.gradle
+.m2
+Pods
+.pnpm-store
+.yarn/cache
+.yarn/unplugged
+coverage
+.nyc_output
+DerivedData
+
+// ================================================ 2b. Tool scratch
+// Claude Code checks a repository out a SECOND time under
+// .claude/worktrees/agent-<id> for every agent it isolates, and removes the
+// checkout when the agent is done: a thousand files that come and go. Its
+// .git is a file pointing into the main repository's .git, which is not
+// synced, so on any other machine the checkout would be dead on arrival. On
+// 2026-09-02 three of them vanishing at once read as a delete storm and cut
+// the desktop off from the hub.
+.claude/worktrees
+// The same for the worktrees an editor session makes by hand next to a
+// project, under Projekte/wt/<name>: a full checkout each, a .git file
+// pointing into a repository whose .git does not travel. On 2026-09-02 four
+// of them being removed (5,489 files) paused the desktop for thirteen hours.
+Projekte/wt
+// A running program's own live files. These are the five that failed on the
+// hub every single hour and were the whole of its "did not get through" count
+// on 2026-09-05: a media centre under test writes its log and its scratch
+// while it runs, so what leaves the machine is a torn half of a file, and the
+// receiving side rejects it. Named narrowly on purpose - "temp" and "*.lock"
+// on their own would take yarn.lock and Cargo.lock with them, and those are
+// work.
+(?d)kodi*/temp
+(?d)kodi*/userdata/temp
+(?d)recordings/manager.lock
+// A running program's lock file in its runtime folder: held for as long as
+// the program runs, so the sync can never read it (Windows error 33, "another
+// process has locked a portion of the file"), and arriving on another
+// computer it could make the same program there believe a copy of it is
+// already running - git's index.lock again (section 1). On 2026-10-07 a video
+// converter's Projekte/DVDtoMP4/runtime/web-worker.lock kept the PC's status
+// window at "1 file not saved yet" all day. Only inside a folder named
+// runtime: yarn.lock and Cargo.lock sit at a project's root and are work.
+(?d)runtime/*.lock
+// The same media centre's settings, when it runs in a container with the
+// project's kodi-profile folder as its data folder (MoviePilot's
+// docker-compose.kodi.yml): it rewrites these two files every second with the
+// same content, only the time changes. Measured 2026-09-29: 14,400 new
+// versions of each in a day, the largest steady load the hub had, and every
+// one travelled to every computer. Only the containers read them.
+(?d)kodi*/userdata/guisettings.xml
+(?d)kodi*/userdata/profiles.xml
+// AWG's own gateway writes app.log and error.log beside its source whenever it
+// or its tests run (metamcp/apps/backend/src/utils/logger.ts; git ignores
+// them). Measured 2026-09-26: rewritten on every test run, 200 KB each, and
+// every write travelled to every computer. Named by path on purpose - other
+// projects share logs between computers deliberately (MoviePilot's
+// live-debug-logs), so "*.log" everywhere would break them.
+(?d)/Github/StardawnAI/AI-Working-Ground/metamcp/apps/backend/*.log
+// The knowledge-graph builder (/understand) writes its batches under
+// .ua/intermediate and moves the previous run to .ua/.trash-<n>, then deletes
+// both. The graph itself (.ua/knowledge-graph.json and its small companions)
+// is the useful part and still travels. On 2026-09-13 three projects' runs
+// deleting their scratch at once read as a delete storm and cut the desktop
+// off from the hub for an hour and a half. The same for a browser test's
+// scratch folder, .playwright-mcp.
+(?d).ua/intermediate
+(?d).ua/tmp
+(?d).ua/.trash-*
+(?d).understand-anything/intermediate
+(?d).understand-anything/.trash-*
+(?d).playwright-mcp
+
+// ==================================================== 3. Model weights
+// The lion's share of the DATA volume, measured 2026-08-06:
+//   flux1-fill-dev.safetensors        22.2 GB
+//   _nsfw.safetensors                 11.1 GB
+//   models_t5_umt5-xxl-enc-bf16.pth   10.6 GB
+//   diffusion_pytorch_model (2 parts) 18.5 GB
+//   t5xxl_fp16.safetensors             9.1 GB
+// The twenty largest alone came to about 104 GB of 129 GB. All of them can be
+// downloaded again -- and none of them ever changes.
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.msgpack
+*.h5
+*.tflite
+*.pb
+*.bin.gz
+*.npz
+checkpoints
+
+// Disk images and large binaries
+*.iso
+*.vmdk
+*.vdi
+*.vhdx
+*.qcow2
+
+// Crash dumps. Only useful on the machine that crashed.
+CrashDumps
+*.mdmp
+*.dmp
+
+// Remains of aborted transfers. Sat on the hub as .syncthing.*.tmp at 4.7 GB
+// each, never finishing.
+.syncthing.*
+*.incomplete
+*.partial
+
+// ============================================================ 4. System noise
+(?d)desktop.ini
+(?d)Thumbs.db
+(?d)ehthumbs.db
+(?d)$RECYCLE.BIN
+(?d).DS_Store
+(?d)._*
+(?d).Spotlight-V100
+(?d).Trashes
+(?d)*.tmp
+(?d)~$*
+(?d).~lock.*
+// A CONFLICT COPY IS WORK, SO IT IS NOT EXCLUDED HERE ANY MORE (2026-09-04).
+//
+// This line used to read "(?d)*.sync-conflict-*". Two mistakes in one pattern.
+// Being an ignore rule it kept conflict copies OFF the sync, so the losing side
+// of a conflict existed on exactly one machine. And "(?d)" tells Syncthing the
+// file may be DELETED when it is in the way - so the only surviving copy of
+// somebody's edit was both unreachable and disposable.
+//
+// A conflict copy is created precisely when two machines changed the same file
+// and Syncthing had to choose. The copy is the half it did not choose. That is
+// the definition of work, and the founder's rule is that an ignore list keeps
+// out what disturbs the sync and never what is work. So they travel now, and
+// the hub reports them - git makes you resolve a conflict, and until this
+// changed nobody was even told one had happened.
+
+// ============================================= 5. Syncthing's own folders
+// At the root Syncthing handles them itself, DEEPER in the tree it does not:
+// when a folder is moved, its version store would otherwise travel as
+// ordinary content and be sent straight back as payload.
+.stversions
+.stfolder
+
+vendor
