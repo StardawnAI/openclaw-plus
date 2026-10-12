@@ -7,6 +7,7 @@
 cli-root-options.mjs
 config/ci-test-timings.json
 node-compile-cache.mjs
+node-runtime-env.mjs
 node-sqlite.mjs
 node-version.mjs
 package.json
@@ -750,7 +751,9 @@ src/infra/agent-run-registry.ts
 src/infra/agent-run-usage.ts
 src/infra/approval-resolution-ref.ts
 src/infra/backoff.ts
+src/infra/backup-audit-paths.ts
 src/infra/backup-scratch.ts
+src/infra/backup-volatile-filter.ts
 src/infra/boundary-file-read.ts
 src/infra/boundary-path.ts
 src/infra/bun-sqlite-close-probe.ts
@@ -820,6 +823,7 @@ src/infra/format-time/format-duration-exact.ts
 src/infra/format-time/format-duration-internal.ts
 src/infra/fs-safe-copy.worker.ts
 src/infra/fs-safe-env.ts
+src/infra/fs-safe-file-copy.ts
 src/infra/fs-safe-remove.ts
 src/infra/fs-safe.ts
 src/infra/gateway-lock-payload.ts
@@ -1117,6 +1121,8 @@ src/logging/redact-internal-state.ts
 src/logging/redact-internal.ts
 src/logging/redact-json-tokens.ts
 src/logging/redact-json.ts
+src/logging/redact-linear-matchers.ts
+src/logging/redact-mask.ts
 src/logging/redact-pattern-runtime.ts
 src/logging/redact-patterns.ts
 src/logging/redact-pem.ts
@@ -1506,6 +1512,7 @@ src/shared/node-list-parse.ts
 src/shared/path-array-index.ts
 src/shared/pid-alive.ts
 src/shared/regexp.ts
+src/shared/rosetta-translation.ts
 src/shared/sandbox-workspace-paths.ts
 src/shared/settle-within.ts
 src/shared/store-writer-queue.ts
@@ -1537,6 +1544,7 @@ src/state/openclaw-agent-context-engine-turn-outbox-schema.ts
 src/state/openclaw-agent-db-additive-columns.ts
 src/state/openclaw-agent-db-admission.ts
 src/state/openclaw-agent-db-contract.ts
+src/state/openclaw-agent-db-discovery-paths.ts
 src/state/openclaw-agent-db-existing-write.ts
 src/state/openclaw-agent-db-identity.ts
 src/state/openclaw-agent-db-lease.ts
