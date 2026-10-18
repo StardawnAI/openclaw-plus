@@ -27,7 +27,6 @@ import {
   matchesPackageActivationLauncher as matchesLauncher,
   verifyPackageActivationSelectedLaunchers as verifySelectedLaunchers,
 } from "./package-update-activation-launcher.js";
-import { LEGACY_PACKAGE_RECOVERY_HELPER } from "./package-update-activation-paths.js";
 import {
   assertPackageActivationActionAllowed,
   readPackageActivationRecordStatus as packageActivationStatus,
@@ -41,10 +40,12 @@ import {
 } from "./package-update-filesystem.js";
 import {
   createPackageIntegrityReader,
-  packageIntegrityDifferences,
-  PackageIntegrityMismatchError,
   type PackageIntegrityFingerprint,
 } from "./package-update-integrity.js";
+import {
+  copyPackagePublicationTree,
+  createPackagePublicationTreeMatcher,
+} from "./package-update-publication-tree.js";
 import { assertManagedUpdateLeaseDatabaseIdentity } from "./update-managed-service-handoff-database.js";
 
 const log = createSubsystemLogger("update/package-integrity");
@@ -57,13 +58,13 @@ export function createPublicationOwner(
   assertJournalCurrent: (expected: PackageActivationRecord) => void = journal.assertCurrent.bind(
     journal,
   ),
+  onWarning: (message: string) => void = (message) => log.warn(message),
 ) {
   const assertion = retainMutationAuthority(assertOwner);
   let record = initial;
-  const descriptor = record.descriptor;
-  // Published 2026.9.8 records use the historical digest and cannot reseal metadata drift.
-  const legacy = descriptor.helperDigest === LEGACY_PACKAGE_RECOVERY_HELPER;
-  const trees: { legacyWarning?: string } = {};
+  let descriptor = record.descriptor;
+  const trees = createPackagePublicationTreeMatcher(descriptor, onWarning);
+  const matches = trees.matches;
   let retirementSelected: "previous" | "candidate" | undefined;
   const live = descriptor.authority.installKey;
   const matchesSelected = (selected: "previous" | "candidate", contents = true) =>
@@ -74,7 +75,9 @@ export function createPublicationOwner(
       contents,
     );
   const root = (name: string) => path.join(anchor, name);
-  const helperIdentity = descriptor.helperIdentity;
+  // Creation can lose its acknowledgement before custody is journaled. Keep
+  // that empty staging object outside the anchor so recovery can still abort.
+  const copyRoot = `${anchor}.copy-${descriptor.operationId}`;
   const custodyPath = (name: "anchor" | "helper") => {
     if (record.phase !== "preparing") {
       return name === "anchor" ? anchor : resolvePackageActivationHelper(anchor);
@@ -111,6 +114,18 @@ export function createPublicationOwner(
     if (entries.some((name) => !allowed.includes(name))) {
       throw new Error("Unknown package recovery artifacts require operator inspection.");
     }
+    const expected =
+      record.intent?.kind === "copy-previous"
+        ? record.intent.identity
+        : record.intent?.kind === "displace-copy"
+          ? descriptor.previous.identity
+          : null;
+    if (expected) {
+      const current = entryIdentity(copyRoot, true);
+      if (current !== null && current !== expected) {
+        throw new Error("Package copy custody changed.");
+      }
+    }
   };
   const assertCurrent = () => {
     assertion();
@@ -125,7 +140,7 @@ export function createPublicationOwner(
     ) {
       throw new Error("Package recovery anchor identity changed.");
     }
-    if (packageActivationIdentity(descriptor.binDir, true) !== descriptor.binIdentity) {
+    if (packageActivationIdentity(descriptor.binDir, "parent") !== descriptor.binIdentity) {
       throw new Error("Package launcher parent changed");
     }
     if (retirementSelected) {
@@ -143,51 +158,14 @@ export function createPublicationOwner(
     assertCurrent();
     record = journal.transition(record, phase, intent, assertion, publications);
   };
-  const matches = async (
-    file: string,
-    expected: PackageIntegrityFingerprint,
-    logical: string,
-    contents = true,
-  ) => {
-    const id = entryIdentity(file, true);
-    if (id === null) {
-      return false;
-    }
-    if (id !== expected.identity) {
-      throw new Error(`Package publication object changed: ${file}`);
-    }
-    if (!contents) {
-      return true;
-    }
-    // Legacy package code is reinstallable; accept its previous identity/version without the stale seal.
-    if (legacy && expected === descriptor.previous) {
-      const current = await createPackageIntegrityReader().directoryIdentity(file);
-      if (current?.identity !== expected.identity || current.version !== expected.version) {
-        throw new Error(`Package publication object changed: ${file}`);
-      }
-      if (!trees.legacyWarning) {
-        trees.legacyWarning =
-          "legacy package record settled by identity and version; content could not be re-verified";
-        log.warn(trees.legacyWarning);
-      }
-      return true;
-    }
-    // A prepared descriptor carries its in-process observation, so settled unchanged
-    // files are not re-read. A recovery process parses one without and re-reads all.
-    const observed = await createPackageIntegrityReader().tree(file, logical, expected, legacy);
-    if (!isDeepStrictEqual(observed, expected)) {
-      throw new PackageIntegrityMismatchError(
-        `Package publication object changed: ${file}`,
-        packageIntegrityDifferences(expected, observed),
-      );
-    }
-    return true;
-  };
   const inspect = async (contents: "all" | "selected" | "staged" | "none" = "all") => {
     const reader = createPackageIntegrityReader();
     const liveIdentity = entryIdentity(live, true);
+    const copying = record.intent?.kind === "displace-copy" ? record.intent : undefined;
     let selected: "previous" | "candidate" | null = null;
-    if (liveIdentity !== null) {
+    if (copying && liveIdentity === copying.source.identity) {
+      await matches(live, copying.source, live, !copying.removing);
+    } else if (liveIdentity !== null) {
       selected =
         liveIdentity === descriptor.previous.identity
           ? "previous"
@@ -199,7 +177,13 @@ export function createPublicationOwner(
       }
       await matchesSelected(selected, contents === "all" || contents === "selected");
     }
-    const previous = await matches(root("previous"), descriptor.previous, live, contents === "all");
+    let previous = await matches(root("previous"), descriptor.previous, live, contents === "all");
+    if (copying && (await matches(copyRoot, descriptor.previous, live))) {
+      if (previous) {
+        throw new Error("Package copy custody is ambiguous.");
+      }
+      previous = true;
+    }
     const candidate = await matches(
       root("candidate"),
       descriptor.candidate,
@@ -245,7 +229,7 @@ export function createPublicationOwner(
   const verifyClosure = async () => {
     assertInventory();
     assertManagedUpdateLeaseDatabaseIdentity(descriptor.authority);
-    if (packageActivationIdentity(helper(), false) !== helperIdentity) {
+    if (packageActivationIdentity(helper(), false) !== descriptor.helperIdentity) {
       throw new Error("Sealed package recovery helper identity changed.");
     }
     const bytes = await fsp.readFile(helper());
@@ -282,13 +266,102 @@ export function createPublicationOwner(
       requireDirectorySync(outcome, "Package selection");
     }
   };
-  const publish = async (resume: boolean, onDisplaced?: () => void | Promise<void>) => {
+  const discardIncompleteCopy = async () => {
+    if (record.intent?.kind !== "copy-previous") {
+      return;
+    }
+    const identity = record.intent.identity;
+    await removePackagePath(copyRoot, () => {
+      assertCurrent();
+      const current = entryIdentity(copyRoot, true);
+      if (current !== null && current !== identity) {
+        throw new Error("Package copy custody changed.");
+      }
+    });
+    assertCurrent();
+    requireDirectorySync(
+      await syncDirectory(path.dirname(anchor)),
+      "Incomplete package copy removal",
+    );
+    transition(record.phase, { kind: "displace" });
+  };
+  const finishCopiedDisplacement = async () => {
+    if (record.intent?.kind !== "displace-copy") {
+      return;
+    }
+    const source = record.intent.source;
+    await inspect();
+    assertCurrent();
+    if (entryIdentity(copyRoot, true) !== null) {
+      await fsp.rename(copyRoot, root("previous"));
+    }
+    for (const directory of [anchor, path.dirname(anchor)]) {
+      assertCurrent();
+      requireDirectorySync(await syncDirectory(directory), "Verified package copy publication");
+    }
+    assertCurrent();
+    await matches(root("previous"), descriptor.previous, live);
+    if (!record.intent.removing) {
+      if (!(await matches(live, source, live))) {
+        throw new Error("Package copy source disappeared before removal intent.");
+      }
+      transition(record.phase, { kind: "displace-copy", source, removing: true });
+    }
+    await removePackagePath(live, () => {
+      assertCurrent();
+      const current = entryIdentity(live, true);
+      if (
+        (current !== null && current !== source.identity) ||
+        entryIdentity(root("previous"), true) !== descriptor.previous.identity
+      ) {
+        throw new Error("Package copy displacement custody changed.");
+      }
+    });
+    await persistPackageSelection("displaced");
+    transition(record.phase, { kind: "displace" });
+  };
+  const copyPrevious = async () => {
+    assertCurrent();
+    await fsp.mkdir(copyRoot, { mode: 0o700 });
+    const identity = packageActivationIdentity(copyRoot, true);
+    const assertCopy = () => {
+      assertCurrent();
+      if (
+        entryIdentity(live, true) !== descriptor.previous.identity ||
+        entryIdentity(copyRoot, true) !== identity ||
+        entryIdentity(root("previous"), true) !== null
+      ) {
+        throw new Error("Package copy preimage changed.");
+      }
+    };
+    assertCopy();
+    requireDirectorySync(await syncDirectory(path.dirname(anchor)), "Package copy staging");
+    transition("publishing", { kind: "copy-previous", identity });
+    const reader = createPackageIntegrityReader();
+    const source = await reader.tree(live, live, descriptor.previous);
+    if (!isDeepStrictEqual(source, descriptor.previous)) {
+      throw new Error("Package copy source changed.");
+    }
+    await copyPackagePublicationTree(live, copyRoot, assertCopy);
+    const previous = await reader.copiedTree(copyRoot, live, source);
+    await matches(live, descriptor.previous, live);
+    assertCopy();
+    record = journal.recordPreviousCopy(record, previous, assertion);
+    descriptor = { ...record.descriptor, previous, candidate: descriptor.candidate };
+    await finishCopiedDisplacement();
+  };
+  const publish = async (
+    resume: boolean,
+    onDisplaced?: (previous: PackageIntegrityFingerprint, copied: boolean) => void | Promise<void>,
+  ) => {
     await verifyClosure();
     assertPackageActivationActionAllowed(record, "repair");
     if (record.phase === "preparing") {
       await completePackageActivationCustody(anchor, journal, assertion);
       record = journal.read();
     }
+    await discardIncompleteCopy();
+    await finishCopiedDisplacement();
     let observed = await inspect();
     assertCurrent();
     if (resume && observed.selected === "previous" && !observed.previous) {
@@ -307,9 +380,19 @@ export function createPublicationOwner(
       ) {
         throw new Error("Package displacement preimage changed.");
       }
-      await fsp.rename(live, root("previous"));
+      try {
+        await fsp.rename(live, root("previous"));
+      } catch (error) {
+        if (!hasErrnoCode(error, "EXDEV")) {
+          throw error;
+        }
+        await copyPrevious();
+      }
       await persistPackageSelection("displaced");
-      await onDisplaced?.();
+      await onDisplaced?.(
+        descriptor.previous,
+        descriptor.previous.identity !== initial.descriptor.previous.identity,
+      );
       assertCurrent();
     } else if (observed.selected === null) {
       await persistPackageSelection("displaced");
@@ -317,7 +400,6 @@ export function createPublicationOwner(
     if (observed.selected !== "candidate") {
       // Displacement/capture can yield to writers; re-verify the candidate at publication.
       await inspect("staged");
-      assertCurrent();
       transition("publishing", { kind: "publish" });
       await activateStagedNpmPackageRoot(root("candidate"), live, () => {
         assertCurrent();
@@ -432,10 +514,7 @@ export function createPublicationOwner(
     retirementSelected = selected;
     assertCurrent();
     if (trees.legacyWarning) {
-      const { archiveWarning } = settleSelected(selected, trees.legacyWarning, onSettled);
-      if (archiveWarning) {
-        log.warn(archiveWarning);
-      }
+      onWarning(settleSelected(selected, trees.legacyWarning, onSettled).warning);
       return packageActivationStatus(record);
     }
     if (!["retiring", "anchor-retired"].includes(record.phase)) {
@@ -510,13 +589,17 @@ export function createPublicationOwner(
     assertCurrent();
     if (
       entryIdentity(anchor, true) !== null ||
-      packageActivationIdentity(helper(), false) !== helperIdentity
+      packageActivationIdentity(helper(), false) !== descriptor.helperIdentity
     ) {
       throw new Error("Final package recovery cleanup identity changed.");
     }
-    transition("anchor-retired", { kind: "unlink-helper", identity: helperIdentity, selected });
+    transition("anchor-retired", {
+      kind: "unlink-helper",
+      identity: descriptor.helperIdentity,
+      selected,
+    });
     assertCurrent();
-    if (packageActivationIdentity(helper(), false) !== helperIdentity) {
+    if (packageActivationIdentity(helper(), false) !== descriptor.helperIdentity) {
       throw new Error("Final helper identity changed.");
     }
     await fsp.unlink(helper());
@@ -560,6 +643,7 @@ export function createPublicationOwner(
     retireVerified,
     async disarmRollback() {
       assertCurrent();
+      await discardIncompleteCopy();
       const observed = await inspect();
       assertCurrent();
       if (
@@ -573,7 +657,8 @@ export function createPublicationOwner(
       // Disarm before any restore or its compensating moves. Failure to commit
       // this fact forbids compensation; a killed rollback never becomes forward repair.
       transition("rollback-in-progress", record.intent);
-      return observed.previous;
+      await finishCopiedDisplacement();
+      return observed.previous ? descriptor.previous : false;
     },
     recordRestoredLauncher(name: string, staged: string) {
       if (record.phase !== "rollback-in-progress") {

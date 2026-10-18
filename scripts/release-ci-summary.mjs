@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-/**
- * Release CI summary helper that prints parent and child workflow status for a
- * full release run.
- */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, statSync } from "node:fs";
@@ -817,16 +813,17 @@ function findExactChildRun(child, repository = DEFAULT_REPO) {
 // readReleaseJobListing selects.
 const MAX_RUN_JOBS = 1000;
 
-function findRunJobsAll(path, repository = DEFAULT_REPO, requireComplete = false) {
+function readRunJobPages(path, baseQuery, repository, requireComplete) {
   return readReleaseJobListing(async (perPage, { smallerPageFallback }) => {
     const jobs = [];
     let total;
     for (let page = 1; jobs.length < MAX_RUN_JOBS; page += 1) {
       const query = new URLSearchParams({
+        ...baseQuery,
         page: String(page),
         per_page: String(perPage),
       });
-      const response = await githubRestJsonAsync(`${path}${query.toString()}`, repository, {
+      const response = await githubRestJsonAsync(`${path}?${query.toString()}`, repository, {
         smallerPageFallback,
       });
       const pageJobs = response.jobs ?? [];
@@ -857,7 +854,7 @@ function findRunJobsAll(path, repository = DEFAULT_REPO, requireComplete = false
 }
 
 function findParentJobsAll(parentRunId, repository = DEFAULT_REPO) {
-  return findRunJobsAll(`actions/runs/${parentRunId}/jobs?filter=all&`, repository);
+  return readRunJobPages(`actions/runs/${parentRunId}/jobs`, { filter: "all" }, repository, false);
 }
 
 function findRunAttemptJobsAll(
@@ -866,8 +863,9 @@ function findRunAttemptJobsAll(
   repository = DEFAULT_REPO,
   requireComplete = false,
 ) {
-  return findRunJobsAll(
-    `actions/runs/${runId}/attempts/${runAttempt}/jobs?`,
+  return readRunJobPages(
+    `actions/runs/${runId}/attempts/${runAttempt}/jobs`,
+    {},
     repository,
     requireComplete,
   );

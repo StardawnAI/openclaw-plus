@@ -17,7 +17,7 @@ import * as sessionBinding from "./session-binding.js";
 import { readCodexAppServerBinding } from "./session-binding.test-helpers.js";
 import {
   createLeasedCodexLifecycleHarness,
-  startOrResumeAttemptThread,
+  startOrResumeAttemptThreadWithoutSkills as startOrResumeAttemptThread,
   type CodexAttemptThreadInput as LifecycleInput,
 } from "./thread-lifecycle.test-fixtures.js";
 
@@ -61,7 +61,6 @@ function createThreadLifecycleAppServerOptions(): LifecycleInput["appServer"] {
     codeModeOnly: false,
     loopDetectionPreToolUseRelay: true,
     connectionClass: "local-loopback",
-    remoteAppsSubstrate: "preconfigured",
   };
 }
 
@@ -122,7 +121,7 @@ function createPluginAppPolicyContext() {
   };
 }
 
-setupRunAttemptTestHooks();
+setupRunAttemptTestHooks({ isolateNativeSkillHome: true });
 
 describe("Codex warm subscription cleanup", () => {
   it.for([false, true])(

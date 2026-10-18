@@ -8,11 +8,9 @@ import { orderModelCatalogForPicker } from "./model-catalog-order.js";
 import { buildPreparedModelCatalogSnapshot } from "./model-catalog.js";
 import type { ModelCatalogEntry } from "./model-catalog.types.js";
 import { createModelVisibilityPolicy } from "./model-visibility-policy.js";
+import { prepareModelCatalogPublication } from "./prepared-model-runtime.catalog-publication.js";
 import { prepareCapturedRuntimeFacts } from "./prepared-model-runtime.configured-catalog.js";
-import {
-  materializePreparedModelCatalog,
-  prepareModelCatalogPublication,
-} from "./prepared-model-runtime.full-catalog.js";
+import { materializePreparedModelCatalog } from "./prepared-model-runtime.full-catalog.js";
 import type { PreparedConfiguredRuntimeModel } from "./prepared-model-runtime.types.js";
 import { AuthStorage, ModelRegistry } from "./sessions/index.js";
 
@@ -69,7 +67,7 @@ describe("configured catalog registry composition", () => {
         config,
         agentDir: "captured:agent",
         authCredentials: {},
-        modelRegistry: registry,
+        models: registry.getAll(),
         metadataSnapshot,
         includeProviderPluginAugmentation: false,
       });

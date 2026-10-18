@@ -689,10 +689,8 @@ export function assertStateDatabaseReadAllowed(databasePath: string): void {
     !hasPhysicalOwnership(owner) ||
     (owner.getProjection && !owner.getProjection()?.verifyStillHeld())
   ) {
-    // A recorded loss already names the lock and the restart step; rethrow it unwrapped.
-    owner.lost.signal.throwIfAborted();
     throw new Error(
-      `OpenClaw state ownership at ${databasePath} was lost: owner lock was removed or replaced; restart the Gateway.`,
+      `OpenClaw state ownership at ${databasePath} was lost: ${owner.lost.signal.reason ?? "owner lock was removed or replaced"}; restart the Gateway.`,
     );
   }
   readOwnerPaths.set(key, { pathname, owner, expiresAt: now + READ_OWNERSHIP_MAX_AGE_MS });
@@ -725,9 +723,8 @@ export function assertStateDatabaseAccessAllowed(
   if (local) {
     if (!hasPhysicalOwnership(local)) {
       local.lost.signal.throwIfAborted();
-      throw new Error(
-        `OpenClaw state ownership at ${databasePath} was lost: owner lock was removed or replaced; restart the Gateway.`,
-      );
+      const lost = `OpenClaw state ownership at ${databasePath} was lost: owner lock was removed or replaced; restart the Gateway.`;
+      throw new Error(lost);
     }
     const role = local.payload.role ?? "gateway";
     if (!local.accepting || (role !== "gateway" && role !== "agent-embedded")) {

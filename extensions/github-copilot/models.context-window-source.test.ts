@@ -1,16 +1,26 @@
 import { expectDefined } from "@openclaw/normalization-core/expect";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fetchCopilotModelCatalog } from "./models.js";
+
+const fixture = vi.hoisted(() => ({ limits: {} as Record<string, unknown> }));
+// Mapping owns these tests; transport cleanup and SSRF have coverage in models.test.ts.
+vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/ssrf-runtime")>()),
+  ssrfPolicyFromHttpBaseUrlAllowedOrigin: () => ({}),
+  fetchWithSsrFGuard: async () => ({
+    response: Response.json({
+      data: [{ id: "account-model", capabilities: { type: "chat", limits: fixture.limits } }],
+    }),
+    release: async () => {},
+  }),
+}));
 
 describe("native context window provenance", () => {
   async function mapLimits(limits: Record<string, unknown>) {
+    fixture.limits = limits;
     const [model] = await fetchCopilotModelCatalog({
       copilotApiToken: "fixture-token",
       baseUrl: "https://fixture.test",
-      fetchImpl: async () =>
-        Response.json({
-          data: [{ id: "account-model", capabilities: { type: "chat", limits } }],
-        }),
     });
     return expectDefined(model, "mapped account model");
   }

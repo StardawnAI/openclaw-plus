@@ -67,7 +67,6 @@ extension GatewayChannelActor {
         guard let deadline = self.connectFailureBackoff.deadline else { return }
         // Delay inside the shared connect attempt so callers coalesce before a
         // socket is created instead of starting independent retry bursts.
-        // The owned wait task lets clearConnectFailureBackoff wake a pending delay.
         let wait = Task {
             #if DEBUG
             if let testConnectFailureBackoffWaitHandler = self.testConnectFailureBackoffWaitHandler {
@@ -83,7 +82,7 @@ extension GatewayChannelActor {
         do {
             try await withTaskCancellationHandler { try await wait.value } onCancel: { wait.cancel() }
         } catch is CancellationError {
-            // A cleared backoff cancels the delay, not the shared connection attempt.
+            // A satisfied path cancels the delay, not the shared connection attempt.
             try Task.checkCancellation()
         }
         self.connectFailureBackoff.clear(deadline: deadline)

@@ -299,7 +299,7 @@ for ((index = 0; index < run_count; index += 1)); do
       --trusted-workflow-sha "$TRUSTED_WORKFLOW_SHA" \
       --verifier-source-sha "$VERIFIER_SOURCE_SHA" \
       --verifier-source-file "$VALIDATOR" \
-      ${qualification_args[@]+"${qualification_args[@]}"} \
+      "${qualification_args[@]}" \
       --json
   )"; then
     validator_error="$(

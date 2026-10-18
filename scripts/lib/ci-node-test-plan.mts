@@ -61,6 +61,14 @@ import {
 } from "./ci-command-test-plan.mts";
 import { rebalanceMeasuredSerialJobs } from "./ci-measured-compact-packing.mts";
 import {
+  BUNDLED_NODE_TEST_RUNNER,
+  DEFAULT_NODE_TEST_RUNNER,
+  EXTRA_LARGE_NODE_TEST_RUNNER,
+  TOOLING_CONFIG,
+  TOOLING_LARGE_CAPACITY_TEST_FILES,
+  resolveCompactNodeTestRunner,
+} from "./ci-node-test-capacity.mts";
+import {
   COMPACT_EMBEDDED_BASE_GROUP_NAME,
   canSplitWholeConfigGroup,
   listScopedOwnerTestFiles,
@@ -127,16 +135,12 @@ function compactGroupTimingKey(group: NodeTestShardGroup): string {
   return group.timing_key ?? group.shard_name;
 }
 
-export type NodeTestShard = {
+export type NodeTestShard = Omit<
+  NodeTestShardGroup,
+  "shard_name" | "fallbackMaxWorkers" | "minTotalMemoryBytes"
+> & {
   checkName: string;
   shardName: string;
-  timing_key?: string;
-  configs: string[];
-  runner: string;
-  requiresDist: boolean;
-  pretestBuildMode?: NodeTestPretestBuildMode;
-  includePatterns?: string[];
-  env?: Record<string, string>;
   groups?: NodeTestShardGroup[];
   timeoutMinutes?: number;
   planConcurrency?: number;
@@ -294,9 +298,6 @@ const EXCLUDED_PROJECT_CONFIGS = new Set([
   // checks-ui owns the Chromium project; Node stripes retain Node-driven Playwright tests.
   "test/vitest/vitest.ui-browser.config.ts",
 ]);
-const DEFAULT_NODE_TEST_RUNNER = "blacksmith-8vcpu-ubuntu-2404";
-const BUNDLED_NODE_TEST_RUNNER = "blacksmith-4vcpu-ubuntu-2404";
-const EXTRA_LARGE_NODE_TEST_RUNNER = "blacksmith-32vcpu-ubuntu-2404";
 // Startup-core transforms the broad gateway graph before its assertions run.
 // Keep enough CPU here to avoid spending minutes in Vitest imports on 4 vCPU.
 const GATEWAY_STARTUP_CORE_RUNNER = DEFAULT_NODE_TEST_RUNNER;
@@ -791,11 +792,9 @@ const STORAGE_MODULE_WORK_SECONDS = new Map<string, number>([
   ["src/channels/message-access/operator-authority.test.ts", 31.775],
   ["src/agents/subagents/registry/subagent-registry.persistence.test.ts", 23.639],
   ["src/auto-reply/reply/session.acp-reset-routing.test.ts", 8.938],
-  ["src/agents/tools/skill-workshop-tool.support-paths.test.ts", 1.686],
   ["src/claws/package-update.test.ts", 4.164],
   ["src/cli/update-cli.git-service.test.ts", 24.578],
   ["src/flows/doctor-health.fleet-preflight.test.ts", 8.648],
-  ["src/agents/embedded-agent-runner/run/attempt-prompt-submit.retention.test.ts", 6.452],
   ["src/agents/embedded-agent-runner/compact.delegate.test.ts", 16.151],
   ["src/cli/plugins-cli.update.test.ts", 9.511],
   ["src/state/openclaw-agent-participants-migration.test.ts", 9.279],
@@ -1502,16 +1501,8 @@ function expandCompactGroup(
     applyCompactGroupWorkerPins(expandedGroup, runnerBackend),
   );
 }
-const TOOLING_CONFIG = "test/vitest/vitest.tooling.config.ts";
 const TOOLING_DOCKER_TEST_FILE = "test/scripts/docker-build-helper.test.ts";
 const TOOLING_UNIFIED_DECLARATIONS_TEST_FILE = "test/scripts/write-unified-entry-dts.test.ts";
-const TOOLING_LARGE_CAPACITY_TEST_FILES = new Set([
-  // Generation-retention cases require eight CPUs / 24 GiB; the two-CPU
-  // screen also peaked at 6.05 GiB before those gated cases could run.
-  "test/scripts/vitest-worker-artifacts.ci.test.ts",
-  "test/scripts/write-unified-entry-dts.test.ts",
-  "test/scripts/write-plugin-sdk-entry-dts.test.ts",
-]);
 const TOOLING_ISOLATED_CONFIG = "test/vitest/vitest.tooling-isolated.config.ts";
 // The full matrix is capped at 28 jobs. Admit the consistently slow serial
 // shards first so short alphabetical groups cannot leave them on the tail.
@@ -3033,12 +3024,9 @@ function createNodeTestShardsForOwners(
 }
 
 /** Select planner envelopes that produce the protected Vitest transform-cache seed. */
-export function createVitestCacheWarmGroups(profile: "full" | "hybrid-hosted" = "full"): Array<{
-  configs: string[];
-  env?: Record<string, string>;
-  includePatterns?: string[];
-  shard_name: string;
-}> {
+export function createVitestCacheWarmGroups(
+  profile: "full" | "hybrid-hosted" = "full",
+): Pick<NodeTestShardGroup, "configs" | "env" | "includePatterns" | "shard_name">[] {
   // Preserve the package root and aliases used by checks-ui in either backend.
   const uiGroup = {
     configs: ["ui/vitest.config.ts"],
@@ -3208,7 +3196,7 @@ function createStripedBatches<T>(
   entries.sort((a, b) => b.weight - a.weight || a.index - b.index);
   const batches: Array<{
     totalWeight: number;
-    entries: Array<{ index: number; value: T; weight: number }>;
+    entries: typeof entries;
   }> = Array.from({ length: batchCount }, () => ({ totalWeight: 0, entries: [] }));
   const firstBatch = batches[0];
   if (!firstBatch) {
@@ -3324,11 +3312,7 @@ export function createNodeTestShardBundles(
   const unbundled: NodeTestShard[] = [];
   const groups = new Map<
     string,
-    {
-      configs: string[];
-      pretestBuildMode?: NodeTestPretestBuildMode;
-      requiresDist: boolean;
-      runner: string;
+    Pick<NodeTestShard, "configs" | "pretestBuildMode" | "requiresDist" | "runner"> & {
       shards: NodeTestShard[];
     }
   >();
@@ -3580,40 +3564,23 @@ function splitHostedReleaseShard(shard: NodeTestShard): NodeTestShard[] {
     timings,
     original.selectorKey,
   );
-  const currentlyUnmeasured =
-    timings[parentShardName] === undefined && currentGenerationSeconds === undefined;
   const retainHistoricalTimings =
-    RELEASE_TIMING_CONTINUITY_SHARDS.has(shard.shardName) && currentlyUnmeasured;
+    RELEASE_TIMING_CONTINUITY_SHARDS.has(shard.shardName) &&
+    timings[parentShardName] === undefined &&
+    currentGenerationSeconds === undefined;
   const singletonKeys = generation(files.map((file) => [file])).timingKeys;
   const currentSingletons = new Set(
     singletonKeys.map((key) => key.match(/#include-1-[a-f0-9]{12}$/u)![0]),
   );
-  let historicalWholeSeconds = 0;
   const singletonCosts = new Map<string, number>();
   for (const [key, cost] of Object.entries(timings)) {
-    const parsed = parseCompactSplitTimingKey(key);
-    const historicalFileCount = Number(parsed?.selectorKey.match(/#selector-(\d+)-/u)?.[1]);
-    // Until the current selection is measured, scale whole historical walls.
-    // Continuity owners price retained history from complete generations below.
-    if (
-      currentlyUnmeasured &&
-      !RELEASE_TIMING_CONTINUITY_SHARDS.has(shard.shardName) &&
-      parsed?.parentShardName === parentShardName &&
-      parsed.expectedParts === 1 &&
-      Number.isSafeInteger(historicalFileCount) &&
-      historicalFileCount > 0
-    ) {
-      historicalWholeSeconds = Math.max(
-        historicalWholeSeconds,
-        Math.ceil(cost * Math.max(1, files.length / historicalFileCount)),
-      );
-    }
     const singleton = key.match(/#include-1-[a-f0-9]{12}$/u)?.[0];
     if (
       singleton &&
       currentSingletons.has(singleton) &&
       (key.startsWith(`${original.selectorKey}#generation-`) ||
-        (retainHistoricalTimings && parsed?.parentShardName === parentShardName))
+        (retainHistoricalTimings &&
+          parseCompactSplitTimingKey(key)?.parentShardName === parentShardName))
     ) {
       singletonCosts.set(singleton, Math.max(singletonCosts.get(singleton) ?? 0, cost));
     }
@@ -3627,8 +3594,6 @@ function splitHostedReleaseShard(shard: NodeTestShard): NodeTestShard[] {
     timings[parentShardName] ?? 0,
     timings[original.timingKeys[0]!] ?? 0,
     currentGenerationSeconds ?? 0,
-    // Setup and the second runtime consume the remaining 12 minutes of the job timeout.
-    historicalWholeSeconds > budget * 4 ? historicalWholeSeconds : 0,
   );
   if (retainHistoricalTimings) {
     const selectors = new Set(
@@ -4549,7 +4514,12 @@ export function createSelectedNodeTestShardBundles(
           : `changed-${timingParent}`,
         stripes: [includePatterns],
       });
-      const selectedSeconds = Math.max(fallbackSeconds, selectedTimings[timingKeys[0]!] ?? 0);
+      // An older complete-group price cannot cap a known indivisible file's cost.
+      const selectedSeconds = Math.max(
+        fallbackSeconds,
+        ...includePatterns.map(stripeFileWeight),
+        selectedTimings[timingKeys[0]!] ?? 0,
+      );
       retainedSeconds += selectedSeconds;
       const projectedGroup = {
         ...group,
@@ -5533,10 +5503,11 @@ function createCompactNodeTestShardBundles(
   }
   const finalJobs = compactJobs.filter((job) => !retiredJobs.has(job));
   for (const job of finalJobs) {
-    // The 4/8 classes both deliver two CPUs. Routing must not alter placement anchors.
-    if (usesBlacksmithCapacity(job.runner) && job.runner === BUNDLED_NODE_TEST_RUNNER) {
-      job.runner = DEFAULT_NODE_TEST_RUNNER;
-    }
+    job.runner = resolveCompactNodeTestRunner(
+      job,
+      options.runnerBackend,
+      usesBlacksmithCapacity(job.runner),
+    );
   }
 
   // Split/packing admission retains the two-worker retry budget. Once placement

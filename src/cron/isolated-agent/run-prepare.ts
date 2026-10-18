@@ -10,6 +10,7 @@ import {
   type PreparedModelRuntimeLease,
 } from "../../agents/prepared-model-runtime.js";
 import { resolveAgentModelPrimaryValue } from "../../config/model-input.js";
+import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
 import { resolveCreatorSandbox } from "../../gateway/operator-role-policy.js";
 import { isCronSessionKey, parseAgentSessionKey } from "../../routing/session-key.js";
 import {
@@ -49,6 +50,7 @@ import {
 import {
   CronSessionLifecycleClaimError,
   beginCronSessionWorkAdmission,
+  withCronSessionPreparation,
   createCronRunContinuationSession,
   createPersistCronSessionEntry,
   setCronSessionRuntimeModel,
@@ -103,10 +105,11 @@ export async function prepareCronRunContext(params: {
   let runtimeLease: ReturnType<typeof scopePreparedModelRuntimeLease> | undefined;
   const publishedRuntime = await loadPublishedGatewayReplyDispatchRuntime({
     agentId: initialAgentId,
+    demand: "scheduled",
+    abortSignal: input.abortSignal ?? input.signal,
     onRuntimeLease: (lease) => {
       runtimeLease = runtimeResources.use(scopePreparedModelRuntimeLease(lease));
     },
-    abortSignal: input.abortSignal ?? input.signal,
   });
   const modelOwner = await resolveCronModelSelectionOwner({
     cfg: requestedRuntimeCfg,
@@ -159,13 +162,23 @@ export async function prepareCronRunContext(params: {
     payloadHookExternalContentSource ?? resolveHookExternalContentSource(baseSessionKey);
 
   const isGmailHook = hookExternalContentSource === "gmail";
-  return runtimeLease
-    ? await runtimeLease.run(prepareAdmittedSession)
-    : await prepareAdmittedSession();
+  const prepareSession = () =>
+    withCronSessionPreparation(
+      {
+        storePath: resolveSessionStorePathCore(runtimeCfg.session?.store, { agentId }),
+        sessionKey: agentSessionKey,
+        signal: input.abortSignal ?? input.signal,
+        onInterrupt: params.onLifecycleInterrupt,
+        onLaneWait: input.onLaneWait,
+      },
+      prepareAdmittedSession,
+    );
+  return runtimeLease ? await runtimeLease.run(prepareSession) : await prepareSession();
 
   async function prepareAdmittedSession() {
     const now = Date.now();
     const sandbox = resolveCreatorSandbox(runtimeCfg, { actor: input.job.createdActor });
+    const usesExactRunSession = usesDetachedRunSession || baseSessionKey.startsWith("cron:");
     const cronSession = await prepareCronSession({
       cfg: runtimeCfg,
       sessionKey: agentSessionKey,
@@ -174,11 +187,17 @@ export async function prepareCronRunContext(params: {
       agentId,
       nowMs: now,
       forceNew: usesDetachedRunSession,
+      exactRunSession: usesExactRunSession,
       hookExternalContentSource,
     });
     const sourceEntry = sourceSessionKey ? cronSession.store[sourceSessionKey] : undefined;
-    const sourceSessionGeneration = sourceEntry
-      ? { sessionId: sourceEntry.sessionId, lifecycleRevision: sourceEntry.lifecycleRevision }
+    const completionSource =
+      input.job.sessionTarget === "isolated" ? input.job.sourceConversation : sourceEntry;
+    const sourceSessionGeneration = completionSource
+      ? {
+          sessionId: completionSource.sessionId,
+          lifecycleRevision: completionSource.lifecycleRevision,
+        }
       : undefined;
     const reservedKey = isAgentHarnessSessionKey(agentSessionKey);
     if (cronSession.initialSessionEntry?.modelSelectionLocked === true) {
@@ -193,7 +212,6 @@ export async function prepareCronRunContext(params: {
     }
     const runSessionId = cronSession.sessionEntry.sessionId;
     const currentRunSessionId = () => cronSession.sessionEntry.sessionId ?? runSessionId;
-    const usesExactRunSession = usesDetachedRunSession || baseSessionKey.startsWith("cron:");
     const runSessionKey = usesExactRunSession
       ? `${agentSessionKey}:run:${runSessionId}`
       : agentSessionKey;
@@ -227,7 +245,6 @@ export async function prepareCronRunContext(params: {
       });
       workspaceLease = selectedWorkspace.lease;
       const workspaceDir = selectedWorkspace.workspaceDir;
-      const executionWorkspaceDir = input.executionRoot ?? workspaceDir;
       const persistCronSessionRow: CronSessionRowWriter = async ({
         storePath,
         sessionKey,
@@ -258,7 +275,11 @@ export async function prepareCronRunContext(params: {
         await patchSessionEntryCore(
           { storePath, sessionKey, agentId },
           (_entry, context) => update(context.existingEntry),
-          { fallbackEntry, replaceEntry: true, assertCommitAllowed },
+          {
+            fallbackEntry,
+            replaceEntry: true,
+            workerGuard: { assertCurrent: assertCommitAllowed },
+          },
         );
       };
       const persistSessionEntry = createPersistCronSessionEntry({
@@ -291,10 +312,9 @@ export async function prepareCronRunContext(params: {
         isGmailHook,
         agentId,
         agentDir,
-        workspaceDir: executionWorkspaceDir,
+        workspaceDir,
       });
       if (!resolvedModelSelection.ok) {
-        sessionWorkAdmission.release();
         return {
           ok: false as const,
           result: withRunSession({
@@ -330,7 +350,6 @@ export async function prepareCronRunContext(params: {
       });
       if (!preflight.ok) {
         logWarn(`[cron:${input.job.id}] ${preflight.reason}`);
-        sessionWorkAdmission.release();
         return {
           ok: false as const,
           result: withRunSession({
@@ -411,15 +430,14 @@ export async function prepareCronRunContext(params: {
           abortSignal: input.abortSignal ?? input.signal,
         },
       );
-
       const admittedConfig = preparedModelRuntimeLease.snapshot.config;
+
       const explicitTimeoutSeconds =
         input.job.payload.kind === "agentTurn" ? input.job.payload.timeoutSeconds : undefined;
       const timeoutMs = resolveAgentTimeoutMs({
         cfg: cfgWithAgentDefaults,
         overrideSeconds: explicitTimeoutSeconds,
       });
-      // Preserve explicit timeout provenance so the idle watchdog does not reapply 120s when defaults match.
       // Preserve an explicit cron timeout even when it equals the agent default;
       // the embedded runner uses its presence to configure the idle watchdog.
       const runTimeoutOverrideMs = resolveCronRunTimeoutOverrideMs(explicitTimeoutSeconds);
@@ -440,6 +458,7 @@ export async function prepareCronRunContext(params: {
         modelApi,
         agentId: modelOwner.agentId,
         agentDir: modelOwner.agentDir,
+
         sessionKey: agentSessionKey,
         agentPayload,
       });
@@ -507,18 +526,18 @@ export async function prepareCronRunContext(params: {
       } else {
         commandBody = `${base}\n${timeLine}`.trim();
       }
-      commandBody = appendCronUnattendedRunPreamble(commandBody, { externalHook: isExternalHook });
+      commandBody = appendCronUnattendedRunPreamble(commandBody, {
+        externalHook: isExternalHook,
+      });
 
-      const skillsSnapshot =
-        input.skillsSnapshot ??
-        (await resolveCronSkillsSnapshot({
-          workspaceDir: executionWorkspaceDir,
-          config: admittedConfig,
-          agentId,
-          existingSnapshot: cronSession.sessionEntry.skillsSnapshot,
-          librarySelections: cronSession.sessionEntry.skillLibrarySelections,
-          isFastTestEnv: params.isFastTestEnv,
-        }));
+      const skillsSnapshot = await resolveCronSkillsSnapshot({
+        workspaceDir,
+        config: admittedConfig,
+        agentId,
+        existingSnapshot: cronSession.sessionEntry.skillsSnapshot,
+        librarySelections: cronSession.sessionEntry.skillLibrarySelections,
+        isFastTestEnv: params.isFastTestEnv,
+      });
       await persistCronSkillsSnapshotIfChanged({
         isFastTestEnv: params.isFastTestEnv,
         cronSession,
@@ -603,13 +622,16 @@ export async function prepareCronRunContext(params: {
         ok: true as const,
         context: {
           input,
-          // Execution borrows the admitted owner config; flattened defaults only select it.
+          // Execution borrows the admitted owner's config; flattened defaults only select it.
           cfgWithAgentDefaults: admittedConfig,
           agentId,
           agentCfg,
           agentDir,
           agentSessionKey,
-          sourceSessionKey,
+          sourceSessionKey:
+            input.job.sessionTarget === "isolated"
+              ? input.job.sourceConversation?.sessionKey
+              : sourceSessionKey,
           sourceSessionGeneration,
           runSessionId,
           currentRunSessionId,
@@ -618,7 +640,6 @@ export async function prepareCronRunContext(params: {
           workspaceDir,
           cwd: selectedWorkspace.cwd,
           workspaceLease,
-          executionRoot: input.executionRoot,
           commandBody,
           inputProvenance:
             agentPayload && !isExternalHook
@@ -659,14 +680,11 @@ export async function prepareCronRunContext(params: {
         },
       };
     } catch (error) {
-      try {
-        await using _ = preparedModelRuntimeLease;
-        throw error;
-      } finally {
-        sessionWorkAdmission.release();
-      }
+      await using _ = preparedModelRuntimeLease;
+      throw error;
     } finally {
       if (!workspaceLeaseTransferred) {
+        sessionWorkAdmission.release();
         await workspaceLease?.release();
       }
     }

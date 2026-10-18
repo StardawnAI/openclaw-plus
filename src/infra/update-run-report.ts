@@ -9,11 +9,11 @@ import {
 } from "../shared/update-outcome.js";
 import { formatDurationPrecise } from "./format-time/format-duration.ts";
 import type { RestartSentinelPayload } from "./restart-sentinel-store.js";
-import { UPDATE_DESTINATION_RECOVERY } from "./update-destination-failure.js";
 import { formatUpdateDoctorConfigWriteRefusal } from "./update-doctor-config.js";
 import {
   formatUpdateFailureFact,
   selectUpdateFailureReportSteps,
+  UPDATE_DESTINATION_RECOVERY,
 } from "./update-failure-facts-format.js";
 import {
   LEGACY_UPDATE_RUN_ADVISORY,
@@ -160,10 +160,10 @@ export function formatUpdateRunRecovery(
   }
   const code = observation.failureFacts?.[0]?.code;
   if (!code) {
-    return "Gateway readiness is pending; recovery probe completed without verified readiness";
+    return "Gateway readiness is pending; recovery check completed without verified readiness";
   }
   return code === "gateway-probe-failed"
-    ? `recovery probe failed (${code})`
+    ? `recovery check failed (${code})`
     : `not serving (${code})`;
 }
 
@@ -228,6 +228,7 @@ export function renderUpdateRunReport(
     nextAction?: string;
     currentHealth?: UpdateRunReportHealth;
     mode?: UpdateRunResult["mode"] | "package";
+    markdownLimit?: number;
   } = {},
 ): UpdateRunReport {
   const reconciled = isAcknowledgedAbandonedUpdateRun(run);
@@ -239,13 +240,15 @@ export function renderUpdateRunReport(
     run.origin.nextAction
       ? { kind: "unavailable" }
       : undefined);
+  // Health cannot readmit Doctor custody; report steps omit the settlement's authority fields.
   const runtimeVerificationRecovered =
     run.status === "failed" &&
     currentHealth?.kind === "responding" &&
     Boolean(run.after.version) &&
     currentHealth.version === run.after.version &&
     run.verification.recovery?.serviceRestartSafe === false &&
-    run.verification.recovery.reason === "runtime-verification-failed";
+    run.verification.recovery.reason === "runtime-verification-failed" &&
+    !run.steps.some((step) => step.step === "doctor process settlement");
   // Keep the version visible and distinguish Git updates within the same version.
   const before = formatUpdateVersion(run.before);
   const after = formatUpdateVersion(run.after);
@@ -300,7 +303,11 @@ export function renderUpdateRunReport(
       break;
   }
   headline = bounded(headline, 500);
-  const lines: string[] = [];
+  const markdownLimit = opts.markdownLimit ?? 1500;
+  const warnings = updateRunWarningMessages(run.steps).map((message) => `Warning: ${message}`);
+  // Successful activation must not bury recovery constraints behind snapshot inventory.
+  // Failed runs keep their failure diagnostics ahead of warnings in the short report.
+  const lines: string[] = run.status === "succeeded" ? [...warnings] : [];
   if (
     currentHealth &&
     (runtimeVerificationRecovered || (!run.origin.nextAction && !opts.nextAction))
@@ -320,7 +327,7 @@ export function renderUpdateRunReport(
     const candidateVersion = admission.candidateVersion
       ? ` (${bounded(admission.candidateVersion, 120)})`
       : "";
-    lines.push(`Admission: ${admission.owner}${candidateVersion}.`);
+    lines.push(`Update safety checks ran in the ${admission.owner} updater${candidateVersion}.`);
     if (admission.checks?.length) {
       lines.push(
         `Admission checks: ${admission.checks.map((check) => `${bounded(check.name, 120)}: ${check.status}`).join(", ")}.`,
@@ -395,8 +402,8 @@ export function renderUpdateRunReport(
       ),
     );
   }
-  for (const message of updateRunWarningMessages(run.steps, 3)) {
-    lines.push(`Warning: ${bounded(message, 500)}`);
+  if (run.status !== "succeeded") {
+    lines.push(...warnings);
   }
   const facts = run.verification;
   const observation = run.steps.findLast((step) => step.step === "gateway recovery verification");
@@ -504,13 +511,13 @@ export function renderUpdateRunReport(
     return {
       headline,
       lines: [...(next ? [next, ""] : []), ...details],
-      markdown: `${lead}\n${bounded(details.join("\n"), 1500 - lead.length - 1)}`,
+      markdown: `${lead}\n${bounded(details.join("\n"), markdownLimit - lead.length - 1)}`,
     };
   }
   lines.push(...hints);
   const body = [headline, ...lines.filter((line) => line !== next)].join("\n");
   const suffix = next ? `\n${bounded(next, 1100)}` : "";
-  return { headline, lines, markdown: `${bounded(body, 1500 - suffix.length)}${suffix}` };
+  return { headline, lines, markdown: `${bounded(body, markdownLimit - suffix.length)}${suffix}` };
 }
 
 /** Old CLI finalization paths still return runner results; all wording stays in the report. */

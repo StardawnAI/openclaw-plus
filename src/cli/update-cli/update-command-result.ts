@@ -1,10 +1,12 @@
 // Update failures and control-plane results share one reporting boundary.
 import { PLUGIN_CAPABILITY_CONSENT_REQUIRED } from "../../../packages/gateway-protocol/src/capability-consent-error-details.js";
 import { theme } from "../../../packages/terminal-core/src/theme.js";
+import { classifyDoctorMaintenanceRefusal } from "../../commands/doctor-maintenance-inspection.js";
 import type { TriageFailureContext } from "../../commands/triage-prompt.js";
 import { resolveStateDir } from "../../config/paths.js";
 import { formatServiceInspectionReason } from "../../daemon/service-inspection-error.js";
 import { isAbortError } from "../../infra/abort-signal.js";
+import { acquireWithWait } from "../../infra/acquire-with-wait.js";
 import { isContainerEnvironment } from "../../infra/container-environment.js";
 import {
   attachErrorDiagnostic,
@@ -12,6 +14,7 @@ import {
 } from "../../infra/error-diagnostics.js";
 import { collectNestedErrorCandidates } from "../../infra/error-graph-internal.js";
 import { formatErrorMessage, formatUncaughtError } from "../../infra/errors.js";
+import { isStateDatabaseMaintenanceContention } from "../../infra/gateway-state-owner-record.js";
 import type { PackageUpdateTransaction } from "../../infra/package-update-swap-contract.js";
 import { isSqliteLockError } from "../../infra/sqlite-error-diagnostics.js";
 import type { readUpdateStateSchemaVersions } from "../../infra/update-candidate-state.js";
@@ -28,7 +31,6 @@ import {
   type UpdateFailureFact,
 } from "../../infra/update-failure-facts.js";
 import { normalizeUpdateFailureResult } from "../../infra/update-failure-result.js";
-import { FreeBsdPkgOwnershipError } from "../../infra/update-freebsd-pkg-ownership.js";
 import { UpdateRequesterRevokedError } from "../../infra/update-requester-authority.js";
 import { UpdateRunAdmissionBusyError } from "../../infra/update-run-admission.js";
 import {
@@ -47,6 +49,7 @@ import { mutateRun } from "../../infra/update-run-write.js";
 import { GitCleanupReportingError } from "../../infra/update-runner-git-cleanup.js";
 import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import type { UpdateStepResult } from "../../infra/update-step-result.js";
+import { SystemPackageOwnershipError } from "../../infra/update-system-package-ownership.js";
 import { hasCommandProcessCleanupError } from "../../process/exec-result.js";
 import { defaultRuntime } from "../../runtime.js";
 import { isVerifiedUpdateRollback, type UpdateRecoveryStep } from "../../shared/update-outcome.js";
@@ -270,7 +273,7 @@ export function createUpdateCommandFailureResult(
   const { detail } = failure;
   const cause = primaryUpdateFailure(failure.cause);
   const preMutationFailure = cause instanceof UpdatePreMutationError;
-  const pkgOwnershipFailure = cause instanceof FreeBsdPkgOwnershipError;
+  const pkgOwnershipFailure = cause instanceof SystemPackageOwnershipError;
   const admissionFailure =
     admission === true && cause instanceof GatewayServiceUpdateOwnershipError;
   const reason =
@@ -306,6 +309,21 @@ export function createUpdateCommandFailureResult(
     steps: stepResult?.failedStep ? stepResult.steps : [...(stepResult?.steps ?? []), failedStep],
   };
 }
+
+export function isUpdateStateReadContention(error: unknown): boolean {
+  return (
+    collectNestedErrorCandidates(error).some(isStateDatabaseMaintenanceContention) &&
+    classifyDoctorMaintenanceRefusal(error).kind !== "data-at-risk"
+  );
+}
+
+export const withUpdateStateRead = <T>(read: () => Promise<T>, timeoutMs: number) =>
+  acquireWithWait({
+    acquire: read,
+    shouldRetry: isUpdateStateReadContention,
+    deadlineMs: performance.now() + timeoutMs,
+    pollIntervalMs: 250,
+  });
 
 /** Mutable exceptions cannot authorize recovery while command cleanup is unknown. */
 export async function resolveMutableUpdateFailure(params: {
@@ -348,7 +366,7 @@ export async function resolveMutableUpdateFailure(params: {
       mode: params.mode,
       root: params.root,
       recovery:
-        primary instanceof UpdatePreMutationError
+        primary instanceof UpdatePreMutationError || isUpdateStateReadContention(params.cause)
           ? await params.originalRecovery()
           : { serviceRestartSafe: false, reason: "runtime-verification-failed" },
       failure,
@@ -367,7 +385,10 @@ export async function withUpdateAdmissionReporting<T>(
   try {
     return await admit();
   } catch (error) {
-    if (error instanceof UpdateRunAdmissionBusyError) {
+    if (
+      error instanceof UpdateRunAdmissionBusyError ||
+      (error instanceof SystemPackageOwnershipError && error.owned)
+    ) {
       const result = {
         status: "skipped",
         mode,
@@ -390,12 +411,12 @@ export async function withUpdateAdmissionReporting<T>(
     }
     if (
       !(error instanceof GatewayServiceUpdateOwnershipError) &&
-      !(error instanceof FreeBsdPkgOwnershipError)
+      !(error instanceof SystemPackageOwnershipError)
     ) {
       throw error;
     }
     const message =
-      error instanceof FreeBsdPkgOwnershipError
+      error instanceof SystemPackageOwnershipError
         ? error.message
         : `${error.message} Run \`openclaw gateway status --deep\` from the service's owning account before retrying.`;
     if (opts.json) {
@@ -443,7 +464,9 @@ export class UpdateCommandPendingRecoveryFailure extends UpdateCommandFailure {
           result.status === "error"
             ? (result.reason ?? "update-recovery-pending")
             : "update-recovery-pending",
-        recovery: { serviceRestartSafe: false, reason: "runtime-verification-failed" },
+        recovery: isUpdateStateReadContention(options?.cause)
+          ? result.recovery
+          : { serviceRestartSafe: false, reason: "runtime-verification-failed" },
       },
       1,
       detail,
@@ -599,11 +622,9 @@ export async function writeControlPlaneUpdateRestartSentinelBestEffort(params: {
       throw err;
     }
     const message = `Failed to write update.run restart sentinel: ${String(err)}`;
-    if (params.jsonMode) {
-      defaultRuntime.error(message);
-    } else {
-      defaultRuntime.log(theme.warn(message));
-    }
+    defaultRuntime[params.jsonMode ? "error" : "log"](
+      params.jsonMode ? message : theme.warn(message),
+    );
   }
 }
 
@@ -620,11 +641,9 @@ export async function markControlPlaneUpdateRestartSentinelFailureBestEffort(par
     await markControlPlaneUpdateRestartSentinelFailure(params.reason, params.meta, params.env);
   } catch (err) {
     const message = `Failed to mark update.run restart sentinel failed: ${String(err)}`;
-    if (params.jsonMode) {
-      defaultRuntime.error(message);
-    } else {
-      defaultRuntime.log(theme.warn(message));
-    }
+    defaultRuntime[params.jsonMode ? "error" : "log"](
+      params.jsonMode ? message : theme.warn(message),
+    );
   }
 }
 
@@ -648,7 +667,7 @@ export function recordUpdateResultNextAction(
         result.verification === undefined
           ? result
           : { ...result, recovery: verification.recovery ?? undefined },
-      restart: params.coreAlreadyCurrent ? params.opts.restart : undefined,
+      restart: params.opts.restart,
       serviceRunning: verification.serviceRunning,
       runningVersion: verification.runningVersion,
       verifiedServingVersion: resolveUpdateRunVerifiedServingVersion(

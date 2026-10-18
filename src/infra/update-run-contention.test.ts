@@ -81,29 +81,31 @@ function retentionCommand(
   };
 }
 
-it.each(["updater-runtime-retention", "candidate-state-snapshot"])(
-  "skips contended bookkeeping for %s",
-  (step) => {
-    const command = retentionCommand();
-    command.input.step.step = step;
-    const run = vi.spyOn(writer, "run").mockImplementation(() => {
-      throw busyError();
+it.each([
+  "updater-runtime-retention",
+  "diagnostic:updater-runtime-retention",
+  "candidate-state-snapshot",
+  "update-driver-handoff",
+])("skips contended bookkeeping for %s", (step) => {
+  const command = retentionCommand();
+  command.input.step.step = step;
+  const run = vi.spyOn(writer, "run").mockImplementation(() => {
+    throw busyError();
+  });
+  const current = vi.fn();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    expect(recordUpdateRunMutationInWorker(command, options, current, writer)).toEqual({
+      kind: "bookkeeping-skipped",
     });
-    const current = vi.fn();
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      expect(recordUpdateRunMutationInWorker(command, options, current, writer)).toEqual({
-        kind: "bookkeeping-skipped",
-      });
-    }
-    expect(run).toHaveBeenCalledTimes(3);
-    expect(run).toHaveBeenLastCalledWith(
-      expect.any(Function),
-      expect.objectContaining({ busyTimeoutMs: 1_000 }),
-    );
-    expect(current.mock.calls).toEqual([["transaction"], ["transaction"], ["transaction"]]);
-    expect(getUpdateRun(runId, options)?.steps.some((entry) => entry.step === step)).toBe(false);
-  },
-);
+  }
+  expect(run).toHaveBeenCalledTimes(3);
+  expect(run).toHaveBeenLastCalledWith(
+    expect.any(Function),
+    expect.objectContaining({ busyTimeoutMs: 1_000 }),
+  );
+  expect(current.mock.calls).toEqual([["transaction"], ["transaction"], ["transaction"]]);
+  expect(getUpdateRun(runId, options)?.steps.some((entry) => entry.step === step)).toBe(false);
+});
 
 it("warns on contended bookkeeping and still records the required outcome", () => {
   const write = vi

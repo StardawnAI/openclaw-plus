@@ -1,11 +1,13 @@
 // Assistant visible text helpers strip hidden reasoning and control marker text.
 import { stripPlainTextToolCallBlocks } from "../../../packages/tool-call-repair/src/index.js";
+import { escapeRegExp } from "../regexp.js";
 import { findCodeRegions, isInsideCode, stripLinesOutsideCode } from "./code-regions.js";
 import { downgradedToolCallTextFilter } from "./downgraded-tool-call-text.js";
 import { stripModelSpecialTokens } from "./model-special-tokens.js";
 import { stripReasoningTagsFromText } from "./reasoning-tags.js";
 import {
   applyTextFilters,
+  createConditionalTextProjector,
   leadingEmptyLinesTextFilter,
   trimTextFilter,
   type TextFilter,
@@ -17,18 +19,44 @@ export { stripToolCallXmlTags, toolCallXmlTextFilter } from "./tool-call-xml.js"
 const MEMORY_TAG_RE = /<\s*(\/?)\s*relevant[-_]memories\b[^<>]*>/gi;
 const MEMORY_TAG_QUICK_RE = /<\s*\/?\s*relevant[-_]memories\b/i;
 const LEGACY_BRACKET_TOOL_BLOCK_QUICK_RE = /\[\s*\/?\s*TOOL_(?:CALL|RESULT)\s*\]/i;
-const INTERNAL_TRACE_LINE_QUICK_RE =
-  /(?:📊|🛠️|📖|📝|🔍|🔎|⚙️|tool[-_ ]?call|tool[-_ ]?result|function[-_ ]?call)/i;
-const INTERNAL_TRACE_LINE_RE =
-  /^(?:>\s*)?(?:⚠️\s*)?(?:📊|🛠️|📖|📝|🔍|🔎|⚙️)\s*(?:Session Status|Exec|Read|Edit|Write|Patch|Search|Open|Click|Find|Screenshot|Update Plan|Tool Call|Tool Result|Function Call|Shell|Command)\s*:/i;
-// The current producer reserves "⚠️ 🛠️ Exec|Bash failed[:...]" for exec warnings, so
-// echoed copies must be removed. The second branch preserves the historical "(agent) failed" shape.
-const INTERNAL_COMPACT_FAILURE_TRACE_LINE_RE =
-  /^(?:>\s*)?⚠️\s*🛠️\s+(?:(?:Exec|Bash)\s+failed(?:(?:\s+\(exit\s+-?\d+\))|(?:\s*:[^\r\n]*))?|\S[^\r\n]*\s+\(agent\)`{0,2}\s+failed(?:\s*:[^\r\n]*)?)\s*$/i;
-const INTERNAL_COMPACT_COMMAND_TRACE_LINE_RE =
-  /^(?:>\s*)?🛠️\s*(?:(?:(?:elevated|pty)\b\s*(?:·|,)\s*)+)?(?:`{1,2}\s*\S|(?:run|check|fetch|pull|push|view|show|list|switch|create|merge|rebase|stage|restore|reset|stash|search|find|print|copy|move|remove|install|start|cd|git|pnpm|npm|yarn|bun|node|python|python3|bash|sh)\b)/i;
-const INTERNAL_CHANNEL_TRACE_LINE_RE =
-  /^(?:>\s*)?(?:tool[-_ ]?call|tool[-_ ]?result|function[-_ ]?call)\s*[:=]/i;
+const traceIconHeads = ["📊", "🛠️", "📖", "📝", "🔍", "🔎", "⚙️"].flatMap((icon) => [
+  [icon],
+  ["⚠️", icon],
+]);
+const traceChannelHeads = ["tool call", "tool result", "function call"].flatMap((name) =>
+  ["", "-", "_", " "].flatMap((separator) =>
+    [":", "="].map((delimiter) => [name.replace(" ", separator), delimiter]),
+  ),
+);
+// Literal head parts, separated by optional whitespace, own both batch and stream activation.
+const traceLineRules = [
+  {
+    heads: traceIconHeads,
+    body: /\s*(?:Session Status|Exec|Read|Edit|Write|Patch|Search|Open|Click|Find|Screenshot|Update Plan|Tool Call|Tool Result|Function Call|Shell|Command)\s*:/,
+  },
+  {
+    // Historical warnings include the older "(agent) failed" shape.
+    heads: [["⚠️", "🛠️"]],
+    body: /\s+(?:(?:Exec|Bash)\s+failed(?:(?:\s+\(exit\s+-?\d+\))|(?:\s*:[^\r\n]*))?|\S[^\r\n]*\s+\(agent\)`{0,2}\s+failed(?:\s*:[^\r\n]*)?)\s*$/,
+  },
+  {
+    heads: [["🛠️"]],
+    body: /\s*(?:(?:(?:elevated|pty)\b\s*(?:·|,)\s*)+)?(?:`{1,2}\s*\S|(?:run|check|fetch|pull|push|view|show|list|switch|create|merge|rebase|stage|restore|reset|stash|search|find|print|copy|move|remove|install|start|cd|git|pnpm|npm|yarn|bun|node|python|python3|bash|sh)\b)/,
+  },
+  { heads: traceChannelHeads, body: /(?:)/ },
+];
+const INTERNAL_TRACE_LINE_RE = new RegExp(
+  `^(?:>\\s*)?(?:${traceLineRules
+    .map(
+      ({ heads, body }) =>
+        `(?:${heads.map((parts) => parts.map(escapeRegExp).join("\\s*")).join("|")})${body.source}`,
+    )
+    .join("|")})`,
+  "i",
+);
+const traceLineHeads = traceLineRules.flatMap(({ heads }) =>
+  heads.flatMap((parts) => [parts, [">", ...parts]]),
+);
 
 /**
  * Strip malformed Minimax tool invocations that leak into text content.
@@ -126,19 +154,19 @@ export function stripLegacyBracketToolCallBlocks(text: string): string {
     const isResult = openMatch[1]?.toUpperCase() === "RESULT";
     const closeRe = isResult ? /\[\s*\/\s*TOOL_RESULT\s*\]/gi : /\[\s*\/\s*TOOL_CALL\s*\]/gi;
     closeRe.lastIndex = payloadStart;
-    const closeMatch = closeRe.exec(text);
-    const closeStart =
-      closeMatch && !isInsideCode(closeMatch.index, codeRegions) ? closeMatch.index : -1;
-    const payload = text.slice(payloadStart, closeStart >= 0 ? closeStart : text.length);
-    if (
-      !(isResult
-        ? isLegacyBracketToolResultPayload(payload)
-        : isLegacyBracketToolCallPayload(payload))
-    ) {
+    let closeMatch = closeRe.exec(text);
+    while (closeMatch && isInsideCode(closeMatch.index, codeRegions)) {
+      closeMatch = closeRe.exec(text);
+    }
+    const payload = text.slice(payloadStart, closeMatch?.index);
+    const isToolPayload = isResult
+      ? isLegacyBracketToolResultPayload(payload)
+      : isLegacyBracketToolCallPayload(payload);
+    if (!isToolPayload) {
       continue;
     }
     result += text.slice(cursor, openStart);
-    cursor = closeStart >= 0 ? closeStart + (closeMatch?.[0].length ?? 0) : text.length;
+    cursor = closeMatch ? closeMatch.index + closeMatch[0].length : text.length;
     if (cursor === text.length) {
       break;
     }
@@ -184,19 +212,7 @@ function stripRelevantMemoriesTags(text: string): string {
 }
 
 function stripAssistantInternalTraceLines(text: string): string {
-  if (!text || !INTERNAL_TRACE_LINE_QUICK_RE.test(text)) {
-    return text;
-  }
-
-  return stripLinesOutsideCode(text, (line) => {
-    const trimmed = line.trim();
-    return (
-      INTERNAL_TRACE_LINE_RE.test(trimmed) ||
-      INTERNAL_COMPACT_FAILURE_TRACE_LINE_RE.test(trimmed) ||
-      INTERNAL_COMPACT_COMMAND_TRACE_LINE_RE.test(trimmed) ||
-      INTERNAL_CHANNEL_TRACE_LINE_RE.test(trimmed)
-    );
-  });
+  return stripLinesOutsideCode(text, (line) => INTERNAL_TRACE_LINE_RE.test(line.trim()));
 }
 
 export type AssistantVisibleTextSanitizerProfile =
@@ -207,6 +223,10 @@ export type AssistantVisibleTextSanitizerProfile =
   | "tool-progress";
 
 const profileFilters = new Map<string, readonly TextFilter[]>();
+
+function stripInvisibleAssistantText(text: string): string {
+  return /^[\p{White_Space}\p{Default_Ignorable_Code_Point}]*$/u.test(text) ? "" : text;
+}
 
 export function assistantVisibleTextFilters(
   profile: AssistantVisibleTextSanitizerProfile,
@@ -261,6 +281,10 @@ export function assistantVisibleTextFilters(
   }
   filters.push(
     preserve ? leadingEmptyLinesTextFilter : trimTextFilter(trim, { preserveCodeIndentation }),
+    {
+      transform: stripInvisibleAssistantText,
+      create: () => createConditionalTextProjector(stripInvisibleAssistantText, () => true),
+    },
   );
   profileFilters.set(key, filters);
   return filters;
@@ -280,8 +304,55 @@ export const legacyBracketToolCallTextFilter: TextFilter = {
 
 export const assistantTraceTextFilter: TextFilter = {
   transform: stripAssistantInternalTraceLines,
-  activationTokens: ["tool", "function", "📊", "🛠", "📖", "📝", "🔍", "🔎", "⚙"],
+  create: createAssistantTraceProjector,
 };
+
+function createAssistantTraceProjector() {
+  let active = false;
+  const resetLine = () => traceLineHeads.map((parts) => ({ parts, part: 0, offset: 0 }));
+  let candidates = resetLine();
+  return createConditionalTextProjector(stripAssistantInternalTraceLines, (input) => {
+    if (active) {
+      return true;
+    }
+    const appended = input.delta ?? input.text;
+    for (let at = 0; at < appended.length; at++) {
+      const char = appended.charAt(at).toLowerCase();
+      if (char === "\n") {
+        candidates = resetLine();
+        continue;
+      }
+      const whitespace = /\s/.test(char);
+      candidates = candidates.filter((candidate) => {
+        if (candidate.offset === 0 && whitespace) {
+          return true;
+        }
+        if (candidate.parts[candidate.part]?.charAt(candidate.offset) !== char) {
+          return false;
+        }
+        candidate.offset++;
+        if (candidate.offset === candidate.parts[candidate.part]?.length) {
+          candidate.part++;
+          candidate.offset = 0;
+          active ||= candidate.part === candidate.parts.length;
+        }
+        return true;
+      });
+      // The canonical transform owns code protection and corrections after activation.
+      if (active) {
+        return true;
+      }
+      if (candidates.length === 0) {
+        const newline = appended.indexOf("\n", at + 1);
+        if (newline === -1) {
+          break;
+        }
+        at = newline - 1;
+      }
+    }
+    return false;
+  });
+}
 
 export const plainToolCallTextFilter: TextFilter = {
   transform: (text) =>

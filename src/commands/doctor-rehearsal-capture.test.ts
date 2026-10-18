@@ -27,11 +27,10 @@ import { parseUpdateRecoveryBackupManifest } from "./backup-verify-manifest.js";
 import { beginDoctorMaintenance } from "./doctor-maintenance.js";
 import { backupDoctorMigrationDatabases } from "./doctor-migration-backup.js";
 import { preserveDoctorOriginalState } from "./doctor-original-capture.js";
-import * as workshopResources from "./doctor-update-rehearsal-workshop.js";
 
 afterEach(() => vi.restoreAllMocks());
 
-it("keeps config and declared plugin/Workshop resources while excluding disposable core images and aliases", async () => {
+it("keeps config and declared plugin resources while excluding disposable core images and aliases", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const stateDir = await fs.realpath(state.stateDir);
     await withEnvAsync(
@@ -52,9 +51,9 @@ it("keeps config and declared plugin/Workshop resources while excluding disposab
         await closeOpenClawAgentDatabasesAsync();
         await closeOpenClawStateDatabaseAsync();
         const plugin = state.path("external-plugin-data");
-        const workshop = path.join(stateDir, "synthetic-workshop");
+        const declared = path.join(stateDir, "synthetic-declared");
         await fs.mkdir(plugin);
-        await fs.mkdir(workshop);
+        await fs.mkdir(declared);
         const pluginDatabase = path.join(plugin, "plugin.sqlite");
         const db = new DatabaseSync(pluginDatabase);
         try {
@@ -64,12 +63,12 @@ it("keeps config and declared plugin/Workshop resources while excluding disposab
         } finally {
           db.close();
         }
-        const skill = path.join(workshop, "SKILL.md");
-        await fs.writeFile(skill, "retain Workshop repair input");
-        const alias = path.join(workshop, "agent.sqlite");
+        const skill = path.join(declared, "SKILL.md");
+        await fs.writeFile(skill, "retain declared repair input");
+        const alias = path.join(declared, "agent.sqlite");
         await fs.symlink(agent, alias);
         await fs.writeFile(`${agent}-journal`, "");
-        const companionAlias = path.join(workshop, "agent.sqlite-journal");
+        const companionAlias = path.join(declared, "agent.sqlite-journal");
         await fs.symlink(`${agent}-journal`, companionAlias);
         const legacyCanvasRoot = path.join(stateDir, "legacy-canvas-host");
         const canvasDocument = path.join(legacyCanvasRoot, "documents", "retained", "index.html");
@@ -107,6 +106,7 @@ it("keeps config and declared plugin/Workshop resources while excluding disposab
               resources: [
                 ...canvas.resources,
                 { path: plugin, kind: "directory" },
+                { path: declared, kind: "directory" },
                 { path: shared, kind: "sqlite" },
               ],
               deferredPluginIds: new Set(),
@@ -115,9 +115,6 @@ it("keeps config and declared plugin/Workshop resources while excluding disposab
             };
           },
         );
-        vi.spyOn(workshopResources, "collectDoctorSkillWorkshopBackupResources").mockResolvedValue([
-          { path: workshop, kind: "directory" },
-        ]);
         const messages: string[] = [];
         const runtime: RuntimeEnv = {
           log: (...args) => {
@@ -257,9 +254,6 @@ it("refuses to seal exclusions when the rehearsal environment changes during cap
             assertCurrent() {},
           };
         },
-      );
-      vi.spyOn(workshopResources, "collectDoctorSkillWorkshopBackupResources").mockResolvedValue(
-        [],
       );
       try {
         await maintenance!.run(async () => {

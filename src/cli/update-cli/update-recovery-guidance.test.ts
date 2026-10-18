@@ -11,12 +11,16 @@ import {
   recordUpdateRunStep,
   recordUpdateRunVerification,
 } from "../../infra/update-run-ledger.js";
-import { renderUpdateRunReport } from "../../infra/update-run-report.js";
+import {
+  renderUpdateRunReport,
+  updateRunReportInputFromResult,
+} from "../../infra/update-run-report.js";
 import type { UpdateRunResult } from "../../infra/update-runner-types.js";
 import { defaultRuntime } from "../../runtime.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { observeUpdateGatewayReadiness } from "./update-command-readiness.js";
 import { recordUpdateResultNextAction } from "./update-command-result.js";
+import { refuseUnsettledDoctorRecovery } from "./update-command-service-recovery.js";
 import { publishUpdateCommandTerminalResult } from "./update-command-terminal.js";
 import { verifyUpdatedGateway } from "./update-command-verification.js";
 import { resolveUpdateResultNextAction } from "./update-recovery-guidance.js";
@@ -86,6 +90,72 @@ afterEach(() => {
 });
 
 describe("update recovery reporting", () => {
+  it.each(["unsettled", "foreign", "settled"] as const)(
+    "keeps %s Doctor settlement guidance when the target Gateway responds",
+    (settlement) => {
+      const root = "/fixture/candidate";
+      const message =
+        "Doctor processes remain unsettled, data-at-risk. PIDs/process groups: 41001. Keep the Gateway stopped and preserve recovery snapshots; resolve retained process custody before retrying `openclaw update repair`.";
+      const result: UpdateRunResult = {
+        status: "error",
+        mode: "npm",
+        root,
+        reason: "state-migrated-no-rollback",
+        before: { version: "2026.9.1" },
+        after: { version: "2026.9.2" },
+        durationMs: 1,
+        recovery: { serviceRestartSafe: true, service: "healthy", version: "2026.9.2" },
+        steps: [
+          {
+            name: "doctor process settlement",
+            command: "settle doctor process groups",
+            cwd: settlement === "foreign" ? "/fixture/other-candidate" : root,
+            durationMs: 1,
+            exitCode: settlement === "unsettled" ? 1 : 0,
+            ...(settlement === "unsettled"
+              ? {
+                  stderrTail: message,
+                  failureFacts: [
+                    { check: "openclaw doctor", code: "doctor-processes-unsettled", message },
+                  ],
+                }
+              : {}),
+            warnings: ["Optional maintenance remains deferred."],
+          },
+        ],
+      };
+      expect(refuseUnsettledDoctorRecovery(result, root, () => {})).toBe(settlement !== "settled");
+      const nextAction = resolveUpdateResultNextAction({
+        result,
+        env: {},
+        environment: { container: false, stateDir: "/fixture/state" },
+      });
+      expect(nextAction).toBeTruthy();
+      const input = updateRunReportInputFromResult(result, { origin: { nextAction } });
+      const saved = structuredClone(input);
+      const report = renderUpdateRunReport(input, {
+        currentHealth: { kind: "responding", version: "2026.9.2" },
+      });
+      expect(report.lines.join("\n")).toContain(nextAction);
+      expect(report.markdown).not.toContain("saved runtime verification failure no longer applies");
+      expect(report.headline).toContain("update failed: state-migrated-no-rollback");
+      expect(report.lines).toContain("Warning: Optional maintenance remains deferred.");
+      if (settlement === "unsettled") {
+        expect(nextAction).toContain(
+          "Keep the Gateway stopped while Doctor writers may still be running",
+        );
+        expect(report.lines.join("\n")).toContain("doctor-processes-unsettled");
+      } else if (settlement === "settled") {
+        expect(result.recovery).toMatchObject({ serviceRestartSafe: true, service: "healthy" });
+        expect(nextAction).toContain("candidate Gateway is healthy");
+      } else {
+        expect(result.recovery).toMatchObject({ serviceRestartSafe: false });
+        expect(nextAction).toContain("could not prove a runnable installation");
+      }
+      expect(input).toEqual(saved);
+    },
+  );
+
   it.each([true, false])(
     "publishes recovery observation consistently after validation fails (healthy=%s)",
     async (healthy) => {
@@ -116,10 +186,9 @@ describe("update recovery reporting", () => {
           staleGatewayPids: [],
           expectedVersion: "2026.9.6",
           gatewayVersion: "2026.9.6",
-          ...(healthy ? {} : { channelProbeErrors: [{ id: "discord", error: "not ready" }] }),
         },
         readyz: healthy,
-        http: undefined,
+        http: { healthz: 200, readyz: healthy ? 200 : 503 },
         launchAgentRecovery: null,
       });
       await verifyUpdatedGateway({
@@ -150,7 +219,7 @@ describe("update recovery reporting", () => {
           expect(output).not.toContain("did not pass verification");
         } else {
           expect(output).toContain("gateway is running 2026.9.6 but did not pass verification");
-          expect(output).toContain("channel-errors");
+          expect(output).toContain("readyz-unhealthy");
           expect(output).toContain(hostGuidance);
           expect(output).not.toContain("nothing to restore");
         }
@@ -561,4 +630,58 @@ describe("update recovery reporting", () => {
     expect(action).toContain("automatic rollback was refused to preserve them");
     expect(action).not.toContain(redeploy);
   });
+
+  it("describes successful-update cleanup as permanent migration-original retirement", () => {
+    const action = resolveUpdateResultNextAction({
+      result: { status: "ok", mode: "git", steps: [], durationMs: 0 },
+      env: { OPENCLAW_PROFILE: "work", OPENCLAW_STATE_DIR: "/fixture/state" },
+    });
+
+    expect(action).toContain("After confirming the update and your conversations are healthy");
+    expect(action).toContain("retained migration originals eligible for permanent cleanup");
+    expect(action).toContain("`openclaw --profile work update cleanup --dry-run`");
+    expect(action).toContain("state `/fixture/state`");
+    expect(action).toContain("Use the same profile, state, and config settings.");
+  });
+
+  it.each([false, true])(
+    "retains plugin activation guidance when restart was skipped (core current=%s)",
+    async (coreAlreadyCurrent) => {
+      const run = createRun({ profile: "work" });
+      const output = vi.spyOn(defaultRuntime, "writeJson").mockImplementation(() => {});
+      await publishUpdateCommandTerminalResult(
+        { opts: { json: true, restart: false, run }, coreAlreadyCurrent },
+        {
+          status: "ok",
+          mode: "npm",
+          before: { version: coreAlreadyCurrent ? "2026.9.7" : "2026.9.6" },
+          after: { version: "2026.9.7" },
+          steps: [],
+          durationMs: 0,
+          postUpdate: {
+            plugins: {
+              status: "ok",
+              changed: true,
+              sync: {
+                changed: false,
+                switchedToBundled: [],
+                switchedToNpm: [],
+                warnings: [],
+                errors: [],
+              },
+              npm: { changed: true, outcomes: [] },
+              integrityDrifts: [],
+            },
+          },
+        },
+        { rolledBack: false },
+      );
+      const stored = getUpdateRun(run.runId, { env: run.env });
+      const action =
+        "Plugins updated; Gateway restart skipped (--no-restart). Run `openclaw --profile work gateway restart` to activate them in the running Gateway.";
+      expect(stored?.origin.nextAction).toBe(action);
+      expect(output.mock.calls[0]?.[0]).toMatchObject({ run: { origin: { nextAction: action } } });
+      expect(stored && renderUpdateRunReport(stored).markdown).toContain(action);
+    },
+  );
 });

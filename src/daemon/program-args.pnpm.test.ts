@@ -11,11 +11,7 @@ import { readScheduledTaskCommand } from "./schtasks-layout.js";
 import { buildSystemdUnit, parseSystemdExecStart } from "./systemd-unit.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-const originalArgv = [...process.argv];
-afterEach(() => {
-  process.argv = originalArgv;
-  vi.restoreAllMocks();
-});
+afterEach(() => vi.restoreAllMocks());
 
 async function createPnpmInstall(nestedStore: boolean) {
   const home = tempDirs.make("openclaw-pnpm-task-");
@@ -51,8 +47,8 @@ describe("pnpm Scheduled Task entrypoint", () => {
     async ({ nestedStore, entry }) => {
       const fixture = await createPnpmInstall(nestedStore);
       const runtimePath = path.win32.join("C:\\Program Files", "nodejs", "node.exe");
-      process.argv[1] = path.join(fixture.originalRoot, entry);
       const resolved = await resolveGatewayProgramArguments({
+        cliEntrypoint: path.join(fixture.originalRoot, entry),
         runtime: "node",
         runtimePath,
         port: 18789,
@@ -137,8 +133,8 @@ describe("pnpm Scheduled Task entrypoint", () => {
         await fs.symlink(unrelatedRoot, fixture.stableRoot, "junction");
       }
       const originalEntry = path.join(fixture.originalRoot, "dist", "index.js");
-      process.argv[1] = originalEntry;
       const result = await resolveGatewayProgramArguments({
+        cliEntrypoint: originalEntry,
         runtime: "node",
         runtimePath: process.execPath,
         port: 18789,
@@ -180,8 +176,8 @@ it.each(["openclaw.mjs", "dist/index.js"])(
     };
     const original = await writeProject("2026.10.1");
     await fs.symlink(original.project, projectLink, "junction");
-    process.argv[1] = path.join(original.root, entry);
     const { programArguments } = await resolveGatewayProgramArguments({
+      cliEntrypoint: path.join(original.root, entry),
       runtime: "node",
       runtimePath: process.execPath,
       port: 18789,

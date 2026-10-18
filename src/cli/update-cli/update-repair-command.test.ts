@@ -173,7 +173,7 @@ describe("update repair ledger recovery", () => {
             authority: { installKey },
             anchorIdentity: packageActivationIdentity(anchor, true),
             journalIdentity: packageActivationIdentity(journal, false),
-            parentIdentity: packageActivationIdentity(path.dirname(anchor), true),
+            parentIdentity: packageActivationIdentity(path.dirname(anchor), "parent"),
           }),
         );
       } finally {

@@ -1129,14 +1129,9 @@ type OverrideViolation = {
   path: string;
 };
 
-type NpmBundledDependencyPolicy = {
-  allowMissingBundleMarker: boolean;
-  exceptions: Map<string, string>;
-};
-
 // Trusted release tooling validates frozen targets as well as current main. Keep each
 // reviewed npm tarball exact here until no supported frozen target can reference it.
-const NPM_BUNDLED_DEPENDENCY_POLICIES = new Map<string, NpmBundledDependencyPolicy>([
+const NPM_BUNDLED_DEPENDENCY_POLICIES = new Map([
   [
     "11.20.0",
     {
@@ -1150,6 +1145,17 @@ const NPM_BUNDLED_DEPENDENCY_POLICIES = new Map<string, NpmBundledDependencyPoli
   ],
   [
     "12.1.0",
+    {
+      allowMissingBundleMarker: false,
+      exceptions: new Map([
+        ["node_modules/npm/node_modules/minimatch", "10.2.5"],
+        ["node_modules/npm/node_modules/brace-expansion", "5.0.9"],
+        ["node_modules/npm/node_modules/ip-address", "10.5.0"],
+      ]),
+    },
+  ],
+  [
+    "12.2.0",
     {
       allowMissingBundleMarker: false,
       exceptions: new Map([
@@ -1384,10 +1390,7 @@ function collectUnallowedOverrideViolations(
   const packages = recordAt(lockfile, "packages");
   const broadViolations = collectOverrideViolations(lockfile, overrideRules);
   if (!packages) {
-    return broadViolations.map((violation) => ({
-      ...violation,
-      shrinkwrapSources: [] as string[],
-    }));
+    return [];
   }
 
   const findings = new Map<

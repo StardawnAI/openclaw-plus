@@ -1,5 +1,3 @@
-// Gateway Tailscale exposure helper.
-// Applies Serve/Funnel routes and returns optional shutdown cleanup.
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { TailscaleServeDisabledError } from "../infra/tailscale-serve-disabled-error.js";
@@ -63,7 +61,12 @@ export async function startGatewayTailscaleExposure(params: {
     );
     const hostname = (
       params.tailscaleMode === "serve" ? getTailnetHostnameAfterServe() : getTailnetHostname()
-    ).catch(() => null);
+    ).catch((error: unknown) => {
+      params.logTailscale.warn(
+        `Could not read the Tailscale hostname; managed portal ingress is unavailable: ${formatErrorMessage(error)}`,
+      );
+      return null;
+    });
     const host = await racePromiseWithAbortSignal(
       hostname,
       params.signal,

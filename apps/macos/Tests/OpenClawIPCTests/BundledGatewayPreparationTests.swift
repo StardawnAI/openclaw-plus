@@ -63,7 +63,7 @@ struct BundledGatewayPreparationTests {
               printf '%s\n' '2026.9.1' > "$OPENCLAW_PREPARATION_FIXTURE_ROOT/version"
             fi
             if [ -f "$OPENCLAW_PREPARATION_FIXTURE_ROOT/fail" ]; then
-              printf '%s\n' '{"status":"error","reason":"fixture offline"}'
+              printf '%s\n' '{"status":"error","reason":"fixture offline","steps":[{"name":"package update","exitCode":1,"stderrTail":"registry unavailable: fixture offline"}]}'
               exit 1
             fi
             printf '%s\n' '2026.9.1' > "$OPENCLAW_PREPARATION_FIXTURE_ROOT/version"
@@ -126,9 +126,10 @@ struct BundledGatewayPreparationTests {
                         try PostAppUpdateReceiptStore.recordCoreUpdateDispatch(receipt: notice, owner: owner)
                     },
                     statusHandler: { _ in })
-                guard case .failure = failed else { Issue.record("Expected interrupted core update")
+                guard case let .failure(_, details) = failed else { Issue.record("Expected interrupted core update")
                     return
                 }
+                #expect(details?.contains("registry unavailable") == true)
                 try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("fail"))
             }
             let pending: PostAppUpdateReceipt = if fresh {
@@ -344,7 +345,7 @@ struct BundledGatewayPreparationTests {
                 var runtimeActions: [String] = []
                 var failHealth = scenario == "runtime-failure"
                 var operations = ManagedNodeGatewayMigration.liveOperations(
-                    checkCurrent: {}, resolveLegacyCLI: { cli }, allowNamedServiceRetry: true,
+                    checkCurrent: {}, resolveLegacyCLI: { cli },
                     verifyHealth: {
                         runtimeActions.append("health")
                         if failHealth {

@@ -83,7 +83,6 @@ export function recordUpdateRunMutationInWorker(
   };
   let entered = false;
   try {
-    // Take the host's initial grant before BEGIN IMMEDIATE; host latency must not hold the writer.
     assertCurrent("transaction");
     return writer.run(({ db }) => {
       entered = true;

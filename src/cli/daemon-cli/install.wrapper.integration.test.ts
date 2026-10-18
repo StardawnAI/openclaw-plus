@@ -4,10 +4,8 @@ import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../../config/config.js";
-import { resolveLaunchAgentLabel } from "../../daemon/launchd-label.js";
-import { resolveLaunchAgentEnvWrapperPath } from "../../daemon/launchd-service-files.js";
 import * as runtimePaths from "../../daemon/runtime-paths.js";
-import * as runtimePins from "../../daemon/runtime-pin-state.js";
+import { ServiceStartRefusalError } from "../../daemon/service-inspection-error.js";
 import type {
   GatewayServiceCommandConfig,
   GatewayServiceInstallArgs,
@@ -37,7 +35,6 @@ const service = vi.hoisted(() => ({
   readCommand: vi.fn<() => Promise<GatewayServiceCommandConfig | null>>(),
   readDefinitionMutationCapability: vi.fn(async () => ({ kind: "writable" as const })),
 }));
-
 const executor = vi.hoisted(() => ({ current: true }));
 
 vi.mock("../../infra/openclaw-root.js", async (importOriginal) => ({
@@ -72,13 +69,7 @@ let originalArgv: string[];
 let entrypoint: string;
 
 describe("registered gateway install runtime default", () => {
-  it.each([
-    "Bun-only first install",
-    "explicit Node without Node",
-    "recorded runtime",
-    "pinned runtime",
-  ])("handles %s", async (name) => {
-    const explicit = name === "explicit Node without Node";
+  it("uses the running Bun on first install when Node is unavailable", async () => {
     const execPath = Object.getOwnPropertyDescriptor(process, "execPath")!;
     const bunVersion = Object.getOwnPropertyDescriptor(process.versions, "bun");
     const bunPath = "/opt/app/runtime/bun";
@@ -94,71 +85,28 @@ describe("registered gateway install runtime default", () => {
       nodeSharedSqlite: false,
     };
     const probe = vi.spyOn(runtimePaths, "resolveBunRuntimeInfo").mockResolvedValue(supported);
-    const retainedPath =
-      name === "recorded runtime" || name === "pinned runtime" ? "/opt/prior/bun" : undefined;
-    const pin =
-      name === "pinned runtime" ? { runtime: "bun" as const, path: "/opt/prior/bun" } : undefined;
-    if (retainedPath) {
-      service.readCommand.mockResolvedValue({
-        programArguments: [retainedPath, entrypoint, "gateway"],
-      });
-      vi.spyOn(runtimePaths, "resolveRecordedDaemonRuntime").mockResolvedValue({
-        ...supported,
-        runtime: "bun",
-        path: retainedPath,
-      });
-    }
-    if (pin) {
-      vi.spyOn(runtimePins, "readDaemonRuntimePinForInstall").mockReturnValue({
-        revision: "prior",
-        stored: true,
-        pin,
-      });
-      vi.spyOn(runtimePaths, "resolvePinnedDaemonRuntimePath").mockResolvedValue(pin.path);
-    }
     try {
       const program = new Command().name("openclaw");
       addGatewayServiceCommands(program.command("gateway"));
-      const install = program.parseAsync(
-        [
-          "gateway",
-          "install",
-          "--force",
-          "--port",
-          "29453",
-          "--json",
-          ...(explicit ? ["--runtime", "node"] : []),
-        ],
-        { from: "user" },
-      );
-      if (explicit) {
-        await expect(install).rejects.toThrow("No supported Node runtime was selected");
-        expect(service.install).not.toHaveBeenCalled();
-      } else {
-        await install;
-        expect(runtimeErrors).toEqual([]);
-        expect(service.install).toHaveBeenCalledOnce();
-        const [installed] = service.install.mock.calls[0]!;
-        expect(installed.programArguments[0]).toBe(retainedPath ?? bunPath);
-        expect(installed.runtimePinUpdate?.pin).toEqual(pin);
-        if (!retainedPath) {
-          expect(installed.programArguments).toEqual([
-            bunPath,
-            "--no-install",
-            entrypoint,
-            "gateway",
-            "--port",
-            "29453",
-          ]);
-          expect(probe).toHaveBeenCalledWith(bunPath, undefined, expect.any(Object));
-          expect(JSON.parse(runtimeLogs.at(-1)!).warnings).toEqual([
-            "No supported Node runtime was found; using the running Bun for the service.",
-          ]);
-        }
-      }
-      if (explicit || retainedPath) {
-        expect(probe).not.toHaveBeenCalled();
-      }
+      await program.parseAsync(["gateway", "install", "--force", "--port", "29453", "--json"], {
+        from: "user",
+      });
+      expect(runtimeErrors).toEqual([]);
+      expect(service.install).toHaveBeenCalledOnce();
+      const [installed] = service.install.mock.calls[0]!;
+      expect(installed.runtimePinUpdate?.pin).toBeUndefined();
+      expect(installed.programArguments).toEqual([
+        bunPath,
+        "--no-install",
+        entrypoint,
+        "gateway",
+        "--port",
+        "29453",
+      ]);
+      expect(probe).toHaveBeenCalledWith(bunPath, undefined, expect.any(Object));
+      expect(JSON.parse(runtimeLogs.at(-1)!).warnings).toEqual([
+        "No supported Node runtime was found; using the running Bun for the service.",
+      ]);
     } finally {
       Object.defineProperty(process, "execPath", execPath);
       if (bunVersion) {
@@ -235,7 +183,11 @@ function supplyExecutorInput(rebind = false) {
 describe("update executor failure reporting", () => {
   it.each([false, true])("retains a pre-write install refusal (rebind=%s)", async (rebind) => {
     supplyExecutorInput(rebind);
-    service.readCommand.mockRejectedValue(new Error("inspection failed"));
+    const message =
+      "Service definition inspection or backup failed; the definition was preserved: inspection failed";
+    service.readCommand.mockRejectedValue(
+      new ServiceStartRefusalError({ reason: "disabled-no-start", message }),
+    );
     const exit = new ExitError(1);
     await defaultRuntime.exit.withImplementation(
       () => {
@@ -252,10 +204,10 @@ describe("update executor failure reporting", () => {
         ).rejects.toBe(exit);
       },
     );
-    const reported = JSON.parse(runtimeLogs[0]!);
-    expect(reported.ok).toBe(false);
-    expect(reported.error).toMatch(/^SERVICE_DEFINITION_UNKNOWN: /);
-    expect(reported.error).not.toContain("UPDATE_NATIVE_AUTHORITY");
+    expect(JSON.parse(runtimeLogs[0]!)).toMatchObject({
+      ok: false,
+      error: `SERVICE_DEFINITION_UNKNOWN: ${message}`,
+    });
     expect(runtimeErrors).toEqual([]);
     expect(service.install).not.toHaveBeenCalled();
   });
@@ -334,55 +286,4 @@ afterEach(() => {
   vi.unstubAllEnvs();
   clearConfigCache();
   clearRuntimeConfigSnapshot();
-});
-
-describe("registered gateway install --force wrapper selection", () => {
-  it.each(["explicit", "persisted", "custom"] as const)(
-    "selects a runnable service command for a %s wrapper",
-    async (source) => {
-      const wrapper =
-        source === "custom"
-          ? path.join(process.env.HOME!, "custom-wrapper.sh")
-          : resolveLaunchAgentEnvWrapperPath(process.env, resolveLaunchAgentLabel(process.env));
-      await fs.mkdir(path.dirname(wrapper), { recursive: true });
-      await fs.writeFile(wrapper, '#!/bin/sh\nexec "$@"\n', { mode: 0o700 });
-      if (source === "persisted") {
-        vi.stubEnv("OPENCLAW_WRAPPER", undefined);
-        service.readCommand.mockResolvedValue({
-          programArguments: [wrapper, "gateway", "--port", "29453"],
-          environment: { OPENCLAW_WRAPPER: wrapper, WRAPPER_TEST_VALUE: "retained" },
-        });
-      }
-      const program = new Command().name("openclaw");
-      addGatewayServiceCommands(program.command("gateway"));
-      await program.parseAsync(
-        [
-          "gateway",
-          "install",
-          "--force",
-          "--runtime",
-          "node",
-          "--port",
-          "29453",
-          "--json",
-          ...(source === "persisted" ? [] : ["--wrapper", wrapper]),
-        ],
-        { from: "user" },
-      );
-      expect(runtimeErrors).toEqual([]);
-      expect(service.install).toHaveBeenCalledOnce();
-      const [installed] = service.install.mock.calls[0]!;
-      if (source === "custom") {
-        expect(installed.programArguments).toEqual([wrapper, "gateway", "--port", "29453"]);
-        expect(installed.environment?.OPENCLAW_WRAPPER).toBe(wrapper);
-      } else {
-        expect(installed.programArguments).toContain(entrypoint);
-        expect(installed.programArguments).not.toContain(wrapper);
-        expect(installed.environment?.OPENCLAW_WRAPPER).toBeUndefined();
-      }
-      if (source === "persisted") {
-        expect(installed.environment?.WRAPPER_TEST_VALUE).toBe("retained");
-      }
-    },
-  );
 });

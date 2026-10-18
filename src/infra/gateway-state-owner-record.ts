@@ -58,6 +58,12 @@ export const StateDatabaseOfflineMaintenanceError = resolveGlobalSingleton(
     },
 );
 
+export const isStateDatabaseMaintenanceContention = (error: unknown): boolean =>
+  error instanceof AggregateError
+    ? error.errors.length > 0 && error.errors.every(isStateDatabaseMaintenanceContention)
+    : error instanceof StateDatabaseAdmissionPendingError ||
+      error instanceof StateDatabaseOfflineMaintenanceError;
+
 /** Persisted ownership can identify a holder but cannot lend this process maintenance authority. */
 export function assertPersistedStateDatabaseAccessAllowed(params: {
   databasePath: string;
@@ -102,16 +108,11 @@ export function assertPersistedStateDatabaseAccessAllowed(params: {
     assertMaintenance();
     return;
   }
+  const maintenancePending = `OpenClaw state at ${databasePath} is undergoing offline maintenance; retry when it finishes.`;
   if (owner.stateOwnerKind === "schema" && owner.role === "sqlite-maintenance") {
-    throw new StateDatabaseAdmissionPendingError(
-      databasePath,
-      `OpenClaw state at ${databasePath} is undergoing offline maintenance; retry when it finishes.`,
-    );
+    throw new StateDatabaseAdmissionPendingError(databasePath, maintenancePending);
   }
-  throw new StateDatabaseOfflineMaintenanceError(
-    databasePath,
-    `OpenClaw state at ${databasePath} is undergoing offline maintenance; retry when it finishes.`,
-  );
+  throw new StateDatabaseOfflineMaintenanceError(databasePath, maintenancePending);
 }
 
 export function defaultPayload(databasePath: string): LockPayload {

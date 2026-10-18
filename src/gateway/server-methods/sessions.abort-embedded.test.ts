@@ -49,82 +49,6 @@ const parentKey = "agent:main:direct:embedded-parent";
 const parentId = "embedded-parent-session";
 const childKey = (id: string) => `agent:main:subagent:${id}`;
 
-it.for(["controller", "reply-only"] as const)(
-  "delete drain records cancellation before settling a retained %s reply",
-  async (owner, { signal }) => {
-    const runId = "delete-retained-reply";
-    await sessions.upsertSessionEntryCore(
-      { agentId: "main", sessionKey: parentKey },
-      { sessionId: parentId, updatedAt: 1 },
-    );
-    const context = createDirectChatContext({ getRuntimeConfig });
-    const registration =
-      owner === "controller"
-        ? registerChatAbortController({
-            chatAbortControllers: context.chatAbortControllers,
-            runId,
-            sessionId: parentId,
-            sessionKey: parentKey,
-            agentId: "main",
-            timeoutMs: 30_000,
-            isAbortable: (entry) => isReplyRunAbortableForSignal(entry.controller.signal),
-          })
-        : undefined;
-    const operation = createReplyOperation({
-      sessionKey: parentKey,
-      sessionId: parentId,
-      agentId: "main",
-      resetTriggered: false,
-      upstreamAbortSignal: registration?.controller.signal,
-    });
-    retainReplyOperationUntilComplete(operation);
-    const aborted = createDeferredCore();
-    operation.abortSignal.addEventListener("abort", () => aborted.resolve(), { once: true });
-    let drain: SessionLifecycleDrain | undefined;
-    const pending = prepareSessionLifecycleDrain({
-      action: "delete",
-      context,
-      storePath: resolveSessionStorePathCore(getRuntimeConfig().session?.store, {
-        agentId: "main",
-      }),
-      sessionKeys: [parentKey],
-      sessionKey: parentKey,
-      sessionId: parentId,
-      agentId: "main",
-      defaultAgentId: "main",
-      lifecycleIdentities: [parentKey, parentId],
-    }).then((result) => {
-      drain = result;
-      return result;
-    });
-    const settled = Promise.allSettled([pending]);
-    try {
-      await withinTest(
-        awaitGateBeforeSettlement(aborted.promise, pending, "Delete skipped the reply owner"),
-        signal,
-      );
-      expect(operation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
-      expect(drain).toBeUndefined();
-      if (registration) {
-        expect(context.broadcast).toHaveBeenCalledWith(
-          "chat",
-          expect.objectContaining({ runId, state: "aborted", stopReason: "delete" }),
-          expect.anything(),
-        );
-      }
-      operation.complete();
-      registration?.cleanup();
-      await withinTest(pending, signal);
-      expect(drain?.hasAuthoritativeWork()).toBe(false);
-    } finally {
-      operation.complete();
-      registration?.cleanup();
-      await settled;
-      drain?.release();
-    }
-  },
-);
-
 it.each(["matched", "old-incarnation", "foreign-key", "missing-row"] as const)(
   "narrow sessions.abort qualifies the exact %s embedded producer before effects",
   async (target) => {
@@ -363,7 +287,7 @@ it("exact embedded Stop cancels running and queued collectors without dispatchin
     expect(parentAbort).toHaveBeenCalledOnce();
     await fixture.settle();
     for (const id of ["running", "queued"]) {
-      expect(getSubagentRunByChildSessionKey(childKey(id)), id).toMatchObject({
+      expect(await getSubagentRunByChildSessionKey(childKey(id)), id).toMatchObject({
         endedReason: "subagent-killed",
       });
     }
@@ -372,7 +296,7 @@ it("exact embedded Stop cancels running and queued collectors without dispatchin
     expect(isSwarmRunActive("running")).toBe(false);
     await vi.waitFor(() => expect(otherTurnDispatch).toHaveBeenCalledOnce());
     for (const id of ["other-turn", "other-session"]) {
-      expect(getSubagentRunByChildSessionKey(childKey(id))?.endedReason).toBeUndefined();
+      expect((await getSubagentRunByChildSessionKey(childKey(id)))?.endedReason).toBeUndefined();
     }
     expect(otherSessionDispatch).not.toHaveBeenCalled();
     expect(releaseSwarmRun("unrelated-capacity")).toBe(true);
@@ -438,10 +362,12 @@ it.each(["replaced", "throwing", "unreadable child"])(
       ]);
       expect(abort).toHaveBeenCalledTimes(state === "throwing" ? 1 : 0);
       expect(replacementAbort).not.toHaveBeenCalled();
-      expect(getSubagentRunByChildSessionKey(childKey("queued"))).toMatchObject({
+      expect(await getSubagentRunByChildSessionKey(childKey("queued"))).toMatchObject({
         execution: { status: "queued" },
       });
-      expect(getSubagentRunByChildSessionKey(childKey("queued"))?.killIntent).toBeUndefined();
+      expect(
+        (await getSubagentRunByChildSessionKey(childKey("queued")))?.killIntent,
+      ).toBeUndefined();
       expect(dispatch).not.toHaveBeenCalled();
       expect(releaseSwarmRun("capacity")).toBe(true);
       await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
@@ -546,7 +472,7 @@ it.each([true, false])(
       expect.soft(childAbort).toHaveBeenCalledTimes(finalizing ? 0 : 1);
       expect(dispatch).not.toHaveBeenCalled();
       for (const id of ["running", "queued"]) {
-        const run = getSubagentRunByChildSessionKey(childKey(id));
+        const run = await getSubagentRunByChildSessionKey(childKey(id));
         if (finalizing) {
           expect.soft(run?.endedReason, id).toBeUndefined();
           expect.soft(run?.killIntent, id).toBeUndefined();
@@ -555,7 +481,7 @@ it.each([true, false])(
         }
       }
       if (finalizing) {
-        expect.soft(getSubagentRunByChildSessionKey(childKey("queued"))).toMatchObject({
+        expect.soft(await getSubagentRunByChildSessionKey(childKey("queued"))).toMatchObject({
           execution: { status: "queued" },
         });
         releaseSwarmRun("running");
@@ -569,6 +495,82 @@ it.each([true, false])(
       clearActiveEmbeddedRun("running", child, childKey("running"));
       registration.cleanup();
       expect(isEmbeddedAgentRunAbortableForRunId("parent")).toBe(true);
+    }
+  },
+);
+
+it.for(["controller", "reply-only"] as const)(
+  "delete drain records cancellation before settling a retained %s reply",
+  async (owner, { signal }) => {
+    const runId = "delete-retained-reply";
+    await sessions.upsertSessionEntryCore(
+      { agentId: "main", sessionKey: parentKey },
+      { sessionId: parentId, updatedAt: 1 },
+    );
+    const context = createDirectChatContext({ getRuntimeConfig });
+    const registration =
+      owner === "controller"
+        ? registerChatAbortController({
+            chatAbortControllers: context.chatAbortControllers,
+            runId,
+            sessionId: parentId,
+            sessionKey: parentKey,
+            agentId: "main",
+            timeoutMs: 30_000,
+            isAbortable: (entry) => isReplyRunAbortableForSignal(entry.controller.signal),
+          })
+        : undefined;
+    const operation = createReplyOperation({
+      sessionKey: parentKey,
+      sessionId: parentId,
+      agentId: "main",
+      resetTriggered: false,
+      upstreamAbortSignal: registration?.controller.signal,
+    });
+    retainReplyOperationUntilComplete(operation);
+    const aborted = createDeferredCore();
+    operation.abortSignal.addEventListener("abort", () => aborted.resolve(), { once: true });
+    let drain: SessionLifecycleDrain | undefined;
+    const pending = prepareSessionLifecycleDrain({
+      action: "delete",
+      context,
+      storePath: resolveSessionStorePathCore(getRuntimeConfig().session?.store, {
+        agentId: "main",
+      }),
+      sessionKeys: [parentKey],
+      sessionKey: parentKey,
+      sessionId: parentId,
+      agentId: "main",
+      defaultAgentId: "main",
+      lifecycleIdentities: [parentKey, parentId],
+    }).then((result) => {
+      drain = result;
+      return result;
+    });
+    const settled = Promise.allSettled([pending]);
+    try {
+      await withinTest(
+        awaitGateBeforeSettlement(aborted.promise, pending, "Delete skipped the reply owner"),
+        signal,
+      );
+      expect(operation.result).toEqual({ kind: "aborted", code: "aborted_by_user" });
+      expect(drain).toBeUndefined();
+      if (registration) {
+        expect(context.broadcast).toHaveBeenCalledWith(
+          "chat",
+          expect.objectContaining({ runId, state: "aborted", stopReason: "delete" }),
+          expect.anything(),
+        );
+      }
+      operation.complete();
+      registration?.cleanup();
+      await withinTest(pending, signal);
+      expect(drain?.hasAuthoritativeWork()).toBe(false);
+    } finally {
+      operation.complete();
+      registration?.cleanup();
+      await settled;
+      drain?.release();
     }
   },
 );

@@ -344,7 +344,7 @@ describe("MCP HTTP work ownership", () => {
     ownerCurrent = false;
     expect(await callTool(ownerGrant)).toMatchObject({
       result: {
-        content: [{ text: "Gateway client authority closed before dispatching scope.probe." }],
+        content: [{ text: "Gateway requester authority changed" }],
       },
     });
     expect(adminDispatch).toHaveBeenCalledTimes(1);

@@ -46,7 +46,7 @@ import {
 import { ensureOpenClawStatePermissions } from "./openclaw-state-db-permissions.js";
 import {
   assertSupportedStateSchemaVersion,
-  readStateSchemaMigrationVersion,
+  readStateSchemaContentVersion,
 } from "./openclaw-state-db-schema-version.js";
 import { assertOpenClawStateWriteAllowed } from "./openclaw-state-ownership.js";
 
@@ -56,7 +56,7 @@ function assertStateDatabaseIntegrityBeforeMutation(
   database: DatabaseSync,
   pathname: string,
 ): void {
-  const contentVersion = readStateSchemaMigrationVersion(database);
+  const contentVersion = readStateSchemaContentVersion(database);
   const hasApplicationSchema = database // sqlite-allow-raw -- Cold-open schema presence probe before Kysely exposure.
     .prepare("SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1")
     .get();

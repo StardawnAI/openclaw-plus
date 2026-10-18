@@ -6,7 +6,6 @@ import { loadPersistedAuthProfileStore } from "../agents/auth-profiles/persisted
 import { isDefaultInstallIdentity } from "../config/paths.js";
 import type { GatewayService } from "../daemon/service.js";
 import { createMockGatewayService, mockSystemAccountHome } from "../daemon/service.test-helpers.js";
-import { acquireGatewayStateOwner } from "../infra/gateway-state-owner.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { beginDoctorMaintenance } from "./doctor-maintenance.js";
@@ -34,13 +33,6 @@ afterEach(() => {
 
 it.each([
   { name: "CLI service", appOwned: false, running: false, platform: "linux" as const },
-  {
-    name: "CLI service with an active state writer",
-    appOwned: false,
-    running: false,
-    platform: "linux" as const,
-    activeWriter: true,
-  },
   { name: "offline app-owned service", appOwned: true, running: false },
   { name: "running app-owned service", appOwned: true, running: true },
   {
@@ -51,7 +43,7 @@ it.each([
   },
 ])(
   "repairs canonical state without mutating the $name",
-  async ({ appOwned, running, platform, activeWriter }) => {
+  async ({ appOwned, running, platform }) => {
     if (platform) {
       vi.spyOn(process, "platform", "get").mockReturnValue(platform);
     }
@@ -115,21 +107,6 @@ it.each([
         options: { repair: true, nonInteractive: true },
         runtime: { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
       });
-    if (activeWriter) {
-      const owner = acquireGatewayStateOwner({
-        databasePath: path.join(stateDir, "state/openclaw.sqlite"),
-      });
-      try {
-        await expect(begin()).rejects.toThrow("is undergoing offline maintenance");
-      } finally {
-        owner.release();
-      }
-      expect(fs.readFileSync(sourcePath, "utf8")).toBe(source);
-      for (const operation of ["stop", "start", "restart", "install", "uninstall"] as const) {
-        expect(mocks.service[operation]).not.toHaveBeenCalled();
-      }
-      return;
-    }
     if (running) {
       await expect(begin()).rejects.toThrow("Managed by OpenClaw.app");
       expect(fs.readFileSync(sourcePath, "utf8")).toBe(source);

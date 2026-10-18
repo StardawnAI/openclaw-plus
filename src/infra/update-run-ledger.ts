@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { UPDATE_RUN_DRIVER_LIMIT } from "../../packages/gateway-protocol/src/update-run-vocabulary.js";
 import { runExistingOpenClawStateWriteTransaction } from "../state/openclaw-state-db-existing-write.js";
@@ -169,11 +170,7 @@ export function createUpdateRun(
       return decodeRun(admittedRow);
     },
     options,
-    {
-      schemaSql: schema,
-      busyTimeoutMs: options.busyTimeoutMs,
-      recoverTaskDeliveryOrphans: !input.preview,
-    },
+    !input.preview,
   );
 }
 
@@ -437,6 +434,31 @@ export function reconcilePackageOwnerRefusal(
   );
 }
 
+function finishInterruptedRunInTransaction(
+  db: DatabaseSync,
+  expected: UpdateRunRecord,
+  status: "skipped" | "failed",
+  options: LedgerOptions,
+): void {
+  if (
+    inspectRecoveryRows(db).some(
+      ({ record }) => record.runId === expected.runId || isUpdateRecoveryPending(record),
+    )
+  ) {
+    return;
+  }
+  mutateRunInTransaction(
+    db,
+    expected.runId,
+    (record) => {
+      if (isDeepStrictEqual(record, expected)) {
+        finishUpdateRunRecord(record, { status, reason: "interrupted" });
+      }
+    },
+    options,
+  );
+}
+
 /** Close only this local preview, excluding recovery in the same stable-schema transaction. */
 export function finishInterruptedUpdatePreview(
   expected: UpdateRunRecord,
@@ -446,25 +468,7 @@ export function finishInterruptedUpdatePreview(
     throw new Error("Preview interruption requires an active admission");
   }
   runExistingOpenClawStateWriteTransaction(
-    ({ db }) => {
-      if (
-        inspectRecoveryRows(db).some(
-          ({ record }) => record.runId === expected.runId || isUpdateRecoveryPending(record),
-        )
-      ) {
-        return;
-      }
-      mutateRunInTransaction(
-        db,
-        expected.runId,
-        (record) => {
-          if (isDeepStrictEqual(record, expected)) {
-            finishUpdateRunRecord(record, { status: "skipped", reason: "interrupted" });
-          }
-        },
-        options,
-      );
-    },
+    ({ db }) => finishInterruptedRunInTransaction(db, expected, "skipped", options),
     options,
     { schemaSql: schema, operationLabel: "update.preview.interrupted" },
   );
@@ -504,22 +508,7 @@ export function finishInterruptedUpdateBeforeActivation(
       if (recoveryObject) {
         assertSqliteSchemaContains(db, pathname, recoverySchema);
       }
-      if (
-        !inspectRecoveryRows(db).some(
-          ({ record }) => record.runId === expected.runId || isUpdateRecoveryPending(record),
-        )
-      ) {
-        mutateRunInTransaction(
-          db,
-          expected.runId,
-          (record) => {
-            if (isDeepStrictEqual(record, expected)) {
-              finishUpdateRunRecord(record, { status: "failed", reason: "interrupted" });
-            }
-          },
-          options,
-        );
-      }
+      finishInterruptedRunInTransaction(db, expected, "failed", options);
       assertCurrent();
     },
     options,

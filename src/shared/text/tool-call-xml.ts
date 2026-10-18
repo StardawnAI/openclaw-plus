@@ -1,4 +1,3 @@
-// Tool-call XML parsing and its incremental stream filter.
 import { expectDefined } from "@openclaw/normalization-core";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
@@ -33,27 +32,7 @@ const TOOL_CALL_XML_PAYLOAD_START_RE =
   /^\s*(?:\r?\n\s*)?<(?:antml:)?(?:function_call|tool_call|function|invoke|parameters?|arguments?)\b/i;
 const NESTED_JSON_TOOL_CALL_PAYLOAD_START_RE = /^\s*(?:\r?\n\s*)?<(?:function_call|tool_call)\b/i;
 
-const TOOL_CALL_PREFIX_NAMES = [
-  ...TOOL_CALL_TAG_NAMES,
-  "invoke",
-  "parameter",
-  "parameters",
-  "arguments",
-];
-
 type ToolCallPayloadKind = "json" | "xml" | null;
-
-function isToolCallTagPrefix(text: string, start: number): boolean {
-  if (start < 0) {
-    return false;
-  }
-  const match = /^<\s*(?:\/\s*)?([\w:]*)$/.exec(text.slice(start));
-  if (!match) {
-    return false;
-  }
-  const name = (match[1] ?? "").toLowerCase();
-  return TOOL_CALL_PREFIX_NAMES.some((candidate) => candidate.startsWith(name));
-}
 
 function createQuotedStringScanner(text: string, start: number): (end: number) => boolean {
   let quoteChar: "'" | '"' | null = null;
@@ -344,11 +323,10 @@ export function stripToolCallXmlTags(input: string, options: StripToolCallXmlOpt
 }
 
 function stripToolCallXmlTagsInternal(
-  input: string,
+  text: string,
   options: StripToolCallXmlOptions,
   resolveCodeRegions = findCodeRegions,
 ): string {
-  const text = input;
   if (!text || !TOOL_CALL_QUICK_RE.test(text)) {
     return text;
   }
@@ -527,9 +505,11 @@ export function toolCallXmlTextFilter(options: StripToolCallXmlOptions = {}): Te
               active = true;
               return true;
             }
-            if (!protectedBlock && isToolCallTagPrefix(candidate, 0)) {
+            if (!protectedBlock && next === -1 && /^<[\s/]*[\w:]*$/.test(candidate)) {
+              // An unfinished tag name can still become tool markup; rescan it on the next append.
               scannedThrough = start;
-              return true;
+              codeRegions = undefined;
+              return false;
             }
             start = next;
           }

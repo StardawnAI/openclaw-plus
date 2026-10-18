@@ -55,23 +55,6 @@ function unverifiedDriverRun(): UpdateRunRecord {
   return run;
 }
 
-type SnapshotRow = { pid: number; parentPid: number; startedAt: string };
-/** Answer the process snapshot from `snapshot`, and start-time probes with `startOf`. */
-function mockWindowsProcesses(
-  snapshot: () => SnapshotRow[] | null,
-  startOf: (pid: number) => number,
-) {
-  spawnSync.mockImplementation((_command: string, args: string[]) => {
-    const script = args.at(-1) ?? "";
-    if (script.includes("Get-CimInstance")) {
-      const rows = snapshot();
-      return rows ? { status: 0, stdout: JSON.stringify(rows) } : { status: 1, stdout: "" };
-    }
-    const pid = Number(/GetProcessById\((\d+)\)/.exec(script)?.[1]);
-    return { status: 0, stdout: new Date(startOf(pid)).toISOString() };
-  });
-}
-
 describe("Windows update repair continuation", () => {
   beforeEach(() => {
     spawnSync.mockReset();
@@ -134,6 +117,39 @@ describe("Windows update repair continuation", () => {
     expect(getSelfAndAncestorPidsSync().has(repairPid)).toBe(true);
     expect(inspectUpdateRepairDriverAdmission([run], runId).kind).toBe("conflict");
   });
+  function mockWindowsProcesses(
+    ancestry: () => { status: number; stdout: string },
+    driverStart: () => number,
+  ) {
+    spawnSync.mockImplementation((_command: string, args: string[]) =>
+      (args.at(-1) ?? "").includes("Get-CimInstance")
+        ? ancestry()
+        : { status: 0, stdout: new Date(driverStart()).toISOString() },
+    );
+  }
+
+  it("grants continuation when an incomplete chain contains the verified live driver", () => {
+    // Windows chains usually end at an exited parent; every collected PID is still a
+    // creation-ordered ancestor, so finding the driver proves the continuation.
+    const chainPid = repairPid + 300;
+    const run = updateRun();
+    run.origin = {
+      driver: { host: hostname(), pid: chainPid, startIdentity: String(repairStart) },
+    };
+    mockWindowsProcesses(
+      () => ({
+        status: 0,
+        stdout: JSON.stringify([
+          { pid: process.pid, parentPid: chainPid, startedAt: ticks(doctorStart) },
+          { pid: chainPid, parentPid: updaterPid, startedAt: ticks(repairStart) },
+        ]),
+      }),
+      () => repairStart,
+    );
+    expect(getSelfAndAncestorPidsSync().has(chainPid)).toBe(true);
+    expect(inspectUpdateRepairDriverAdmission([run], runId).kind).toBe("continuation");
+  });
+
   it("keeps a verified continuation when a later ancestry read fails", () => {
     const retainedPid = repairPid + 200;
     const run = (startIdentity: number): UpdateRunRecord => ({
@@ -142,27 +158,30 @@ describe("Windows update repair continuation", () => {
         driver: { host: hostname(), pid: retainedPid, startIdentity: String(startIdentity) },
       },
     });
-    let snapshots = 0;
+    let ancestryReads = 0;
     let driverStart = repairStart;
     mockWindowsProcesses(
       () =>
-        snapshots++ === 0
-          ? [
-              { pid: process.pid, parentPid: retainedPid, startedAt: ticks(doctorStart) },
-              { pid: retainedPid, parentPid: 0, startedAt: ticks(repairStart) },
-            ]
-          : null,
+        ++ancestryReads === 1
+          ? {
+              status: 0,
+              stdout: JSON.stringify([
+                { pid: process.pid, parentPid: retainedPid, startedAt: ticks(doctorStart) },
+                { pid: retainedPid, parentPid: 0, startedAt: ticks(repairStart) },
+              ]),
+            }
+          : { status: 1, stdout: "" },
       () => driverStart,
     );
 
     expect(inspectUpdateRepairDriverAdmission([run(repairStart)], runId).kind).toBe("continuation");
-    expect(snapshots).toBe(1);
+    expect(ancestryReads).toBe(1);
     expect(inspectUpdateRepairDriverAdmission([run(repairStart)], runId).kind).toBe("continuation");
-    expect(snapshots).toBe(1);
 
     // Retained proof is bound to the verified identity, never to a reused PID.
-    driverStart = doctorStart + 1000;
-    expect(inspectUpdateRepairDriverAdmission([run(driverStart)], runId)).toMatchObject({
+    const reusedStart = doctorStart + 1000;
+    driverStart = reusedStart;
+    expect(inspectUpdateRepairDriverAdmission([run(reusedStart)], runId)).toMatchObject({
       kind: "conflict",
       message: expect.stringContaining("could not read this process's ancestry"),
     });
@@ -170,7 +189,7 @@ describe("Windows update repair continuation", () => {
 
   it("reports unreadable ancestry instead of a conflicting live update", () => {
     mockWindowsProcesses(
-      () => null,
+      () => ({ status: 1, stdout: "" }),
       () => repairStart,
     );
 

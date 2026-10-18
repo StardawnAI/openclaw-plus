@@ -307,8 +307,6 @@ async function prepareUpdateFinalization(
     installKind,
     preFinalizeConfig,
     requestedChannel,
-    storedChannel,
-    effectiveChannel,
     channel,
   };
 }
@@ -321,21 +319,24 @@ async function updateFinalizeCommandInternal(
   invokingRunId: string,
   ownsMaintenance: boolean,
 ): Promise<() => Promise<void>> {
-  const {
-    root,
-    nodeRunner,
-    preFinalizeConfig,
-    requestedChannel,
-    storedChannel,
-    effectiveChannel,
-    channel,
-  } = prepared;
+  const { root, nodeRunner, preFinalizeConfig, requestedChannel, channel } = prepared;
   let doctorWarnings: string[] = [];
   const onDoctorWarnings = (warnings: string[]) => {
     doctorWarnings = normalizeUpdatePostInstallDoctorWarnings([
       ...new Set([...doctorWarnings, ...warnings]),
     ]);
     lifecycle.recordWarnings(doctorWarnings);
+  };
+
+  const doctorParams = {
+    root,
+    nodeRunner,
+    runId: invokingRunId,
+    yes: opts.yes === true,
+    json: opts.json === true,
+    onWarnings: onDoctorWarnings,
+    onDoctorStep: (step: Parameters<typeof lifecycle.recordDoctorStep>[0]) =>
+      lifecycle.recordDoctorStep(step),
   };
 
   let maintenance: Awaited<
@@ -352,11 +353,7 @@ async function updateFinalizeCommandInternal(
   let outcome: { complete: () => Promise<void> } | { error: unknown };
   try {
     if (prepared.installKind === "git") {
-      await withPluginLifecycleLease({}, async (lease) => {
-        await withCommandProcessScope(() =>
-          completeSourceUpdateRuntime({ root, timeoutMs: lifecycle.budget("plugins"), lease }),
-        );
-      });
+      await completeSourceUpdateRuntime({ root, timeoutMs: lifecycle.budget("plugins") });
     }
     const initialPluginUpdate = await withPrePluginUpdateDoctorEnv(async () => {
       await lifecycle.run("configSnapshot", () => createUpdateConfigSnapshot());
@@ -365,15 +362,9 @@ async function updateFinalizeCommandInternal(
         () =>
           runUpdateFinalizationDoctorInFreshProcess({
             phase: "pre-plugin",
-            root,
-            nodeRunner,
-            runId: invokingRunId,
-            yes: opts.yes === true,
-            json: opts.json === true,
+            ...doctorParams,
             workspaceSuggestions: true,
             timeoutMs: lifecycle.budget("doctor"),
-            onWarnings: onDoctorWarnings,
-            onDoctorStep: (step) => lifecycle.recordDoctorStep(step),
           }),
         undefined,
         {
@@ -408,12 +399,7 @@ async function updateFinalizeCommandInternal(
               const postDoctorStoredChannel = configSnapshot.valid
                 ? normalizeUpdateChannel(configSnapshot.config.update?.channel)
                 : null;
-              const postDoctorChannel =
-                requestedChannel ??
-                postDoctorStoredChannel ??
-                storedChannel ??
-                effectiveChannel ??
-                DEFAULT_PACKAGE_CHANNEL;
+              const postDoctorChannel = requestedChannel ?? postDoctorStoredChannel ?? channel;
               const pluginInstallRecords = await loadInstalledPluginIndexInstallRecords();
               return await updatePluginsAfterCoreUpdate({
                 root,
@@ -437,16 +423,9 @@ async function updateFinalizeCommandInternal(
       "targetConfigConvergence",
       async (phase) => {
         const result = await completePostCorePluginUpdate({
-          root,
-          nodeRunner,
-          runId: invokingRunId,
+          ...doctorParams,
           pluginUpdate: initialPluginUpdate,
-          freshDoctorRequired: initialPluginUpdate.changed,
-          yes: opts.yes === true,
-          json: opts.json === true,
           timeoutMs: lifecycle.budget("targetConfigConvergence"),
-          onWarnings: onDoctorWarnings,
-          onDoctorStep: (step) => lifecycle.recordDoctorStep(step),
         });
         const retiredWarnings = await readRetiredDeferredPluginMigrationWarnings(doctorWarnings);
         phase.assertCurrent();

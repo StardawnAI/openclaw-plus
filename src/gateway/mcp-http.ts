@@ -28,10 +28,8 @@ import {
   isAgentHarnessSessionKey,
   isAgentHarnessSessionStoreEntryProtected,
 } from "../sessions/agent-harness-session-key.js";
-import {
-  runInDetachedAsyncContext,
-  runWithTrackedCancellation,
-} from "../shared/async-work-scope.js";
+import { runWithTrackedCancellation } from "../shared/async-work-scope.js";
+import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import {
   registerMcpLoopbackClientGrantRevocationListener,
   revokeMcpLoopbackClientGrantsForRuntime,
@@ -173,14 +171,15 @@ async function startMcpLoopbackServer(
   const closeActiveSseResponses = (): void => {
     for (const res of activeSseResponses) {
       if (!res.destroyed && !res.writableEnded) {
-        const socket = res.socket;
         res.end();
-        socket?.end();
       }
     }
   };
 
   const httpServer = createHttpServer((req, res) => {
+    // Close after the complete response so pooled clients cannot race an idle timeout.
+    // Active JSON/SSE streams remain open until res.end().
+    res.setHeader("Connection", "close");
     const auth = validateMcpLoopbackRequest({
       req,
       res,
@@ -291,7 +290,7 @@ async function startMcpLoopbackServer(
               toolCache.resolve({
                 context: requestContext,
                 admittedRunContext: boundClientGrant?.admittedRunContext,
-                rootedExecution: boundClientGrant?.rootedExecution,
+                sessionEventSourcePolicy: boundClientGrant?.sessionEventSourcePolicy,
                 messageActionTurnCapability: boundClientGrant?.messageActionTurnCapability,
                 cfg,
                 signal: requestAbort.signal,
