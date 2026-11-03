@@ -15,7 +15,6 @@ import { compileMemoryWikiVault } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import { appendMemoryWikiLog } from "./log.js";
 import {
-  decodeWikiPageUtf8,
   isUnmanagedRawSourceSummary,
   parseWikiMarkdown,
   renderWikiMarkdown,
@@ -355,19 +354,17 @@ async function writeLintReport(rootDir: string, issues: MemoryWikiLintIssue[]): 
   const directoryPath = path.dirname(reportPath);
   await fs.mkdir(directoryPath, { recursive: true });
   const dirMode = (await fs.stat(directoryPath)).mode & 0o7777;
-  const originalBytes = await fs.readFile(reportPath).catch(() => null);
-  const original =
-    originalBytes === null
-      ? renderWikiMarkdown({
-          frontmatter: {
-            pageType: "report",
-            id: "report.lint",
-            title: "Lint Report",
-            status: "active",
-          },
-          body: "# Lint Report\n",
-        })
-      : decodeWikiPageUtf8(originalBytes, reportPath);
+  const original = await fs.readFile(reportPath, "utf8").catch(() =>
+    renderWikiMarkdown({
+      frontmatter: {
+        pageType: "report",
+        id: "report.lint",
+        title: "Lint Report",
+        status: "active",
+      },
+      body: "# Lint Report\n",
+    }),
+  );
   // The lint report is itself a wiki page. Keep its metadata fail-closed before
   // replacing the managed body so malformed frontmatter is never rewritten.
   parseWikiMarkdown(original);

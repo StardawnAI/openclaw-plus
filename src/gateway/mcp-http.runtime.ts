@@ -18,8 +18,8 @@ import {
 import { applyEmbeddedAttemptToolsAllow } from "../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
 import { loadNodeExecAvailability } from "../agents/node-exec-availability.js";
 import { pickSandboxToolPolicy } from "../agents/sandbox-tool-policy.js";
+import { prepareSessionCapabilityRead } from "../agents/subagents/spawn/subagent-session-store.js";
 import { normalizeToolPolicyName, toolPolicyRestrictsTools } from "../agents/tool-policy.js";
-import type { AnyAgentTool } from "../agents/tools/common.js";
 import { getInProcessGatewayToolContext } from "../agents/tools/in-process-gateway.js";
 import { hasSessionControlAuthority } from "../agents/tools/sessions-operator-authority.js";
 import type { SessionEventSourcePolicy } from "../auto-reply/reply/session-event-contract.js";
@@ -69,8 +69,6 @@ type McpLoopbackScopeParams = {
   authProfileStore?: AuthProfileStore;
   authProfileStoreAgentDir?: string;
   skillLibraryAuthoring?: SkillLibraryAuthoringCapability;
-  /** Run-owned configured MCP tools; only an exclusive CLI run supplies them. */
-  bundledTools?: readonly AnyAgentTool[];
   /** Host-selected coding owners for pre-grant projection only. */
   defaultMediatedToolNames?: readonly string[];
   messageActionTurnCapability?: string;
@@ -91,13 +89,13 @@ type McpLoopbackScopeParams = {
 
 type LoopbackToolsAllowMode = "exact" | "policy";
 
-function captureMcpLoopbackScope(params: McpLoopbackScopeParams) {
+async function captureMcpLoopbackScope(params: McpLoopbackScopeParams) {
   const canPreparePortal =
     params.context.senderIsOwner === false &&
     Boolean(params.context.sessionKey.trim() && params.context.sessionId);
   const gateway = canPreparePortal ? getInProcessGatewayToolContext() : undefined;
   const projection = gateway ? getSessionRowProjection(gateway) : undefined;
-  const assertCurrent = () => {
+  const prepared = await prepareSessionCapabilityRead(() => {
     params.signal?.throwIfAborted();
     assertCompletionGrantLineage(params);
     hasSessionControlAuthority(readAdmittedRunOperatorAuthority(params.admittedRunContext));
@@ -111,12 +109,16 @@ function captureMcpLoopbackScope(params: McpLoopbackScopeParams) {
     ) {
       throw new Error("MCP tool preparation belongs to a retired Gateway");
     }
+  });
+  return {
+    ...params,
+    projection,
+    assertCurrent: prepared.read,
+    [Symbol.dispose]: prepared.release,
   };
-  assertCurrent();
-  return { ...params, projection, assertCurrent };
 }
 
-type CapturedMcpLoopbackScope = ReturnType<typeof captureMcpLoopbackScope>;
+type CapturedMcpLoopbackScope = Awaited<ReturnType<typeof captureMcpLoopbackScope>>;
 
 function captureMcpCatalogSessionFacts(params: CapturedMcpLoopbackScope) {
   if (!params.projection) {
@@ -340,7 +342,6 @@ async function constructMcpLoopbackTools(
     authProfileStore: params.authProfileStore,
     onYield: params.onYield,
     skillWorkshop,
-    bundledTools: params.bundledTools,
     nativeCronCreatorToolAllowlist: context.nativeCronCreatorToolAllowlist ?? undefined,
     agentDir: params.authProfileStoreAgentDir,
     conversationReadOrigin: "delegated",
@@ -375,8 +376,9 @@ async function resolveMcpLoopbackCatalog(
   params: McpLoopbackScopeParams,
   mode: LoopbackToolsAllowMode,
 ): Promise<CachedScopedTools> {
+  using scope = await captureMcpLoopbackScope(params);
   const resolved = await resolvePairedComputerNodeScope(
-    await resolveNodeExecScope(captureMcpLoopbackScope(params), mode),
+    await resolveNodeExecScope(scope, mode),
     mode,
   );
   for (;;) {
@@ -482,7 +484,8 @@ export class McpLoopbackToolCache {
 
   async resolve(input: McpLoopbackScopeParams): Promise<CachedScopedTools> {
     const epoch = this.#epoch;
-    const nodeExecParams = await resolveNodeExecScope(captureMcpLoopbackScope(input), "exact");
+    using scope = await captureMcpLoopbackScope(input);
+    const nodeExecParams = await resolveNodeExecScope(scope, "exact");
     for (;;) {
       nodeExecParams.assertCurrent();
       // A policy-excluded computer scope has no inventory component. It can use

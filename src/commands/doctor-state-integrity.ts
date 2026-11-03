@@ -14,9 +14,9 @@ import {
   tryResolveDefaultAgentId,
 } from "../agents/agent-scope.js";
 import {
-  resolveSharedAuthStoreOwnership,
-  resolveSharedAuthStorePath,
-} from "../agents/auth-profiles/path-resolve.js";
+  prepareSharedAuthStoreOwnershipForNative as resolveSharedAuthStoreOwnership,
+  resolveNativeSharedAuthStorePath as resolveSharedAuthStorePath,
+} from "../agents/auth-profiles/path-resolve.native.js";
 import { resolveAuthProfileDatabasePath } from "../agents/auth-profiles/sqlite.js";
 import {
   clearWedgedSubagentRecoveryAbort,
@@ -346,8 +346,8 @@ function shouldRequireOAuthDir(cfg: OpenClawConfig, env: NodeJS.ProcessEnv): boo
   if ([...withPersistedAuth].some((channelId) => !withoutPersistedAuth.has(channelId))) {
     return true;
   }
-  // Legacy pairing allowlists lived under credentials/<channel>-allowFrom.json;
-  // only channels with an effective plugin owner need that directory's repair hint.
+  // Pairing allowlists are persisted under credentials/<channel>-allowFrom.json, so a
+  // channel id with no effective plugin owner can never pair and must not require the dir.
   for (const [channelId, channelCfg] of Object.entries(channels)) {
     const scopedChannelId = normalizeOptionalLowercaseString(channelId);
     if (!scopedChannelId || !withPersistedAuth.has(scopedChannelId)) {
@@ -528,6 +528,7 @@ export function stateIntegrityIssueToHealthFinding(
       return finding(
         `${issue.label} is missing.`,
         "Run `openclaw doctor --fix` to create missing runtime state directories.",
+        "error",
       );
     case "runtime-dir-not-writable":
       return finding(
@@ -742,7 +743,7 @@ export async function noteStateIntegrity(
         if (label !== "OAuth dir") {
           continue;
         }
-        warnings.push(`- ${label} missing (${displayDir}).`);
+        warnings.push(`- CRITICAL: ${label} missing (${displayDir}).`);
         const create = await prompter.confirmRuntimeRepair({
           message: `Create ${label} at ${displayDir}?`,
           initialValue: true,

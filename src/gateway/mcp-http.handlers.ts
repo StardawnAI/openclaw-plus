@@ -3,7 +3,6 @@
 import crypto from "node:crypto";
 import { ContentBlockSchema, type ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { runWithSessionMcpToolCallAuthority } from "../agents/agent-bundle-mcp-request-context.js";
 import { runBeforeToolCallHook, type HookContext } from "../agents/agent-tools.before-tool-call.js";
 import { extractToolErrorMessage } from "../agents/embedded-agent-tool-results.js";
 import { runAgentHarnessAfterToolCallHook } from "../agents/harness/hook-helpers.js";
@@ -66,8 +65,6 @@ export async function handleMcpJsonRpc(params: {
   message: JsonRpcRequest;
   tools: McpLoopbackTool[];
   toolSchema: McpToolSchemaEntry[];
-  /** Upstream guidance for bridged configured MCP servers, sent on initialize. */
-  serverInstructions?: string;
   hookContext?: HookContext;
   signal?: AbortSignal;
   /** Revalidate short-lived client authority immediately before side effects. */
@@ -99,7 +96,6 @@ export async function handleMcpJsonRpc(params: {
           name: MCP_LOOPBACK_SERVER_NAME,
           version: MCP_LOOPBACK_SERVER_VERSION,
         },
-        ...(params.serverInstructions ? { instructions: params.serverInstructions } : {}),
       });
     }
     case "notifications/initialized":
@@ -214,16 +210,7 @@ export async function handleMcpJsonRpc(params: {
         }
         let result: Awaited<ReturnType<typeof tool.execute>>;
         try {
-          const { authorizeToolCall } = params;
-          result = await runWithSessionMcpToolCallAuthority(
-            authorizeToolCall &&
-              (() => {
-                if (!authorizeToolCall()) {
-                  throw new Error("Tool call authorization expired");
-                }
-              }),
-            () => tool.execute(toolCallId, finalizedToolArgs, params.signal),
-          );
+          result = await tool.execute(toolCallId, finalizedToolArgs, params.signal);
         } catch (error) {
           throw tool.resultContentSource === "network"
             ? protectNetworkToolExecutionError(error, "tool execution failed", params.signal)

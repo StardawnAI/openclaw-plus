@@ -2,7 +2,7 @@
 // oxfmt-ignore
 import { usePreparedModelRuntimeHarness } from "./prepared-model-runtime.test-harness.js";
 import { describe, expect, it, vi } from "vitest";
-import { createDeferred, withinTest } from "../../test/helpers/promise.js";
+import { createDeferred } from "../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { modelsHandlers } from "../gateway/server-methods/models.js";
 import { registerGatewayModelCatalogPrivateAccess } from "../gateway/server-model-catalog-auth.js";
@@ -44,6 +44,7 @@ import {
 } from "../plugins/runtime/generation-scope.js";
 import { createPluginRecord } from "../plugins/status.test-helpers.js";
 import { AsyncWorkScope, isAsyncWorkScopeActiveHere } from "../shared/async-work-scope.js";
+import { prepareSharedAuthStoreOwnershipForNative } from "./auth-profiles/path-resolve.native.js";
 import type { RuntimeAuthProfileStore } from "./auth-profiles/types.js";
 import { PreparedModelRuntimeAuthPublicationOwner } from "./prepared-model-runtime-auth-publication.js";
 import {
@@ -120,6 +121,7 @@ async function listModels(config: OpenClawConfig) {
         makeContextParams({ loadGatewayModelCatalogSnapshot: loader }),
       ),
       getRuntimeConfig: getConfig,
+      getCommittedRuntimeConfig: getConfig,
     },
     respond,
   });
@@ -128,7 +130,7 @@ async function listModels(config: OpenClawConfig) {
 
 describe("configured plugin generation recovery", () => {
   it.each([true])(
-    "retains exact thinking policy across a stale mark (borrowed Gateway registry=%s)",
+    "retains exact thinking policy until registry replacement (borrowed Gateway registry=%s)",
     async (borrowed) => {
       const provider = "stale-policy-fixture";
       const entry = { provider, id: "reasoner", name: "Reasoner", reasoning: true };
@@ -209,7 +211,7 @@ describe("configured plugin generation recovery", () => {
           // Committing the Gateway successor, not staling the catalog, closes the lender.
           gateway.publish(ambient);
           expect(isPluginRegistryRetired(registry)).toBe(true);
-          expect(readThinking()?.defaultLevel).toBe("high");
+          expect(readThinking).toThrow(PluginInstanceUnavailableError);
           await disposePluginRegistryInstances(registry);
         }
       } finally {
@@ -533,74 +535,63 @@ describe("auth publication generation recovery", () => {
     }
   });
   it.for([false, true])(
-    "joins a publication superseding the fresh auth retry (fails: %s)",
-    async (fails, { signal }) => {
-      const { snapshot, config } = await publishOwner();
+    "re-prepares superseded fresh auth generations with a bound (exhausted: %s)",
+    async (exhausted) => {
+      const { input, snapshot } = await publishOwner();
       const owner = resolvePreparedModelRuntimeOwnerBySnapshot(snapshot)!;
-      const retryStarted = createDeferred();
-      const releaseRetry = createDeferred();
-      const successorStarted = createDeferred();
-      const releaseSuccessor = createDeferred();
-      const failure = new Error("successor credential acquisition failed");
+      mocks.loadAgentRuntimePluginRegistryHandle.mockImplementation(
+        (params) => params.reusableRegistry ?? createEmptyPluginRegistry(),
+      );
+      const superseded = new PreparedModelRuntimePublicationSupersededError(
+        "Accepted model catalog changed during runtime preparation",
+      );
       mocks.resolveAmbientCredentials
         .mockClear()
         .mockImplementationOnce(() => {
-          throw new PluginInstanceUnavailableError("synthetic retired generation");
+          throw superseded;
         })
-        .mockImplementationOnce(async () => {
-          retryStarted.resolve();
-          await releaseRetry.promise;
-          return {};
+        .mockImplementationOnce(() => {
+          throw superseded;
         })
-        .mockImplementationOnce(async () => {
-          successorStarted.resolve();
-          await releaseSuccessor.promise;
-          if (fails) {
-            throw failure;
+        .mockImplementation(() => {
+          if (exhausted) {
+            throw superseded;
           }
           return {};
         });
-      mocks.mutationListener?.({ agentDir: owner.input.agentDir, affectsInheritedStores: false });
-      const reader = prepareModelRuntimeSnapshot(owner.input);
-      const dispatch = loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" });
-      void reader.catch(() => {});
-      void dispatch.catch(() => {});
-      let successor: ReturnType<typeof publishPreparedModelRuntimeSnapshot> | undefined;
-      try {
-        await withinTest(retryStarted.promise, signal);
-        successor = publishPreparedModelRuntimeSnapshot(owner.input, {
-          force: true,
-          provenance: "configured",
-          catalogMode: "static",
+      const mutate = () =>
+        mocks.mutationListener?.({ agentDir: input.agentDir, affectsInheritedStores: false });
+      mutate();
+      if (exhausted) {
+        const result = await loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" }).catch(
+          (error: unknown) => error,
+        );
+        expect(result).toBeInstanceOf(PreparedModelRuntimePublicationSupersededError);
+        expect(result).toMatchObject({
+          message: expect.stringContaining("after 2 fresh-generation retries"),
         });
-        void successor.catch(() => {});
-        releaseRetry.resolve();
-        await withinTest(successorStarted.promise, signal);
-        releaseSuccessor.resolve();
-        if (fails) {
-          await expect(successor).rejects.toBe(failure);
-          await expect(reader).rejects.toThrow(failure.message);
-          await expect(dispatch).rejects.toThrow(failure.message);
-        } else {
-          const latest = await successor;
-          await expect(reader).resolves.toBe(latest);
-          await expect(dispatch).resolves.toMatchObject({ agentId: "default", config });
-          expect(latest.isCurrent()).toBe(true);
-          await listModels(config);
-          expect(mocks.warn).not.toHaveBeenCalled();
-        }
-        expect(mocks.resolveAmbientCredentials).toHaveBeenCalledTimes(3);
-      } finally {
-        releaseRetry.resolve();
-        releaseSuccessor.resolve();
-        await Promise.allSettled([reader, dispatch, successor]);
+        expect(owner.refreshError).toBeInstanceOf(PreparedModelRuntimePublicationSupersededError);
+        expect(owner.catalogRecovery?.error).toBe(owner.refreshError);
+        expect(mocks.warn).toHaveBeenCalledOnce();
+      } else {
+        await expect(
+          loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" }),
+        ).resolves.toMatchObject({ agentId: "default" });
+        expect((await prepareModelRuntimeSnapshot(input)).isCurrent()).toBe(true);
+        expect(mocks.warn).not.toHaveBeenCalled();
       }
+      expect(mocks.resolveAmbientCredentials).toHaveBeenCalledTimes(3);
+      mocks.resolveAmbientCredentials.mockImplementation(() => ({}));
+      await expect(
+        loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" }),
+      ).resolves.toMatchObject({ agentId: "default" });
+      expect((await prepareModelRuntimeSnapshot(input)).isCurrent()).toBe(true);
     },
   );
 });
 
 describe("prepared model auth publication", () => {
-  it("retains the prepared owner on bookkeeping and refreshes on auth availability changes", async () => {
+  it("retains the prepared owner on bookkeeping and availability, but refreshes on credentials", async () => {
     const snapshots = await vi.importActual<typeof import("./auth-profiles/runtime-snapshots.js")>(
       "./auth-profiles/runtime-snapshots.js",
     );
@@ -610,6 +601,7 @@ describe("prepared model auth publication", () => {
       version: 1,
       profiles: { "test:primary": { type: "token", provider: "test", token: "synthetic-token" } },
     };
+    prepareSharedAuthStoreOwnershipForNative(fixture.state.env);
     snapshots.setRuntimeAuthProfileStoreSnapshot(store, agentDir);
     const initial = await publishPreparedModelRuntimeSnapshot(input);
     const events = vi.fn();
@@ -636,6 +628,18 @@ describe("prepared model auth publication", () => {
         {
           ...store,
           usageStats: { "test:primary": { cooldownUntil: Date.now() + 60_000 } },
+        },
+        agentDir,
+      );
+      expect(await prepareModelRuntimeSnapshot(input)).toBe(initial);
+      expect(events).not.toHaveBeenCalled();
+      expect(mocks.ensureOpenClawModelsJson).toHaveBeenCalledOnce();
+      snapshots.updateRuntimeAuthProfileStoreSnapshot(
+        {
+          ...store,
+          profiles: {
+            "test:primary": { type: "token", provider: "test", token: "rotated-synthetic-token" },
+          },
         },
         agentDir,
       );

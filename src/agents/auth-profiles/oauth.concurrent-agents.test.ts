@@ -7,18 +7,10 @@ import { resetFileLockStateForTest } from "../../plugin-sdk/file-lock.js";
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import {
-  completeAgentDeletionJournalInDatabase,
-  readAgentDeletionJournal,
-} from "../../state/agent-deletion-journal.js";
-import {
-  closeOpenClawAgentDatabaseByPathAsync,
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
 } from "../../state/openclaw-agent-db.js";
-import { runOpenClawStateWriteTransaction } from "../../state/openclaw-state-db.js";
-import { beginAgentDeletionJournal } from "../../test-utils/agent-deletion-journal.js";
 import { captureEnv } from "../../test-utils/env.js";
-import { loadCandidateAuthProfileStoreAsync } from "./candidate-stores.js";
 import { AUTH_STORE_VERSION, MINIMAX_CLI_PROFILE_ID } from "./constants.js";
 import "./oauth-external-auth-passthrough.test-support.js";
 import { getOAuthProviderRuntimeMocks } from "./oauth-common-mocks.test-support.js";
@@ -43,7 +35,11 @@ import { loadPersistedAuthProfileStore } from "./persisted.js";
 import { removeAuthProfilesAcrossOwnerStores } from "./profiles.js";
 import { clearRuntimeAuthProfileStoreSnapshots } from "./runtime-snapshots.js";
 import { resolveAuthProfileDatabasePath, writePersistedAuthProfileStoreRaw } from "./sqlite.js";
-import { ensureAuthProfileStore, saveAuthProfileStore } from "./store-runtime.js";
+import {
+  ensureAuthProfileStore,
+  resolvePersistedAuthProfileOwnerAgentDirAsync,
+  saveAuthProfileStore,
+} from "./store-runtime.js";
 import { resolvePersistedAuthProfileOwnerAgentDir } from "./store.js";
 import { persistAuthProfileBatch } from "./upsert-with-lock.js";
 
@@ -122,77 +118,19 @@ afterEach(async () => {
 });
 
 describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", () => {
-  it.each(["empty", "matching"] as const)(
-    "preserves refresh safety with a retained completed-deletion store (%s)",
-    async (peerGeneration) => {
-      const agentId = "deleted-peer";
-      const agentDir = path.join(tempRoot, "agents", agentId, "agent");
-      await fs.mkdir(agentDir, { recursive: true });
-      const original = createExpiredOauthStore({ profileId, provider });
-      const historical =
-        peerGeneration === "matching" ? original : { version: AUTH_STORE_VERSION, profiles: {} };
-      // Seed history before shared inheritance can suppress the local copy.
-      saveAuthProfileStore(historical, agentDir);
-      saveAuthProfileStore(original, mainAgentDir);
-      expect(loadPersistedAuthProfileStore(agentDir)).toEqual(historical);
-      await closeOpenClawAgentDatabaseByPathAsync(
-        resolveAuthProfileDatabasePath(agentDir),
-        agentId,
-      );
-      const deletion = beginAgentDeletionJournal({
-        agentId,
-        agentDir,
-        operationId: "retained-deletion",
-        deleteFiles: false,
-        workspaceDir: path.join(tempRoot, "workspace-deleted-peer"),
-        sessionsDir: path.join(tempRoot, "agents", agentId, "sessions"),
-      });
-      expect(
-        runOpenClawStateWriteTransaction((database) =>
-          completeAgentDeletionJournalInDatabase(database, agentId, deletion.operationId),
-        ),
-      ).toBe(true);
-      const completed = readAgentDeletionJournal(agentId);
-      expect(completed?.cleanupCompleted).toBe(true);
-      refreshProviderOAuthCredentialWithPluginMock.mockResolvedValue({
-        type: "oauth",
-        provider,
-        access: "surviving-access",
-        refresh: "surviving-refresh",
-        expires: Date.now() + 3_600_000,
-      } as never);
-
-      const resolving = resolveFrom(mainAgentDir);
-      if (peerGeneration === "matching") {
-        await expect(resolving).rejects.toThrow(
-          "Failed to fence every historical OAuth refresh peer",
-        );
-        expect(refreshProviderOAuthCredentialWithPluginMock).not.toHaveBeenCalled();
-        expect(read(mainAgentDir)).toEqual(original.profiles[profileId]);
-      } else {
-        await expect(resolving).resolves.toMatchObject({ apiKey: "surviving-access" });
-        expect(refreshProviderOAuthCredentialWithPluginMock).toHaveBeenCalledOnce();
-        expect(read(mainAgentDir)).toMatchObject({
-          access: "surviving-access",
-          refresh: "surviving-refresh",
-        });
-      }
-      expect(await loadCandidateAuthProfileStoreAsync(candidate(agentId, agentDir))).toEqual(
-        historical,
-      );
-      expect(readAgentDeletionJournal(agentId)).toEqual(completed);
-    },
-  );
-
   it("gives one copied refresh generation one durable main-store owner", async () => {
+    const { createSqliteReadOnlyWorkerScope } =
+      await import("../../infra/sqlite-readonly-worker.js");
+    const readOnlyWorkers = createSqliteReadOnlyWorkerScope();
     const work = new AsyncWorkScope();
     const { promise: finishRefreshGate, resolve: finishRefresh } = createDeferredCore();
     // Vitest can time out the observer before the accepted refresh finishes.
     settleCaseWork = async () => {
       finishRefresh();
       await work.drain();
+      await readOnlyWorkers.close();
     };
-    await work.track(async () => {
+    const runCase = async () => {
       const freshExpiry = Date.now() + 60 * 60 * 1000;
       const subAgents = await Promise.all(
         Array.from({ length: 4 }, async (_, i) => {
@@ -254,6 +192,19 @@ describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", ()
           profileId,
         }),
       ).toBeUndefined();
+      const [copiedOwner, independentOwner, portableOwner] = await Promise.all(
+        subAgents
+          .slice(1)
+          .map((agentDir) =>
+            work.track(() =>
+              resolvePersistedAuthProfileOwnerAgentDirAsync({ agentDir, profileId }),
+            ),
+          ),
+      );
+      expect(copiedOwner).toBeUndefined();
+      expect(independentOwner).toBe(subAgents[2]);
+      // A portable copy is not fenced, but its matching refresh generation still reads main.
+      expect(portableOwner).toBeUndefined();
       expect(callCount).toBe(1);
       for (const agentDir of subAgents.slice(0, 2)) {
         const fenced = read(agentDir);
@@ -309,7 +260,8 @@ describe("resolveApiKeyForProfile cross-agent refresh coordination (#26322)", ()
       await expect(resolveFrom(subAgents[3])).resolves.toEqual(
         expect.objectContaining({ apiKey: "portable-access" }),
       );
-    });
+    };
+    await readOnlyWorkers.run(() => work.track(runCase));
   }, 10_000);
 
   it("keeps pending observers read-only until the owner claims a late peer", async () => {

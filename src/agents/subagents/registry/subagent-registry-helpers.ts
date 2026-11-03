@@ -330,14 +330,12 @@ export async function safeRemoveAttachmentsDir(
   try {
     await cleanupMaterializedSubagentAttachments({
       childSessionKey: entry.childSessionKey,
+      childAgentId: entry.childAgentId,
       attachmentId: entry.attachmentId,
       isCurrent,
     });
     return true;
-  } catch (error) {
-    defaultRuntime.log(
-      `[warn] Subagent attachment cleanup failed (${entry.runId}): ${String(error)}`,
-    );
+  } catch {
     return false;
   }
 }

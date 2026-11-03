@@ -4,18 +4,16 @@ import { getCompatibleProcessGatewayPluginMetadataSnapshot } from "../plugins/cu
 import { getGatewayPluginMetadataSnapshot } from "../plugins/current-plugin-metadata-state.js";
 import { loadInstalledPluginIndexInstallRecordsSync } from "../plugins/installed-plugin-index-record-reader.js";
 import {
-  preparePersistedInstalledPluginIndexCacheEntry,
   preparePluginMetadataMachineState,
+  preparePluginMetadataMachineStateAsync,
 } from "../plugins/installed-plugin-index-record-state.js";
 import {
   loadPluginManifestRegistryCore,
   type PluginManifestRegistry,
 } from "../plugins/manifest-registry.js";
 import {
-  cachePluginMetadataSnapshot,
   createPluginCache,
   getPluginCache,
-  readPluginMetadataSnapshotCache,
   retainPluginCache,
   withPluginCache,
 } from "../plugins/plugin-cache.js";
@@ -140,25 +138,24 @@ export async function resolveConfigWidePluginMetadataSnapshotAsync(
   const release = retainPluginCache(cache);
   try {
     return await withPluginCache(cache, async () => {
-      // Policy determines the snapshot cache key before installed-index access.
-      const activateDiscovery = await prepareBundledDiscoveryMode(captured.env);
+      // Policy and inventory share one worker read before synchronous metadata derivation.
+      const activateDiscovery =
+        captured.installRecords === undefined
+          ? await preparePluginMetadataMachineStateAsync({
+              env: captured.env,
+              stateDir: captured.stateDir,
+            })
+          : await prepareBundledDiscoveryMode(captured.env);
       activateDiscovery();
       const preparedCurrent = resolveReusableGatewayPluginMetadataSnapshot(captured);
       if (preparedCurrent) {
         return preparedCurrent;
       }
       const { key } = resolveConfigWideMetadataSelection(captured);
-      const existing = readPluginMetadataSnapshotCache(key);
+      const existing = cache.metadata.snapshots.get(key);
       if (existing) {
         activateDiscovery();
         return existing;
-      }
-      if (captured.installRecords === undefined) {
-        const installed = await preparePersistedInstalledPluginIndexCacheEntry({
-          env: captured.env,
-          stateDir: captured.stateDir,
-        });
-        installed.assertCurrent();
       }
       activateDiscovery();
       // Parsing, recovery, trust checks and persisted/derived selection retain one owner.
@@ -203,12 +200,13 @@ export function resolveConfigWidePluginMetadataSnapshot(
       });
     }
     const { key, workspaceDirs } = resolveConfigWideMetadataSelection(params);
-    const cached = readPluginMetadataSnapshotCache(key);
+    const cache = getPluginCache();
+    const cached = cache.metadata.snapshots.get(key);
     if (cached) {
       return cached;
     }
     const snapshot = resolveConfigWidePluginMetadataSnapshotImpl(params, workspaceDirs);
-    cachePluginMetadataSnapshot(key, snapshot);
+    cache.metadata.snapshots.set(key, snapshot);
     return snapshot;
   });
 }

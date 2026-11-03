@@ -41,7 +41,6 @@ import { defaultRuntime } from "../../runtime.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { assertOpenClawStateWriteAllowedAtPath } from "../../state/openclaw-state-ownership.js";
 import { formatCliCommand } from "../command-format.js";
-import { getGatewayChannelWarnings } from "../daemon-cli/restart-health-diagnostics.js";
 import {
   confirmGatewayReachable,
   resolveGatewayRestartProbeContext,
@@ -58,9 +57,15 @@ import {
 import { updateFinalizeCommand } from "./update-command-finalize.js";
 import { refuseImmutableUpdateActivation } from "./update-command-immutable.js";
 import { resolveServiceRefreshEnv } from "./update-command-service-env.js";
+import { updateMaintenanceError } from "./update-maintenance-error.js";
 
-/** Public repair can clear a stale ledger without entering post-core maintenance. */
-export async function updateRepairCommand(opts: UpdateFinalizeOptions): Promise<void> {
+export function updateRepairCommand(opts: UpdateFinalizeOptions): Promise<void> {
+  return repairUpdate(opts).catch((error: unknown) => {
+    throw updateMaintenanceError(error);
+  });
+}
+
+async function repairUpdate(opts: UpdateFinalizeOptions): Promise<void> {
   // Recovery refusal precedes discovery; later mutation checks still revalidate.
   await assertUpdateRecoveryAdmission({ env: process.env });
   const discoveredRoot = await resolveUpdateRoot();
@@ -220,7 +225,6 @@ export async function updateRepairCommand(opts: UpdateFinalizeOptions): Promise<
   const [gateway, http, expectedVersion, expectedBuildId] = await Promise.all([
     confirmGatewayReachable({ port, ...context, env }),
     waitForGatewayHttpReadiness({
-      requireChannelHealth: false,
       config: context.config,
       port,
       attempts: 1,
@@ -239,7 +243,9 @@ export async function updateRepairCommand(opts: UpdateFinalizeOptions): Promise<
     gateway.gatewayVersion !== expectedVersion ||
     gateway.gatewayBuildId !== expectedBuildId ||
     gateway.activatedPluginErrors.length ||
-    !(http.coreReady ?? (http.healthz === 200 && http.readyz === 200))
+    gateway.channelProbeErrors.length ||
+    http.healthz !== 200 ||
+    http.readyz !== 200
   ) {
     return await updateFinalizeCommand(opts, recoveryRunIds);
   }
@@ -285,15 +291,7 @@ export async function updateRepairCommand(opts: UpdateFinalizeOptions): Promise<
   const message = reconciled.length
     ? `Gateway is healthy. Reconciled ${reconciled.length} abandoned update run${reconciled.length === 1 ? "" : "s"}. No maintenance or service restart was needed.`
     : "Gateway is healthy. Abandoned update runs are already reconciled. No maintenance or service restart was needed.";
-  const warnings = getGatewayChannelWarnings(gateway, http).map(({ id }) => id);
-  reportRepairResult(
-    opts,
-    acknowledged,
-    message +
-      (warnings.length
-        ? ` Channel health warnings: ${warnings.join(", ")}. Run openclaw channels status --probe.`
-        : ""),
-  );
+  reportRepairResult(opts, acknowledged, message);
 }
 
 function reportRepairResult(

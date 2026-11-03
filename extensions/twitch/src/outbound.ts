@@ -5,7 +5,6 @@ import { getClientManager } from "./client-manager-registry.js";
 import { resolveTwitchAccountContext } from "./config.js";
 import { TWITCH_CHAT_MESSAGE_LIMIT } from "./constants.js";
 import { sendMessageTwitchInternal } from "./send.js";
-import { isTwitchDirectMessageTarget, normalizeTwitchMessagingTarget } from "./target.js";
 import type {
   ChannelOutboundAdapter,
   ChannelOutboundContext,
@@ -36,10 +35,10 @@ export const twitchOutbound = {
     const hasWildcard = allowListRaw.includes("*");
     const allowList = allowListRaw
       .filter((entry: string) => entry !== "*")
-      .map((entry: string) => normalizeTwitchMessagingTarget(entry))
+      .map((entry: string) => normalizeTwitchChannel(entry))
       .filter((entry): entry is string => entry.length > 0);
 
-    const normalizedTo = normalizeTwitchMessagingTarget(trimmed);
+    const normalizedTo = normalizeTwitchChannel(trimmed);
     const restricted = mode === "implicit" || mode === "heartbeat";
     if (
       normalizedTo &&
@@ -74,16 +73,8 @@ export const twitchOutbound = {
       );
     }
 
-    // Explicit DM/user addresses are unsupported and must not be delivered to the
-    // account channel. A channel target that normalizes to empty (for example a bare
-    // "#") still keeps the sender's default-channel fallback.
-    const target = to.trim();
-    if (isTwitchDirectMessageTarget(target)) {
-      throw new Error("Delivering to Twitch requires target <channel-name>");
-    }
-    const deliveryChannel =
-      normalizeTwitchMessagingTarget(target) || normalizeTwitchChannel(account.channel);
-    if (!deliveryChannel) {
+    const channel = to || account.channel;
+    if (!channel) {
       throw new Error("No channel specified and no default channel in account config");
     }
 
@@ -93,8 +84,13 @@ export const twitchOutbound = {
           "Required: username, clientId, and accessToken (config or env for default account).",
       );
     }
+    // A target that normalizes to empty still uses the account's default channel.
+    const deliveryChannel = normalizeTwitchChannel(channel) || account.channel;
+    if (!deliveryChannel) {
+      throw new Error("No channel specified and no default channel in account config");
+    }
     const result = await sendMessageTwitchInternal({
-      channel: deliveryChannel,
+      channel: normalizeTwitchChannel(deliveryChannel),
       text,
       cfg,
       account,

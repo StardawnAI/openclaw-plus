@@ -38,8 +38,12 @@ export async function hasRetainedManagedNpmInstallCandidates(
 }
 
 function markerPreservesPackageFiles(markerPath: string): boolean {
-  const marker: unknown = JSON.parse(fs.readFileSync(markerPath, "utf8"));
-  return isRecord(marker) && marker.reason === RETAINED_MANAGED_NPM_KEEP_FILES_REASON;
+  try {
+    const marker: unknown = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+    return isRecord(marker) && marker.reason === RETAINED_MANAGED_NPM_KEEP_FILES_REASON;
+  } catch {
+    return false;
+  }
 }
 
 export function resolveRetainedManagedNpmInstallPackageInfo(packageDir: string): {

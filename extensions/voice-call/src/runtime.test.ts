@@ -32,7 +32,7 @@ const mocks = vi.hoisted(() => ({
   realtimeHandlerCtorArgs: [] as unknown[][],
   realtimeHandlerRegisterToolHandler: vi.fn<RealtimeCallHandler["registerToolHandler"]>(),
   realtimeHandlerSetPublicUrl: vi.fn(),
-  resolveConfiguredRealtimeVoiceProvider: vi.fn(),
+  resolveConfiguredRealtimeVoiceProviderAsync: vi.fn(),
   resolveRealtimeFastContextConsult: vi.fn(),
   actualRealtimeFastContextConsult: undefined as
     | typeof import("openclaw/plugin-sdk/realtime-voice").resolveRealtimeVoiceFastContextConsult
@@ -108,8 +108,9 @@ vi.mock("./webhook.js", () => ({
   },
 }));
 
+// mock-isolation: Keep provider registration and credential state outside runtime tests.
 vi.mock("./realtime-voice.runtime.js", () => ({
-  resolveConfiguredRealtimeVoiceProvider: mocks.resolveConfiguredRealtimeVoiceProvider,
+  resolveConfiguredRealtimeVoiceProviderAsync: mocks.resolveConfiguredRealtimeVoiceProviderAsync,
 }));
 
 vi.mock("openclaw/plugin-sdk/realtime-voice", async (importOriginal) => {
@@ -187,7 +188,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     mocks.realtimeHandlerCtorArgs.length = 0;
     mocks.realtimeHandlerRegisterToolHandler.mockReset();
     mocks.realtimeHandlerSetPublicUrl.mockReset();
-    mocks.resolveConfiguredRealtimeVoiceProvider.mockReturnValue({
+    mocks.resolveConfiguredRealtimeVoiceProviderAsync.mockReturnValue({
       provider: { id: "openai" },
       providerConfig: { model: "gpt-realtime" },
     });
@@ -405,7 +406,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     expect(mocks.realtimeHandlerCtorArgs[0]?.[4]).toBe(
       mocks.webhookGetStreamDisconnectLifecycle.mock.results[0]?.value,
     );
-    expect(mocks.resolveConfiguredRealtimeVoiceProvider).not.toHaveBeenCalled();
+    expect(mocks.resolveConfiguredRealtimeVoiceProviderAsync).not.toHaveBeenCalled();
     if (typeof resolveCallRegistration !== "function") {
       throw new Error("expected per-call realtime registration resolver");
     }
@@ -415,15 +416,15 @@ describe("createVoiceCallRuntime lifecycle", () => {
       from: "+15550001111",
       to: "+15550002222",
     };
-    expect(() =>
+    await expect(
       resolveCallRegistration({
         ...outboundContact,
         callId: "unowned",
         sessionKey: "agent:operator:voice:unowned",
       }),
-    ).toThrow("no recorded agent owner");
-    expect(mocks.resolveConfiguredRealtimeVoiceProvider).not.toHaveBeenCalled();
-    const defaultRegistration = resolveCallRegistration({
+    ).rejects.toThrow("no recorded agent owner");
+    expect(mocks.resolveConfiguredRealtimeVoiceProviderAsync).not.toHaveBeenCalled();
+    const defaultRegistration = await resolveCallRegistration({
       ...outboundContact,
       callId: "call-default",
       agentId: "operator",
@@ -431,7 +432,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     expect(defaultRegistration.agentId).toBe("operator");
     expect(defaultRegistration.instructions).toContain("- Name: Main Voice");
     expect(defaultRegistration.instructions.match(/Agent context:/g)).toHaveLength(1);
-    const briefRegistration = resolveCallRegistration({
+    const briefRegistration = await resolveCallRegistration({
       callId: "call-brief",
       direction: "outbound",
       from: "+15550001111",
@@ -443,7 +444,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     expect(briefRegistration.instructions).toContain("No paid work");
     expect(defaultRegistration.instructions).not.toContain("Arrange a plumber visit");
 
-    const supportRegistration = resolveCallRegistration({
+    const supportRegistration = await resolveCallRegistration({
       ...outboundContact,
       callId: "call-support",
       agentId: "support",
@@ -453,7 +454,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     expect(supportRegistration.instructions).toContain("- Name: Support Voice");
     expect(supportRegistration.instructions).not.toContain("Main Voice");
 
-    const unknownRegistration = resolveCallRegistration({
+    const unknownRegistration = await resolveCallRegistration({
       ...outboundContact,
       callId: "call-unknown",
       agentId: "unknown",
@@ -586,10 +587,7 @@ describe("createVoiceCallRuntime lifecycle", () => {
     await createVoiceCallRuntime({
       scheduler: createTestPluginServiceScheduler(),
       config,
-      // The configured model differs from the runtime default so the consult proves inheritance.
-      coreConfig: {
-        agents: { defaults: { model: { primary: "anthropic/claude-opus-5-5" } } },
-      } as OpenClawConfig,
+      coreConfig: {} as OpenClawConfig,
       agentRuntime: agentRuntime as never,
     });
 
@@ -624,8 +622,8 @@ describe("createVoiceCallRuntime lifecycle", () => {
     expect(consultParams.spawnedBy).toBe("agent:main:discord:channel:general");
     expect(consultParams.messageProvider).toBe("voice");
     expect(consultParams.lane).toBe("voice");
-    expect(consultParams.provider).toBe("anthropic");
-    expect(consultParams.model).toBe("claude-opus-5-5");
+    expect(consultParams.provider).toBe("openai");
+    expect(consultParams.model).toBe("gpt-5.4");
     expect(consultParams.toolsAllow).toEqual([
       "read",
       "web_search",

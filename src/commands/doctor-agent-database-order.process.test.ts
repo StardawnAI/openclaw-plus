@@ -246,6 +246,7 @@ it.for(["current", "historical-v1", "lost-journal"] as const)(
           session: { store: path.join(sessionDir, "sessions.json") },
         }),
       );
+      const agentDatabaseBytes = databasePaths.map((pathname) => fs.readFileSync(pathname));
       const args = [
         "doctor",
         "--fix",
@@ -258,18 +259,26 @@ it.for(["current", "historical-v1", "lost-journal"] as const)(
       );
       const output = stripVTControlCharacters(`${first.stdout}\n${first.stderr}`);
       if (sharedState === "lost-journal") {
-        expect(first.code, output).toBe(0);
+        expect(first.code, output).toBe(1);
         expect(doctorResultPath).toBeDefined();
         const result = await consumeUpdatePostInstallDoctorResult(
           doctorResultPath!,
           doctorResultOptions,
         );
-        expect(result, output).toMatchObject({ status: "ok" });
-        expect(result?.maintenanceRefusal).toBeUndefined();
-        expect(output).toContain("Automatically restored agent main");
-        expect(output).toContain("Automatically restored agent worker");
-        expect(output).not.toContain("held back");
-        expect(output).toContain("Doctor complete.");
+        expect(result, output).toMatchObject({
+          status: "error",
+          maintenanceRefusal: { kind: "data-at-risk", reason: "incomplete-migration" },
+        });
+        expect(output).toContain("Agent deletion journal reconstructed");
+        expect(output).toContain("held back");
+        expect(output).toContain("openclaw agents add");
+        expect(output).toContain("--non-interactive");
+        expect(output).not.toContain("Doctor complete.");
+        for (const [index, pathname] of databasePaths.entries()) {
+          expect(output).toContain(pathname);
+          expect(fs.readFileSync(pathname)).toEqual(agentDatabaseBytes[index]);
+        }
+        return;
       }
       expect(first.code, output).toBe(0);
       expect(output).not.toMatch(
@@ -356,7 +365,6 @@ it.for(["current", "historical-v1", "lost-journal"] as const)(
       );
       const repeatedOutput = `${second.stdout}\n${second.stderr}`;
       expect(second.code, repeatedOutput).toBe(0);
-      expect(repeatedOutput).not.toContain("Automatically restored");
       expect(repeatedOutput).not.toMatch(
         /Upgraded agent database schema|Migrated media persistence|Migrated auth profile JSON|Transcript events: imported=[1-9]/u,
       );

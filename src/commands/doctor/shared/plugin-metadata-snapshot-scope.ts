@@ -1,6 +1,5 @@
 import { resolveConfigWidePluginManifestRegistry } from "../../../config/io.plugin-metadata.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
-import { pruneMapToMaxSize } from "../../../infra/map-size.js";
 import {
   withPluginMetadataSnapshotScope,
   type PluginMetadataSnapshotScopeRunner,
@@ -9,8 +8,8 @@ import { withDeferredPluginDoctorMigrations } from "../../../plugins/doctor-cont
 import {
   createPluginCache,
   getPluginMetadataSnapshotCache,
-  MAX_CACHED_PLUGIN_METADATA_SNAPSHOTS,
   withPluginCache,
+  type PluginCache,
 } from "../../../plugins/plugin-cache.js";
 import {
   isPluginMetadataSnapshotCompatible,
@@ -24,7 +23,7 @@ export type DoctorPluginMetadataSnapshotState = {
   inventoryChanged?: boolean;
 };
 
-type DoctorPluginMetadataSnapshotScope = {
+type DoctorPluginMetadataSnapshotScope = AsyncDisposable & {
   run: PluginMetadataSnapshotScopeRunner;
   invalidate: () => void;
 };
@@ -64,7 +63,13 @@ export function createDoctorPluginMetadataSnapshotScope(params: {
   const env = params.env ?? process.env;
   const snapshotsByWorkspace = new Map<string | undefined, PluginMetadataSnapshot>();
   let currentBaseSnapshot: PluginMetadataSnapshot | undefined;
-  let cache = createPluginCache();
+  const ownedCaches = new Set<PluginCache>();
+  const createOwnedCache = () => {
+    const cache = createPluginCache();
+    ownedCaches.add(cache);
+    return cache;
+  };
+  let cache = createOwnedCache();
 
   const refreshBaseSnapshot = () => {
     const nextBaseSnapshot = params.getBaseSnapshot?.();
@@ -74,7 +79,7 @@ export function createDoctorPluginMetadataSnapshotScope(params: {
     currentBaseSnapshot = nextBaseSnapshot;
     cache = nextBaseSnapshot
       ? getPluginMetadataSnapshotCache(nextBaseSnapshot)
-      : createPluginCache();
+      : createOwnedCache();
     snapshotsByWorkspace.clear();
     if (nextBaseSnapshot && nextBaseSnapshot.pluginIds === undefined) {
       snapshotsByWorkspace.set(nextBaseSnapshot.workspaceDir, nextBaseSnapshot);
@@ -109,9 +114,7 @@ export function createDoctorPluginMetadataSnapshotScope(params: {
       config,
       env,
     });
-    snapshotsByWorkspace.delete(workspaceDir);
     snapshotsByWorkspace.set(workspaceDir, snapshot);
-    pruneMapToMaxSize(snapshotsByWorkspace, MAX_CACHED_PLUGIN_METADATA_SNAPSHOTS);
     return snapshot;
   };
 
@@ -130,13 +133,18 @@ export function createDoctorPluginMetadataSnapshotScope(params: {
   };
 
   return {
+    async [Symbol.asyncDispose]() {
+      // Borrowed snapshots retain their caller's lifetime; only retire our private inventories.
+      await Promise.all([...ownedCaches].map((owned) => owned[Symbol.asyncDispose]()));
+      ownedCaches.clear();
+    },
     run,
     invalidate: () => {
       // Inventory repairs invalidate every derived workspace generation even
       // when updater preflight intentionally left the base snapshot absent.
       currentBaseSnapshot = undefined;
       snapshotsByWorkspace.clear();
-      cache = createPluginCache();
+      cache = createOwnedCache();
     },
   };
 }

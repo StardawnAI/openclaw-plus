@@ -93,8 +93,6 @@ setInterval(() => {}, 1000);`,
     await fs.writeFile(
       configPath,
       JSON.stringify({
-        // This synthetic process backend has no MCP tool-policy projection.
-        tools: { fs: { workspaceOnly: false } },
         agents: {
           defaults: {
             model: { primary: "construction-cli/model-a" },

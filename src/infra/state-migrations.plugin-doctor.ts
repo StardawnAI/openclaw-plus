@@ -152,7 +152,6 @@ export async function collectPluginDoctorStateMigrationPlans(
   const otherPhasePluginIds = new Set<string>();
   const requiredPluginIds = new Set<string>();
   const statelessPluginIds = new Set<string>();
-  const unavailablePluginIds = new Set<string>();
   const collected: PluginDoctorPlanCollection = {
     plans,
     inspectedPluginIds,
@@ -172,11 +171,6 @@ export async function collectPluginDoctorStateMigrationPlans(
       validateDeclarations: params.validateDeclarations,
       onInspectedPlugin: (pluginId) => inspectedPluginIds.add(pluginId),
       onInspectedStatelessPlugin: (pluginId) => statelessPluginIds.add(pluginId),
-      onUnavailablePlugin: (pluginId, error) => {
-        unavailablePluginIds.add(pluginId);
-        requiredPluginIds.add(pluginId);
-        params.warnings?.push(`Plugin ${pluginId} is not prepared: ${error.message}`);
-      },
     });
   } catch (error) {
     if (!(error instanceof PluginDoctorStateMigrationDeclarationError)) {
@@ -209,9 +203,7 @@ export async function collectPluginDoctorStateMigrationPlans(
   if (params.plannedActions) {
     const refusal = validatePluginDoctorPlanOrder({
       actions: entries.map(({ pluginId, migration }) => ({ pluginId, id: migration.id })),
-      plannedActions: params.plannedActions.filter(
-        (action) => !unavailablePluginIds.has(action.pluginId),
-      ),
+      plannedActions: params.plannedActions,
     });
     if (refusal) {
       params.warnings?.push(refusal);

@@ -1,5 +1,5 @@
 import { createSubsystemLogger } from "openclaw/plugin-sdk/logging-core";
-import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
+import { captureRuntimeConfigAsyncReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import {
   createBrowserControlContext,
   ensureBrowserControlRuntime,
@@ -9,6 +9,7 @@ import {
 } from "./browser-control-state.js";
 import { loadBrowserConfigForRuntimeRefresh } from "./browser/config-refresh-source.js";
 import { resolveBrowserConfig, resolveProfile } from "./browser/config.js";
+import { ensureBrowserControlAuth } from "./browser/control-auth.js";
 import {
   getExtensionRelayModule,
   getGatewayExtensionRelayModule,
@@ -26,7 +27,7 @@ async function startBrowserControlServiceUnlocked(): Promise<BrowserServerState 
     return current;
   }
 
-  const cfg = getRuntimeConfig();
+  const cfg = await captureRuntimeConfigAsyncReader()();
   const browserCfg = loadBrowserConfigForRuntimeRefresh();
   if (!resolveBrowserPluginEnableState(cfg).enabled) {
     return null;
@@ -35,8 +36,15 @@ async function startBrowserControlServiceUnlocked(): Promise<BrowserServerState 
   if (!resolved.enabled) {
     return null;
   }
-  // This in-process service has no HTTP listener, so it needs no browser credential. Listeners
-  // (the HTTP server and sandbox bridges) own theirs; a lazy start must never write auth config.
+  try {
+    const ensured = await ensureBrowserControlAuth({ cfg });
+    if (ensured.generatedToken) {
+      logService.info("No browser auth configured; generated gateway.auth.token automatically.");
+    }
+  } catch (err) {
+    logService.warn(`failed to auto-configure browser auth: ${String(err)}`);
+  }
+
   // Ensure the host-local HMAC key exists before relay startup. Gateway hosts
   // and browser node hosts each own an independent key.
   const hasExtensionProfiles = Object.values(resolved.profiles).some(

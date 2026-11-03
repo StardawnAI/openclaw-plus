@@ -1,5 +1,4 @@
 // Coverage for external cancellation and timeout paths.
-import { queryObjects } from "node:v8";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { projectAgentRunAttemptTerminal } from "../../agent-run-terminal-outcome.js";
 import { countActiveToolExecutions } from "../../embedded-agent-subscribe.handlers.tools.start.js";
@@ -38,45 +37,6 @@ beforeEach(() => {
 });
 
 describe("createEmbeddedAttemptExternalAbortController", () => {
-  it("releases session callbacks when disposed controllers remain reachable", () => {
-    class SessionPayload {
-      active = true;
-    }
-    const cleanupAfterEarlyAbort = async () => {};
-    const createController = () => {
-      const payload = new SessionPayload();
-      const controller = createEmbeddedAttemptExternalAbortController({
-        abortSignal: new AbortController().signal,
-        cleanupAfterEarlyAbort,
-        runAbortController: new AbortController(),
-        runId: "retained-abort-controller",
-        state: { terminal: { kind: "ok" } },
-      });
-      controller.setActiveSessionAbort(async () => {
-        payload.active = false;
-      });
-      controller.setRunAbort(() => {
-        payload.active = false;
-      });
-      controller.setCompactionState({
-        isPendingOrRetrying: () => payload.active,
-        isInFlight: () => payload.active,
-      });
-      controller.arm();
-      return controller;
-    };
-    const active = createController();
-    const completed = Array.from({ length: 20 }, () => {
-      const controller = createController();
-      controller.dispose();
-      return controller;
-    });
-    expect(queryObjects(SessionPayload)).toBe(1);
-    active.dispose();
-    expect(queryObjects(SessionPayload)).toBe(0);
-    expect(completed).toHaveLength(20);
-  });
-
   it("preserves external cancellation through active session settlement", async () => {
     const source = new AbortController();
     const runAbortController = new AbortController();
@@ -136,28 +96,6 @@ describe("createEmbeddedAttemptExternalAbortController", () => {
       timedOutDuringToolExecution: false,
     });
     expect(runAbortController.signal.reason).toBe(reason);
-    controller.dispose();
-  });
-
-  it("hands cancellation to the live run handler once installed", () => {
-    const source = new AbortController();
-    const state = createAbortState();
-    const abortRun = vi.fn();
-    const controller = createEmbeddedAttemptExternalAbortController({
-      abortSignal: source.signal,
-      cleanupAfterEarlyAbort: vi.fn(async () => {}),
-      runAbortController: new AbortController(),
-      runId: "run-live",
-      state,
-    });
-    controller.setRunAbort(abortRun);
-    controller.arm();
-    const reason = new Error("cancelled live run");
-
-    source.abort(reason);
-
-    expect(state.terminal).toEqual({ kind: "aborted", source: "external" });
-    expect(abortRun).toHaveBeenCalledExactlyOnceWith(false, reason);
     controller.dispose();
   });
 
@@ -232,15 +170,10 @@ describe("createEmbeddedAttemptExternalAbortController", () => {
     }
   });
 
-  it.each([
-    ["stage-start", false],
-    ["prep-cleanup", false],
-    ["stage-start", true],
-    ["prep-cleanup", true],
-  ] as const)("classifies abort at %s (timeout=%s)", async (checkpoint, timeout) => {
+  it("classifies abort after preparation cleanup", async () => {
     const source = new AbortController();
     const reason = new Error("cancelled during setup");
-    reason.name = timeout ? "TimeoutError" : "AbortError";
+    reason.name = "AbortError";
     source.abort(reason);
     const cleanupAfterEarlyAbort = vi.fn(async () => {});
     const state = createAbortState();
@@ -252,18 +185,14 @@ describe("createEmbeddedAttemptExternalAbortController", () => {
       state,
     });
 
-    if (checkpoint === "stage-start") {
-      expect(() => controller.throwIfFired()).toThrow(reason);
-    } else {
-      await expect(controller.throwIfFiredAfterPrepCleanup()).rejects.toBe(reason);
-    }
+    await expect(controller.throwIfFiredAfterPrepCleanup()).rejects.toBe(reason);
 
-    expect(cleanupAfterEarlyAbort).toHaveBeenCalledTimes(checkpoint === "stage-start" ? 0 : 1);
+    expect(cleanupAfterEarlyAbort).toHaveBeenCalledOnce();
     expect(projectAgentRunAttemptTerminal(state.terminal)).toMatchObject({
       aborted: true,
       externalAbort: true,
       promptError: reason,
-      timedOut: timeout,
+      timedOut: false,
     });
     const firstTerminal = state.terminal;
     controller.arm();

@@ -1,8 +1,8 @@
 /** Lifecycle-owned auth/model discovery snapshots for agent runs. */
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { readOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { getPreparedSharedAuthStoreOwnership } from "./auth-profiles/path-resolve.js";
 import { registerRuntimeAuthProfileStoreMutationListener } from "./auth-profiles/runtime-snapshots.js";
 import type { ModelCatalogSnapshot } from "./model-catalog.types.js";
 import { assertPreparedModelRuntimeAdmissionCanWait } from "./prepared-model-runtime-admission.js";
@@ -28,8 +28,9 @@ import {
 import {
   PreparedModelRuntimePublicationSupersededError,
   hasSameLifecycleInput,
-  normalizeOptionalDir,
   normalizePreparedModelRuntimeInput,
+  normalizeOptionalDir,
+  prepareModelRuntimeInput,
   ownerKey,
   publishPreparedModelRuntimeOwnerBatch,
   publishModelRuntimeSnapshot,
@@ -112,9 +113,25 @@ const modelRuntimeDrain = createPreparedModelRuntimePluginDrain(
   () => pendingModelRuntimeReplacement !== undefined || authPublication.hasPendingPublication,
 );
 const authPublication = new PreparedModelRuntimeAuthPublicationOwner();
-const getBlockingReplacement = () =>
-  pendingModelRuntimeReplacement?.degraded ? undefined : pendingModelRuntimeReplacement;
-const getAdmissionReplacement = () => modelRuntimeDrain.pending ?? getBlockingReplacement();
+const getBlockingReplacement = (input?: PreparedModelRuntimeInput) => {
+  const replacement = pendingModelRuntimeReplacement;
+  if (replacement?.degraded) {
+    return undefined;
+  }
+  const agentIds = replacement?.agentIds;
+  const owner =
+    agentIds && input && !input.readOnly ? resolveConfiguredOwner(owners, input) : undefined;
+  return agentIds &&
+    owner?.input.agentId &&
+    !agentIds.has(owner.input.agentId) &&
+    owner.snapshot &&
+    !owner.needsRefresh &&
+    !owner.pending
+    ? undefined
+    : replacement;
+};
+const getAdmissionReplacement = (input?: PreparedModelRuntimeInput) =>
+  modelRuntimeDrain.pending ?? getBlockingReplacement(input);
 
 const replyDispatchPublication = new PreparedReplyDispatchPublicationOwner({
   retainOwner: retainPublishedModelRuntimeOwner,
@@ -125,7 +142,8 @@ const replyDispatchPublication = new PreparedReplyDispatchPublicationOwner({
       agentDir: ".",
       config: {},
     }),
-  getPendingReplacement: () => getAdmissionReplacement()?.promise,
+  getPendingReplacement: (agentId) =>
+    getAdmissionReplacement({ agentId, agentDir: ".", config: {} })?.promise,
   isStartupPending: () => pendingModelRuntimeReplacement?.degraded === true,
   ensureReady: (params) => ensureGatewayPreparedModelRuntimeReady(params),
 });
@@ -229,7 +247,9 @@ export async function acquireAgentRuntimeCleanupRegistries(agentDir: string) {
 export function getPreparedModelRuntimeSnapshot(
   rawInput: PreparedModelRuntimeInput,
 ): PreparedModelRuntimeSnapshot | undefined {
-  return getBlockingReplacement() ? undefined : readPublishedModelRuntimeSnapshot(owners, rawInput);
+  return getBlockingReplacement(rawInput)
+    ? undefined
+    : readPublishedModelRuntimeSnapshot(owners, rawInput);
 }
 
 /** Reads the owner-held publication barrier without starting catalog acquisition. */
@@ -245,48 +265,57 @@ export async function publishPreparedModelRuntimeSnapshot(
   rawInput: PreparedModelRuntimeInput,
   options: PreparedModelRuntimePublicationOptions = {},
 ): Promise<PreparedModelRuntimeSnapshot> {
-  captureModelRuntimeLifetime();
-  const input = normalizePreparedModelRuntimeInput(rawInput);
+  const assertLifetime = captureModelRuntimeLifetime();
+  const acquisitionSignal = refreshCancellation.signal;
+  const input = getPreparedSharedAuthStoreOwnership(rawInput.env ?? process.env)
+    ? normalizePreparedModelRuntimeInput(rawInput)
+    : await prepareModelRuntimeInput(rawInput);
+  assertLifetime();
+  acquisitionSignal.throwIfAborted();
   const existing = owners.get(ownerKey(input));
-  if (existing?.pending) {
-    if (!options.force && hasSameLifecycleInput(existing.input, input)) {
+  if (existing?.buildCompletion && !existing.pending) {
+    throw (
+      existing.refreshError ??
+      new Error(`prepared model runtime build is still settling for ${input.agentDir}`)
+    );
+  }
+  if (existing && !options.force && hasSameLifecycleInput(existing.input, input)) {
+    if (existing.pending) {
       assertPreparedModelRuntimeAdmissionCanWait(existing);
       return await existing.pending;
     }
-  } else {
-    if (existing?.buildCompletion) {
-      throw (
-        existing.refreshError ??
-        new Error(`prepared model runtime build is still settling for ${input.agentDir}`)
-      );
-    }
-    if (
-      existing?.snapshot &&
-      !existing.needsRefresh &&
-      !options.force &&
-      hasSameLifecycleInput(existing.input, input)
-    ) {
+    if (existing.snapshot && !existing.needsRefresh) {
       return existing.snapshot;
     }
   }
+  // Explicit discovery gets its full deadline in addition to normal generation preparation.
   return await publishModelRuntimeSnapshot(
     input,
     owners,
     agentBuildCompletions,
-    modelRuntimeBuildTimeoutMs,
+    options.providerDiscoveryTimeoutMs === undefined
+      ? modelRuntimeBuildTimeoutMs
+      : modelRuntimeBuildTimeoutMs + options.providerDiscoveryTimeoutMs,
     existing,
     options.provenance,
     options.catalogMode,
+    undefined,
+    undefined,
+    options.providerDiscoveryTimeoutMs,
   );
 }
 
 /** Activates lifecycle publication for direct embedded runtimes without a gateway startup. */
 export async function activateStandalonePreparedModelRuntime(
   rawInput: PreparedModelRuntimeInput,
-  options: Pick<PreparedModelRuntimePublicationOptions, "catalogMode"> = {},
+  options: Pick<
+    PreparedModelRuntimePublicationOptions,
+    "catalogMode" | "force" | "providerDiscoveryTimeoutMs"
+  > = {},
 ): Promise<PreparedModelRuntimeSnapshot | undefined> {
   const assertLifetime = captureModelRuntimeLifetime();
-  const input = normalizePreparedModelRuntimeInput(rawInput);
+  const input = await prepareModelRuntimeInput(rawInput);
+  assertLifetime();
   const key = ownerKey(input);
   const previous = standaloneActivationTails.get(key) ?? Promise.resolve();
   // One writer per owner key prevents conflicting config activations from alternately
@@ -311,7 +340,10 @@ export async function activateStandalonePreparedModelRuntime(
 async function activateStandalonePreparedModelRuntimeNow(
   input: PreparedModelRuntimeInput,
   assertLifetime: () => void,
-  options: Pick<PreparedModelRuntimePublicationOptions, "catalogMode">,
+  options: Pick<
+    PreparedModelRuntimePublicationOptions,
+    "catalogMode" | "force" | "providerDiscoveryTimeoutMs"
+  >,
 ): Promise<PreparedModelRuntimeSnapshot | undefined> {
   for (;;) {
     assertLifetime();
@@ -416,11 +448,15 @@ export function markPreparedModelRuntimeSnapshotsStale(
   const previousCancellation = refreshCancellation;
   refreshCancellation = new AbortController();
   setPreparedModelRuntimeStartupStatus(undefined);
-  replyDispatchPublication.clear();
+  if (options.agentIds) {
+    replyDispatchPublication.remove(options.agentIds);
+  } else {
+    replyDispatchPublication.clear();
+  }
   const requestEpoch = ++refreshRequestEpoch;
   if (options.waitForReplacement) {
     const superseded = pendingModelRuntimeReplacement;
-    const replacement = createPreparedModelRuntimeReplacement();
+    const replacement = createPreparedModelRuntimeReplacement(options.agentIds);
     pendingModelRuntimeReplacement = replacement;
     // Admission precedes queued work; retain its failure before retiring acquisition.
     publicationQueue.admit(replacement.promise, () => requestEpoch === refreshRequestEpoch);
@@ -480,7 +516,6 @@ const remoteCatalogPublication = configuredRefresh.createRemoteCatalogPublicatio
   ...preparedModelRuntimeLeaseContext,
   publicationQueue,
   replyDispatchPublication,
-  getEpoch: () => refreshRequestEpoch,
   getCancellationSignal: () => refreshCancellation.signal,
   // Catalog adoption also waits for a degraded startup's final publication.
   getPendingReplacement: () =>
@@ -502,11 +537,12 @@ export function refreshPreparedModelRuntimeSnapshots(
   const initialAgentIds =
     typeof config === "function" ? undefined : resolveSafeRefreshAgentIds(config, options, owners);
   const forceFullRefresh = requestedScopedRefresh && initialAgentIds === undefined;
-  // Stale synchronously. Queued publication must never leave the prior generation request-visible.
+  // Admit replacement and Gateway lifetime synchronously before this task can be superseded.
   markPreparedModelRuntimeSnapshotsStale(undefined, {
     waitForReplacement: true,
     agentIds: initialAgentIds,
   });
+  gatewayLifecycleActive ||= options.gatewayLifecycle === true;
   const requestEpoch = refreshRequestEpoch;
   const acquisitionSignal = refreshCancellation.signal;
   const replacement = pendingModelRuntimeReplacement;
@@ -530,7 +566,7 @@ export function refreshPreparedModelRuntimeSnapshots(
             void publicationQueue
               .enqueue(async () => {
                 if (isPublicationCurrent()) {
-                  await drainPendingAuthMutations(publish);
+                  await drainPendingAuthMutations(publish, options);
                 }
               })
               .catch((error: unknown) => log.warn(`startup auth refresh failed: ${String(error)}`));
@@ -585,7 +621,6 @@ export function refreshPreparedModelRuntimeSnapshots(
         ? undefined
         : resolveSafeRefreshAgentIds(currentConfig, options, owners);
       retainedGatewayRunOwners.clear(owners);
-      gatewayLifecycleActive ||= options.gatewayLifecycle === true;
       await configuredRefresh.refreshPreparedModelRuntimeSnapshotsNow(
         currentConfig,
         { ...options, agentIds: publicationAgentIds },
@@ -603,12 +638,9 @@ export function refreshPreparedModelRuntimeSnapshots(
       if (!isPublicationCurrent()) {
         return;
       }
-      const drain = () =>
-        drainPendingAuthMutations(
-          // The final queue check, dispatch rebuild, and replacement resolution are one synchronous
-          // commit. A mutation before it is adopted; a mutation after it starts a new auth transaction.
-          commitReplacement,
-        );
+      // The final queue check, dispatch rebuild, and replacement resolution are one synchronous
+      // commit. A mutation before it is adopted; a mutation after it starts a new auth transaction.
+      const drain = () => drainPendingAuthMutations(commitReplacement, options);
       if (replacement?.degraded) {
         await publicationQueue.enqueue(drain);
       } else {
@@ -630,16 +662,19 @@ export function refreshPreparedModelRuntimeSnapshots(
   return publicationQueue.complete(publication, isPublicationCurrent, options, startup);
 }
 
-async function drainPendingAuthMutations(commit?: () => void): Promise<void> {
+async function drainPendingAuthMutations(
+  commit?: () => void,
+  options: PreparedModelRuntimeRefreshOptions = {},
+): Promise<void> {
   await authPublication.drain({
     owners,
     publish: async (ownersToPublish, includeCredentialProviders, reuseGenerations) =>
       await publishPreparedModelRuntimeOwnerBatch({
-        reportSupersededAfterSiblingPublication: true,
         ownersToPublish,
         owners,
         agentBuildCompletions,
         buildTimeoutMs: modelRuntimeBuildTimeoutMs,
+        pluginMetadataSnapshot: options.pluginMetadataSnapshot,
         ...(includeCredentialProviders ? { includeCredentialProviders: true } : {}),
         selectPluginGeneration: reuseGenerations ? (owner) => owner.pluginGeneration : undefined,
       }),
@@ -654,15 +689,19 @@ async function drainPendingAuthMutations(commit?: () => void): Promise<void> {
 }
 
 function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): void {
+  const normalizedEvent = {
+    ...event,
+    agentDir: normalizeOptionalDir(event.agentDir),
+  };
   const { invalidatedOwners, invalidatedConfiguredAgentIds } =
-    invalidatePreparedModelRuntimeOwnersForAuthMutation(owners, event);
+    invalidatePreparedModelRuntimeOwnersForAuthMutation(owners, normalizedEvent);
   if (invalidatedOwners.length === 0) {
     // A first owner reads the already-published auth snapshot while it builds. Replaying an earlier
     // mutation would immediately stale that initial generation even though no prior owner existed.
     return;
   }
   replyDispatchPublication.remove(invalidatedConfiguredAgentIds);
-  const transaction = authPublication.enqueue(invalidatedOwners, event.profileSetChanged);
+  const transaction = authPublication.enqueue(invalidatedOwners, normalizedEvent.profileSetChanged);
   if (getBlockingReplacement()) {
     // The active config transaction drains this event before its atomic dispatch commit. Retire
     // the superseded build gate; queuing another task would make this commit depend on future work.
@@ -698,11 +737,9 @@ function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): voi
       }
     });
   };
-  // Wait for plugin replacement without occupying its queue. Publication owns its reads
-  // and must outlive the auth emitter's temporary SQLite reader scope.
-  const publication = readOnlyWorkerScope.exit(() =>
-    modelRuntimeDrain.runAfter(publicationQueue, publish),
-  );
+  // Auth revocation fences its affected owners immediately; publication must wait for the
+  // plugin reservation to settle without occupying the queue needed by replacement recovery.
+  const publication = modelRuntimeDrain.runAfter(publicationQueue, publish);
   notifyPreparedModelRuntimePublication({ phase: "invalidated" });
   void publication.catch((error: unknown) => {
     if (!authPublication.isCurrent(transaction)) {

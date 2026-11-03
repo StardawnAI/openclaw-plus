@@ -258,7 +258,10 @@ async function readSystemdManagerCommand(
       typeof execution[0] !== "string" ||
       execution[0].length === 0 ||
       typeof execution[2] !== "boolean" ||
-      !execution.slice(3).every(Number.isInteger) ||
+      !execution
+        .slice(3, 7)
+        .every((value) => typeof value === "bigint" || Number.isInteger(value)) ||
+      !execution.slice(7).every(Number.isInteger) ||
       !isStringArray(programArguments) ||
       programArguments.length === 0 ||
       typeof workingDirectory !== "string" ||
@@ -324,12 +327,9 @@ async function readSystemdManagerCommand(
         : null;
     const managedOverrides =
       !reloadPending && managedDefinition
-        ? await readSystemdDropInOverrides(
-            dropInPaths,
-            managedUnsetEnvironment,
-            env,
-            fileSpecs,
-          ).catch(() => UNKNOWN_SYSTEMD_OVERRIDES)
+        ? await readSystemdDropInOverrides(dropInPaths, managedUnsetEnvironment, env).catch(
+            () => UNKNOWN_SYSTEMD_OVERRIDES,
+          )
         : UNKNOWN_SYSTEMD_OVERRIDES;
     const snapshot = await buildSystemdCommandSnapshot({
       programArguments,
@@ -362,7 +362,6 @@ async function readSystemdDropInOverrides(
   dropInPaths: string[],
   managedUnsetEnvironment: string[],
   env: GatewayServiceEnv,
-  effectiveFiles: SystemdEnvironmentFileSpec[],
 ): Promise<GatewayServiceManagedOverrides> {
   const inlineEnvironmentKeys = new Set<string>();
   const fileEnvironmentKeys = new Set<string>();
@@ -428,26 +427,11 @@ async function readSystemdDropInOverrides(
             }
             unsetEnvironmentKeys.add(key);
           }
+        } else if (value.replace(/%%|%h/gu, "").includes("%")) {
+          overrides.environment = true;
         } else {
           try {
-            // Resolve the user runtime directory only when the manager confirms
-            // that exact file. Other specifiers remain operator-owned/unknown.
-            const runtimeDir = env.XDG_RUNTIME_DIR?.trim();
-            const fileValue = runtimeDir
-              ? value.replace(/%%|%t/gu, (token) => (token === "%t" ? runtimeDir : token))
-              : value;
-            if (fileValue.replace(/%%|%h/gu, "").includes("%")) {
-              throw new Error("Unresolved systemd environment file specifier");
-            }
-            const spec = parseSystemdEnvironmentFileSpec(fileValue, env);
-            if (
-              fileValue !== value &&
-              !effectiveFiles.some(
-                ([filePath, optional]) => filePath === spec?.[0] && optional === spec?.[1],
-              )
-            ) {
-              throw new Error("Systemd environment file differs from manager inspection");
-            }
+            const spec = parseSystemdEnvironmentFileSpec(value, env);
             const fileEnvironment = await resolveSystemdEnvironmentFiles({
               environmentFileSpecs: spec ? [spec] : [],
               failOnUnavailable: true,

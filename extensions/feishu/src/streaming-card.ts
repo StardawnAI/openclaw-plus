@@ -35,6 +35,12 @@ type FeishuStreamingCloseResult = {
   visibleReplySent: boolean;
   content?: string;
   messageId?: string;
+  /**
+   * False when the card rejected the final text (for example after CardKit closed
+   * streaming mode). Earlier accepted preview text may still be visible, but it is
+   * not the completed answer, so the dispatcher must deliver that answer another way.
+   */
+  finalTextAccepted?: boolean;
 };
 
 /** Provider finalization failed after a streaming card may already be visible. */
@@ -183,6 +189,34 @@ function shouldPushStreamingUpdate(previousText: string, nextText: string): bool
     /[\n。！？!?；;：:]$/.test(nextText) ||
     nextText.length - previousText.length >= STREAMING_SIGNIFICANT_DELTA_CHARS
   );
+}
+
+/** Merges cumulative or overlapping streaming snapshots without duplicating content. */
+export function mergeStreamingText(
+  previousText: string | undefined,
+  nextText: string | undefined,
+): string {
+  const previous = typeof previousText === "string" ? previousText : "";
+  const next = typeof nextText === "string" ? nextText : "";
+  if (!next) {
+    return previous;
+  }
+  if (!previous || next === previous) {
+    return next;
+  }
+  if (next.includes(previous)) {
+    return next;
+  }
+  if (previous.includes(next)) {
+    return previous;
+  }
+  const maxOverlap = Math.min(previous.length, next.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    if (previous.slice(-overlap) === next.slice(0, overlap)) {
+      return `${previous}${next.slice(overlap)}`;
+    }
+  }
+  return `${previous}${next}`;
 }
 
 export class FeishuStreamingSession {
@@ -535,6 +569,7 @@ export class FeishuStreamingSession {
       visibleReplySent: visibleContentSent,
       ...(visibleContentSent ? { content: finalState.sentText } : {}),
       ...(finalState.messageId ? { messageId: finalState.messageId } : {}),
+      ...(finalWriteError === undefined ? {} : { finalTextAccepted: false }),
     };
     if (finalWriteError !== undefined || closeError !== undefined) {
       const cause =

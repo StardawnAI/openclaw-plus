@@ -52,7 +52,7 @@ import {
 import { createActiveSnapshotTracker, createParticipatedThreadTracker } from "./tracking.js";
 import {
   extractDmPartnerShip,
-  extractMessageTextSafely,
+  extractMessageText,
   formatModelName,
   formatSummarizationHistoryText,
   isDmAllowedWithIngress,
@@ -742,7 +742,7 @@ export async function monitorTlonProvider(opts: MonitorTlonOpts): Promise<void> 
         return;
       }
 
-      const rawText = extractMessageTextSafely(content.content, runtime);
+      const rawText = extractMessageText(content.content);
       if (!rawText.trim()) {
         return;
       }
@@ -944,7 +944,7 @@ export async function monitorTlonProvider(opts: MonitorTlonOpts): Promise<void> 
         );
       }
 
-      const rawText = extractMessageTextSafely(essay.content, runtime);
+      const rawText = extractMessageText(essay.content);
       if (!rawText.trim()) {
         return;
       }

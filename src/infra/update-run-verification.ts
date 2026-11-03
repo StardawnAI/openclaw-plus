@@ -7,8 +7,8 @@ export function isUpdateRunVerificationConfirmed(
     verification.serviceRunning === true &&
     verification.versionMatch === true &&
     verification.settled === true &&
-    (verification.coreReady ??
-      (verification.readyz === true && verification.channelsReady === true)) &&
+    verification.readyz === true &&
+    verification.channelsReady === true &&
     verification.pluginErrors?.length === 0
   );
 }
@@ -23,13 +23,15 @@ export function recordUpdateRunVerificationRecord(
   if (options.onlyIfRunning && record.status !== "running") {
     return;
   }
+  // A skipped observer cannot revoke the durable receipt of a delivered notice.
+  let observedVerification = verification;
+  if (record.verification.noticeDelivered === true && verification.noticeDelivered === false) {
+    observedVerification = { ...verification };
+    delete observedVerification.noticeDelivered;
+  }
   record.verification = {
     ...record.verification,
-    // A released observer's readiness verdict cannot inherit a newer core proof.
-    ...(verification.readyz !== undefined && verification.coreReady === undefined
-      ? { coreReady: undefined }
-      : {}),
-    ...verification,
+    ...observedVerification,
     ...(verification.pluginErrors ? { pluginErrors: verification.pluginErrors.slice(-32) } : {}),
   };
   if (record.status === "running" && verification.serviceRunning === false) {

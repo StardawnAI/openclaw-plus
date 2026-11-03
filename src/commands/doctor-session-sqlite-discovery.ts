@@ -179,11 +179,9 @@ function readArchivedSessionOwnership(
           "Archived session registry no longer matches its migration receipt (file metadata or contents changed).",
         );
       }
-      for (const record of readLegacySessionRecords(target, ownershipIssues, {
-        sourcePath: move.archivePath,
-      })) {
-        records.push(record);
-      }
+      records.push(
+        ...readLegacySessionRecords(target, ownershipIssues, { sourcePath: move.archivePath }),
+      );
       if (
         ownershipIssues.length ||
         !sameMigrationArtifact(readMigrationArtifactIdentity(move.archivePath), identity)

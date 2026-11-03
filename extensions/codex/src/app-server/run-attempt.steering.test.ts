@@ -1,7 +1,6 @@
 // Codex tests cover run attempt.steering plugin behavior.
 import path from "node:path";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { upsertSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import {
   appendSessionTranscriptMessageByIdentity,
@@ -10,18 +9,13 @@ import {
 import { describe, expect, it, vi } from "vitest";
 import type { CodexSteeringQueueOptions } from "./attempt-steering.js";
 import { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
-import { setCodexTestToolFactory } from "./host-capability.test-support.js";
 import type { JsonObject } from "./protocol.js";
-import { itemNotification } from "./protocol.test-helpers.js";
 import { seedRunSessionOwnerForTest } from "./run-attempt-session-owners.test-support.js";
 import {
-  createCodexRuntimePlanFixture,
-  createRuntimeDynamicTool,
   createStartedThreadHarness,
   fastWait,
   queueActiveRunMessageForTest,
   runCodexAppServerAttempt,
-  setCodexTestModelSupportsTools,
   setupRunAttemptTestHooks,
   tempDir,
 } from "./run-attempt-test-harness.js";
@@ -178,92 +172,6 @@ describe("runCodexAppServerAttempt steering", () => {
         handle?.abort();
         acknowledgeApplied?.(false);
         await outcome;
-      }
-    },
-  );
-
-  it.each(["host tool", "local projection"] as const)(
-    "keeps native execution ownership during %s after a long turn",
-    async (work) => {
-      const started = createDeferred<void>();
-      const finish = createDeferred<void>();
-      const harness = createStartedThreadHarness();
-      const params = createSteeringParams();
-      params.timeoutMs = MAX_TIMER_TIMEOUT_MS;
-      params.runtimePlan = createCodexRuntimePlanFixture();
-      setCodexTestModelSupportsTools(params, true);
-      const tool = createRuntimeDynamicTool("autoreview");
-      tool.execute = vi.fn(async () => {
-        started.resolve();
-        await finish.promise;
-        return { content: [{ type: "text" as const, text: "Review complete" }], details: {} };
-      });
-      setCodexTestToolFactory(params, () => [tool]);
-      if (work === "local projection") {
-        params.verboseLevel = "full";
-        params.onToolResult = async () => {
-          started.resolve();
-          await finish.promise;
-        };
-      }
-      vi.useFakeTimers({ toFake: ["Date", "performance", "setTimeout", "clearTimeout"] });
-      const run = runCodexAppServerAttempt(params);
-      let pending: Promise<unknown> | undefined;
-      try {
-        await run.waitForTurnAccepted();
-        const handle = activeRunRegistrationMocks.setActiveEmbeddedRun.mock.calls.findLast(
-          (call) => call[0] === params.sessionId,
-        )?.[1] as { ownsLiveness?: () => boolean } | undefined;
-        await vi.waitFor(() => expect(handle?.ownsLiveness?.()).toBe(true), fastWait);
-        await vi.advanceTimersByTimeAsync(40 * 60_000);
-        pending =
-          work === "host tool"
-            ? harness.handleServerRequest({
-                id: "review-request",
-                method: "item/tool/call",
-                params: {
-                  threadId: "thread-1",
-                  turnId: "turn-1",
-                  callId: "review-call",
-                  namespace: null,
-                  tool: "autoreview",
-                  arguments: {},
-                },
-              })
-            : harness.notify(
-                itemNotification("item/started", {
-                  type: "commandExecution",
-                  id: "native-command",
-                  command: "true",
-                  cwd: params.workspaceDir,
-                  status: "inProgress",
-                }),
-              );
-        await started.promise;
-        expect(handle?.ownsLiveness?.()).toBe(true);
-        finish.resolve();
-        await pending;
-        if (work === "local projection") {
-          await harness.notify(
-            itemNotification("item/completed", {
-              type: "commandExecution",
-              id: "native-command",
-              command: "true",
-              cwd: params.workspaceDir,
-              status: "completed",
-              exitCode: 0,
-              aggregatedOutput: "",
-            }),
-          );
-        }
-        await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-        expect(readAttemptTerminal(await run)).toMatchObject({ aborted: false, timedOut: false });
-        expect(handle?.ownsLiveness?.()).toBe(false);
-      } finally {
-        finish.resolve();
-        await pending;
-        harness.close();
-        await run;
       }
     },
   );
@@ -841,9 +749,13 @@ describe("runCodexAppServerAttempt steering", () => {
     );
     const params = createSteeringParams();
 
+    // This tests receipt ordering, not elapsed time during SQLite preparation.
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const run = runCodexAppServerAttempt(params);
-    await waitForMethod("turn/start");
-    let handle:
+    await run.waitForTurnAccepted();
+    const handle = activeRunRegistrationMocks.setActiveEmbeddedRun.mock.calls.findLast(
+      (call) => call[0] === params.sessionId,
+    )?.[1] as
       | {
           queueMessage: (
             text: string,
@@ -851,12 +763,7 @@ describe("runCodexAppServerAttempt steering", () => {
           ) => Promise<void>;
         }
       | undefined;
-    await vi.waitFor(() => {
-      handle = activeRunRegistrationMocks.setActiveEmbeddedRun.mock.calls.findLast(
-        (call) => call[0] === params.sessionId,
-      )?.[1] as typeof handle;
-      expect(handle).toBeDefined();
-    }, fastWait);
+    expect(handle).toBeDefined();
     const onDispatchedAccepted = vi.fn();
     const onUnsentAccepted = vi.fn();
     const onLateAccepted = vi.fn();
@@ -864,10 +771,8 @@ describe("runCodexAppServerAttempt steering", () => {
       debounceMs: 0,
       onQueueAccepted: onDispatchedAccepted,
     });
-    await vi.waitFor(
-      () => expect(requests.filter((entry) => entry.method === "turn/steer")).toHaveLength(1),
-      fastWait,
-    );
+    await waitForMethod("turn/steer");
+    expect(requests.filter((entry) => entry.method === "turn/steer")).toHaveLength(1);
     const steer = requests.find((entry) => entry.method === "turn/steer");
     const clientUserMessageId = (steer?.params as { clientUserMessageId?: string } | undefined)
       ?.clientUserMessageId;

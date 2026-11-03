@@ -597,6 +597,18 @@ describe("config observe recovery", () => {
     expect((await readObserveEvents(auditPath)).at(-1)?.restoredFromBackup).toBe(true);
   });
 
+  it("recovery uses canonical metadata fingerprints", async () => {
+    const { deps, configPath } = makeDeps(home);
+    const backup = { meta: { authoredBy: "operator" }, gateway: { mode: "local" } };
+    await seedConfigBackup(configPath, backup);
+    const clobbered = await writeConfigRaw(configPath, { gateway: { mode: "local" } });
+    const input = { deps, configPath, ...clobbered, prepareBackup: approveRecoveryCandidate };
+
+    const recovered = await maybeRecoverSuspiciousConfigRead(input);
+
+    expect(recovered.parsed).toEqual(backup);
+  });
+
   it.each([
     {
       name: "retries recovery on next launch after a failed atomic replace",
@@ -635,16 +647,23 @@ describe("config observe recovery", () => {
               return deps.fs.renameSync(source, target);
             },
           };
-    const recover = (recoveryDeps: ObserveRecoveryDeps) => {
+    const recover = async (recoveryDeps: ObserveRecoveryDeps) => {
       const input = {
         deps: recoveryDeps,
         configPath,
         ...clobbered,
         prepareBackup: approveRecoveryCandidate,
       };
-      return mode === "async"
-        ? maybeRecoverSuspiciousConfigRead(input)
-        : maybeRecoverSuspiciousConfigReadSync(input);
+      const work = new AsyncWorkScope();
+      try {
+        return await work.run(() =>
+          mode === "async"
+            ? maybeRecoverSuspiciousConfigRead(input)
+            : maybeRecoverSuspiciousConfigReadSync(input),
+        );
+      } finally {
+        await work.drain();
+      }
     };
     const recovered = await recover({ ...deps, fs: failingFs });
 

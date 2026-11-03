@@ -9,6 +9,8 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { withPluginMetadataSnapshotScope } from "../../plugins/current-plugin-metadata-snapshot.js";
+import { createPluginMetadataSnapshotFixture } from "../../plugins/plugin-metadata.test-support.js";
 import { createBedrockAwsSdkConfig } from "./config-fixtures.test-support.js";
 import { authProfilesLog } from "./constants.js";
 import { createApiKeyCredential } from "./credential-fixtures.test-support.js";
@@ -23,6 +25,7 @@ import {
   TEST_SECONDARY_PROFILE_ID,
   withAuthState,
 } from "./session-override.test-support.js";
+import { isProfileInCooldown } from "./usage-state.js";
 
 describe("resolveSessionAuthProfileOverride", () => {
   it("returns early when no auth sources exist", async () => {
@@ -48,7 +51,7 @@ describe("resolveSessionAuthProfileOverride", () => {
       });
 
       expect(resolved).toBeUndefined();
-      expect(authStoreMocks.ensureAuthProfileStore).not.toHaveBeenCalled();
+      expect(authStoreMocks.ensureAuthProfileStoreAsync).not.toHaveBeenCalled();
       try {
         await fs.access(`${agentDir}/auth-profiles.json`);
       } catch (error) {
@@ -387,6 +390,49 @@ describe("resolveSessionAuthProfileOverride", () => {
     });
   });
 
+  it("keeps an automatic pin for a sibling of a managed provider's blocked model", async () => {
+    await withAuthState(async (state) => {
+      const profileId = "openrouter:manual";
+      const agentDir = await prepareCooldownAuthState(state, { profileIds: [profileId] });
+      authStoreMocks.state.store = {
+        version: 1,
+        profiles: { [profileId]: createApiKeyCredential("openrouter", "sk-test") },
+        order: { openrouter: [profileId] },
+        usageStats: {
+          [profileId]: {
+            cooldownUntil: Date.now() + 60_000,
+            cooldownReason: "rate_limit",
+            blockedUntil: Date.now() + 60_000,
+            blockedScope: "model",
+            blockedModel: "model-x",
+            blockedReason: "subscription_limit",
+          },
+        },
+      };
+      authStoreMocks.isProfileInCooldown.mockImplementation(isProfileInCooldown);
+      const sessionEntry = createAutomaticSessionEntry({
+        authProfileOverride: profileId,
+        model: "model-y",
+      });
+      const snapshot = createPluginMetadataSnapshotFixture({
+        plugins: [{ id: "openrouter", providers: ["openrouter"], managesOwnAvailability: true }],
+      });
+      const resolved = await withPluginMetadataSnapshotScope(
+        snapshot,
+        () =>
+          resolveSession({
+            agentDir,
+            provider: "openrouter",
+            sessionEntry,
+            sessionStore: { "agent:main:main": sessionEntry },
+          }),
+        { trustConfigIdentity: true },
+      );
+      expect(resolved).toBe(profileId);
+      expect(sessionEntry.authProfileOverride).toBe(profileId);
+    });
+  });
+
   it("does not persist an automatic override when every auth profile is in cooldown", async () => {
     await withAuthState(async (state) => {
       const agentDir = await prepareCooldownAuthState(state);
@@ -493,7 +539,7 @@ describe("session auth-profile rotation", () => {
         [OAUTH_PROFILE_ID]: {
           cooldownUntil: Date.now() + 60_000,
           cooldownReason: "rate_limit",
-          lastRateLimitAt: Date.now(),
+          failureCounts: { rate_limit: 1 },
         },
       };
       const sessionEntry: SessionEntry = {
@@ -511,7 +557,7 @@ describe("session auth-profile rotation", () => {
       authStoreMocks.state.store.usageStats[OAUTH_PROFILE_ID] = {
         cooldownUntil: Date.now() - 1,
         cooldownReason: "rate_limit",
-        lastRateLimitAt: Date.now() - 60_000,
+        failureCounts: { rate_limit: 1 },
       };
       sessionEntry.compactionCount = 1;
 

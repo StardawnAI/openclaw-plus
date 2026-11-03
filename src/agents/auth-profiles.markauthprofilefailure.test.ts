@@ -2,17 +2,22 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, assert, beforeAll, describe, expect, it, vi } from "vitest";
+import { withPluginMetadataSnapshotScope } from "../plugins/current-plugin-metadata-snapshot.js";
+import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
 } from "../state/openclaw-agent-db.js";
 import { clearRuntimeAuthProfileStoreSnapshots } from "./auth-profiles/runtime-snapshots.js";
-import { writePersistedAuthProfileStateRaw } from "./auth-profiles/sqlite.js";
+import {
+  readPersistedAuthProfileStateRaw,
+  readPersistedAuthProfileStoreRaw,
+} from "./auth-profiles/sqlite.js";
 import { ensureAuthProfileStore, saveAuthProfileStore } from "./auth-profiles/store-runtime.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
 import {
-  isProfileInCooldown,
   markAuthProfileFailure,
+  markAuthProfileBlockedUntil,
   markInlineProviderApiKeyFailure,
   resolveInlineProviderApiKeyUsageId,
 } from "./auth-profiles/usage.js";
@@ -43,7 +48,7 @@ function fixture(usageStats?: AuthProfileStore["usageStats"]) {
     version: 1,
     profiles: {
       "anthropic:default": { type: "api_key", provider: "anthropic", key: "sk-default" },
-      "openrouter:default": { type: "api_key", provider: "openrouter", key: "sk-router" },
+      "local:default": { type: "api_key", provider: "local", key: "synthetic-key" },
     },
     usageStats,
   };
@@ -67,13 +72,7 @@ describe("markAuthProfileFailure", () => {
       { filterExternalAuthProfiles: false, syncExternalCli: false },
     );
     expect(store.profiles[profileId]).toMatchObject({ key: "sk-default" });
-    await markAuthProfileFailure({
-      store,
-      agentDir,
-      profileId,
-      reason: "rate_limit",
-      retryAfterMs: 60_000,
-    });
+    await markAuthProfileFailure({ store, agentDir, profileId, reason: "rate_limit" });
     clearRuntimeAuthProfileStoreSnapshots();
     const reloaded = ensureAuthProfileStore(agentDir);
     expect(reloaded.profiles[profileId]).toMatchObject({ type: "api_key", key: "sk-fresh" });
@@ -124,121 +123,82 @@ describe("markAuthProfileFailure", () => {
     expect(ensureAuthProfileStore(agentDir).usageStats?.[profileId]?.disabledUntil).toBe(deadline);
   });
 
-  it("does not persist cooldown windows for OpenRouter", async () => {
-    const { store, agentDir } = fixture();
-    await markAuthProfileFailure({
-      store,
-      agentDir,
-      profileId: "openrouter:default",
-      reason: "rate_limit",
-    });
-    expect(store.usageStats?.["openrouter:default"]).toBeUndefined();
-    expect(ensureAuthProfileStore(agentDir).usageStats?.["openrouter:default"]).toBeUndefined();
-  });
-});
-
-describe("provider-driven rate-limit cooldowns", () => {
-  const model = "claude-test";
-  const hour = 60 * 60_000;
-  const reload = (agentDir: string) => {
-    clearRuntimeAuthProfileStoreSnapshots();
-    return ensureAuthProfileStore(agentDir);
-  };
-
-  it("cools a rate-limited model down for exactly the provider's retry window", async () => {
-    const auth = fixture();
-    const before = Date.now();
-    const retryAfterMs = 36 * hour;
-    await markAuthProfileFailure({
-      ...auth,
-      profileId,
-      reason: "rate_limit",
-      modelId: model,
-      retryAfterMs,
-    });
-    const after = Date.now();
-    const stats = reload(auth.agentDir).usageStats?.[profileId];
-    expect(stats).toMatchObject({ cooldownReason: "rate_limit", cooldownModel: model });
-    expect(stats?.cooldownUntil).toBeGreaterThanOrEqual(before + retryAfterMs);
-    expect(stats?.cooldownUntil).toBeLessThanOrEqual(after + retryAfterMs);
-    expect(stats?.failureCounts).toBeUndefined();
-    expect(stats?.errorCount).toBeUndefined();
-  });
-
-  it("leaves the profile usable when concurrent rate limits carry no provider timing", async () => {
-    const auth = fixture();
-    await Promise.all(
-      Array.from({ length: 12 }, () =>
-        markAuthProfileFailure({ ...auth, profileId, reason: "rate_limit", modelId: model }),
-      ),
-    );
-    const store = reload(auth.agentDir);
-    expect(isProfileInCooldown(store, profileId, Date.now(), model)).toBe(false);
-    expect(store.usageStats?.[profileId]?.cooldownUntil).toBeUndefined();
-    expect(store.usageStats?.[profileId]?.failureCounts).toBeUndefined();
-    expect(store.usageStats?.[profileId]?.lastRateLimitAt).toEqual(expect.any(Number));
-  });
-
-  it("follows the latest provider deadline without escalating repeated failures", async () => {
-    const auth = fixture();
-    const fail = (retryAfterMs: number) =>
-      markAuthProfileFailure({
-        ...auth,
-        profileId,
-        reason: "rate_limit",
-        modelId: model,
-        retryAfterMs,
-      });
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      await fail(60_000);
-    }
-    const repeated = reload(auth.agentDir).usageStats?.[profileId];
-    expect(repeated?.cooldownUntil).toBeLessThanOrEqual(Date.now() + 60_000);
-    expect(repeated?.failureCounts).toBeUndefined();
-
-    const before = Date.now();
-    await fail(2 * hour);
-    const extended = reload(auth.agentDir).usageStats?.[profileId]?.cooldownUntil;
-    expect(extended).toBeGreaterThanOrEqual(before + 2 * hour);
-    // A shorter answer for another concurrent request cannot reopen the window early.
-    await fail(1_000);
-    expect(reload(auth.agentDir).usageStats?.[profileId]?.cooldownUntil).toBe(extended);
-  });
-
-  it("releases a profile locked by the retired local rate-limit backoff on upgrade", async () => {
-    const auth = fixture();
+  it("backs off an expired rate-limit probe without extending its deadline on retry", async () => {
     const now = Date.now();
-    const legacy = {
-      cooldownUntil: now + 23 * hour,
-      cooldownReason: "rate_limit",
-      cooldownModel: model,
-      errorCount: 14,
-      failureCounts: { rate_limit: 14 },
-      lastFailureAt: now - 60_000,
-    };
-    // Raw rows bypass the current writer, exactly as an older release left them.
-    writePersistedAuthProfileStateRaw(
-      { version: 1, usageStats: { [profileId]: legacy, "local:default": legacy } },
-      auth.agentDir,
-    );
-    const upgraded = reload(auth.agentDir);
-    expect(isProfileInCooldown(upgraded, profileId, now, model)).toBe(false);
-    expect(upgraded.usageStats?.[profileId]).toEqual({
-      lastFailureAt: now - 60_000,
-      lastRateLimitAt: now - 60_000,
+    const { store, agentDir } = fixture({
+      [profileId]: {
+        errorCount: 3,
+        failureCounts: { rate_limit: 3 },
+        lastFailureAt: now - 120_000,
+        cooldownUntil: now - 60_000,
+      },
     });
+    const fail = () => markAuthProfileFailure({ store, agentDir, profileId, reason: "rate_limit" });
+    await fail();
+    const first = store.usageStats?.[profileId];
+    expect(first?.errorCount).toBe(1);
+    expect(first?.failureCounts?.rate_limit).toBe(4);
+    assert(first?.lastFailureAt !== undefined);
+    expect(first.lastFailureAt).toBeGreaterThanOrEqual(now);
+    expect(first.lastFailureAt).toBeLessThanOrEqual(Date.now());
+    expect(first.cooldownUntil).toBe(first.lastFailureAt + 240_000);
+    const deadline = first?.cooldownUntil;
+    await fail();
+    expect(store.usageStats?.[profileId]?.cooldownUntil).toBe(deadline);
+    expect(ensureAuthProfileStore(agentDir).usageStats?.[profileId]?.cooldownUntil).toBe(deadline);
+  });
 
-    // The first provider-timed failure after upgrade is not held to the old window.
-    await markAuthProfileFailure({
-      ...auth,
-      store: upgraded,
-      profileId,
-      reason: "rate_limit",
-      modelId: model,
-      retryAfterMs: 5_000,
+  const managedSnapshot = createPluginMetadataSnapshotFixture({
+    plugins: [{ id: "local-gateway", providers: ["local"], managesOwnAvailability: true }],
+  });
+  it("does not persist direct overload failures for self-managed providers", async () => {
+    const { store, agentDir } = fixture();
+    await withPluginMetadataSnapshotScope(
+      managedSnapshot,
+      () =>
+        markAuthProfileFailure({
+          store,
+          agentDir,
+          profileId: "local:default",
+          reason: "overloaded",
+        }),
+      { trustConfigIdentity: true },
+    );
+    expect(readPersistedAuthProfileStoreRaw(agentDir)).toMatchObject({
+      profiles: { "local:default": { provider: "local" } },
     });
-    const persisted = reload(auth.agentDir).usageStats;
-    expect(persisted?.[profileId]?.cooldownUntil).toBeLessThanOrEqual(Date.now() + 5_000);
-    expect(persisted?.["local:default"]?.cooldownUntil).toBeUndefined();
+    expect(readPersistedAuthProfileStateRaw(agentDir)).toBeNull();
+  });
+
+  it("keeps subscription blocks and inline-key billing on self-managed providers", async () => {
+    const { store, agentDir } = fixture();
+    const until = Date.now() + 60_000;
+    await withPluginMetadataSnapshotScope(
+      managedSnapshot,
+      async () => {
+        await markAuthProfileBlockedUntil({
+          store,
+          agentDir,
+          profileId: "local:default",
+          blockedUntil: until,
+          source: "wham",
+        });
+        await markInlineProviderApiKeyFailure({
+          store,
+          agentDir,
+          provider: "local",
+          reason: "billing",
+        });
+      },
+      { trustConfigIdentity: true },
+    );
+    const persisted = ensureAuthProfileStore(agentDir);
+    expect(persisted.usageStats?.["local:default"]).toMatchObject({
+      blockedUntil: until,
+      blockedReason: "subscription_limit",
+    });
+    expect(
+      persisted.usageStats?.[resolveInlineProviderApiKeyUsageId("local")]?.disabledReason,
+    ).toBe("billing");
   });
 });

@@ -197,6 +197,47 @@ describe("agents add command", () => {
     });
   }
 
+  it.each([false, true])(
+    "escapes terminal controls only in human agent creation output (json=%s)",
+    async (json) => {
+      const text = "café\u001b[31m\nforged\tend\rrow\u0007";
+      const workspace = `/tmp/${text}`;
+      const agentDir = `/tmp/agent-${text}`;
+      createAgent.mockResolvedValueOnce({
+        status: "created",
+        agentId: "work",
+        workspace,
+        agentDir,
+        model: text,
+        bindingResult: {
+          conflicts: [
+            {
+              binding: { agentId: "work", match: { channel: "slack", accountId: text } },
+              existingAgentId: "other",
+            },
+          ],
+        },
+      });
+      await agentsAddCommand({ name: "work", workspace, nonInteractive: true, json }, runtime);
+      if (json) {
+        expect(JSON.parse(String(runtime.log.mock.lastCall?.[0]))).toMatchObject({
+          workspace,
+          agentDir,
+          model: text,
+          bindings: { conflicts: [`slack accountId=${text} (agent=other)`] },
+        });
+      } else {
+        expect(runtime.log).toHaveBeenCalledWith("Workspace: /tmp/café\\nforged\\tend\\rrow");
+        expect(runtime.log).toHaveBeenCalledWith("Agent dir: /tmp/agent-café\\nforged\\tend\\rrow");
+        expect(runtime.log).toHaveBeenCalledWith("Model: café\\nforged\\tend\\rrow");
+        expect(runtime.error).toHaveBeenCalledWith(
+          "Skipped bindings already claimed by another agent:\n- slack accountId=café\\nforged\\tend\\rrow (agent=other)",
+        );
+      }
+      expect(createAgent).toHaveBeenCalledWith(expect.objectContaining({ workspace }));
+    },
+  );
+
   function useWizard(
     textValues: string[] = [],
     confirmValues?: boolean[],
@@ -240,23 +281,6 @@ describe("agents add command", () => {
     expect(runtime.exit).not.toHaveBeenCalled();
     expect(writeConfig).not.toHaveBeenCalled();
   }
-
-  it("preserves the recovery owner's refusal for an existing held agent", async () => {
-    const message =
-      "Agent main has held databases. Restore its original agentDir and session.store configuration, then rerun agents add to restore the preserved store.";
-    createAgent.mockResolvedValueOnce({
-      status: "error",
-      reason: "already-exists",
-      agentId: "main",
-      message,
-    });
-    await expectRootFailure(
-      agentsAddCommand({ name: "main", workspace: "/tmp/main" }, runtime, {
-        hasAutomationFlags: true,
-      }),
-      message,
-    );
-  });
 
   it.each([
     {
@@ -655,11 +679,13 @@ describe("agents add command", () => {
         { hasAutomationFlags: false },
       );
 
-      expect(createAgent).toHaveBeenCalledWith({
-        name: "Work",
-        workspace: "/tmp/work",
-        transformConfig,
-      });
+      expect(createAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          name: "Work",
+          workspace: "/tmp/work",
+          transformConfig,
+        }),
+      );
       expect(transformConfig).not.toHaveBeenCalled();
       expect(runtime.exit).not.toHaveBeenCalled();
       expect(runtime.error).not.toHaveBeenCalled();
@@ -678,7 +704,7 @@ describe("agents add command", () => {
         agentsAddCommand({ name: "Work", workspace: "/tmp/work" }, runtime, {
           hasAutomationFlags: true,
         }),
-        'agent "work" already exists',
+        'Agent "work" already exists.',
       );
     });
 

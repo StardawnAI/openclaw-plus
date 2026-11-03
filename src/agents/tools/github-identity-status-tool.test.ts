@@ -24,7 +24,6 @@ describe("github_identity_status tool", () => {
     }));
     const tool = createGitHubIdentityStatusTool({
       callGateway: callGatewayMock as InProcessGatewayCaller,
-      githubIdentitySettingsAvailable: true,
     });
 
     const result = await withGatewayToolCallerIdentity(
@@ -36,16 +35,37 @@ describe("github_identity_status tool", () => {
       agentId: "main",
       selectedScope: "agent",
     });
-    expect(JSON.stringify(result)).toContain("github_identity_settings");
+    expect(JSON.stringify(result)).toContain("Ask the operator");
+  });
 
-    const legacyTool = createGitHubIdentityStatusTool({
-      callGateway: callGatewayMock as InProcessGatewayCaller,
+  it("directs capable sessions to the masked reconnect action", async () => {
+    const callGateway = vi.fn(async () => ({
+      agentId: "main",
+      selectedScope: "agent" as const,
+      selected: { scope: "agent" as const, configured: false, identity: null },
+      effective: {
+        source: "system-configured" as const,
+        credentialKind: "managed-oauth" as const,
+        credentialState: "configured_unavailable" as const,
+        account: null,
+        gitAuthor: null,
+        evidence: "none" as const,
+        accessExpiresAtMs: null,
+        refreshState: "unavailable" as const,
+        oauthScopes: [],
+        repositoryGrants: "unknown" as const,
+      },
+    }));
+    const tool = createGitHubIdentityStatusTool({
+      callGateway: callGateway as InProcessGatewayCaller,
+      githubIdentitySettingsAvailable: true,
     });
-    const legacyResult = await withGatewayToolCallerIdentity(
+
+    const result = await withGatewayToolCallerIdentity(
       { agentId: "main", sessionKey: "agent:main:status" },
-      async () => await legacyTool.execute("status-2", {}),
+      async () => await tool.execute("status-2", {}),
     );
-    expect(JSON.stringify(legacyResult)).toContain("Settings → Agents → Tools");
-    expect(JSON.stringify(legacyResult)).not.toContain("github_identity_settings");
+
+    expect(JSON.stringify(result)).toContain("github_identity_settings");
   });
 });

@@ -6,7 +6,6 @@ import {
   measureDiagnosticsTimelineSpanSync,
 } from "../infra/diagnostics-timeline.js";
 import { pruneMapToMaxSize } from "../infra/map-size.js";
-import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { prepareBundledDiscoveryMode } from "./bundled-discovery-state.js";
 import {
   getCurrentPluginMetadataSnapshot,
@@ -25,11 +24,9 @@ import {
 import type { PluginManifestRecord, PluginManifestRegistry } from "./manifest-registry.types.js";
 import {
   bindPluginMetadataSnapshotCache,
-  cachePluginMetadataSnapshot,
   createPluginCache,
   getPluginCache,
   getPluginMetadataSnapshotCache,
-  readPluginMetadataSnapshotCache,
   retainPluginCache,
   withPluginCache,
 } from "./plugin-cache.js";
@@ -71,17 +68,13 @@ export type {
 
 export { resolvePluginMetadataEnvFingerprint } from "./plugin-metadata-env.js";
 
-// Retained snapshots cross source/require module graphs. Frozen descriptors
-// require the same function identity when another graph finalizes them again.
-const throwReadonlyPluginMetadataMutation = resolveGlobalSingleton(
-  Symbol.for("openclaw.pluginMetadataReadonlyMutation"),
-  () => (): never => {
-    throw new TypeError("Plugin metadata snapshots are immutable");
-  },
-);
+function throwReadonlyPluginMetadataMutation(): never {
+  throw new TypeError("Plugin metadata snapshots are immutable");
+}
 
 function freezeSnapshotValue<T>(value: T, seen = new WeakSet<object>()): T {
-  if (!value || typeof value !== "object") {
+  // Frozen facts stay frozen; native callers bypassing their setters are unsupported.
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) {
     return value;
   }
   if (seen.has(value)) {
@@ -195,15 +188,10 @@ export function isPluginMetadataSnapshotCompatible(params: {
 }
 
 function appendOwner(owners: Map<string, string[]>, ownedId: string, pluginId: string): void {
-  const existing = owners.get(ownedId);
-  if (existing) {
-    if (existing.includes(pluginId)) {
-      return;
-    }
-    existing.push(pluginId);
-    return;
+  const existing = owners.get(ownedId) ?? [];
+  if (!existing.includes(pluginId)) {
+    owners.set(ownedId, [...existing, pluginId]);
   }
-  owners.set(ownedId, [pluginId]);
 }
 
 function buildPluginMetadataOwnerMaps(
@@ -281,7 +269,11 @@ function buildPluginMetadataOwnerMaps(
       }
     }
   }
-  return { ...owners, channelAccountKeyPolicies, ...buildPluginMetadataProviderFacts(plugins) };
+  return {
+    ...owners,
+    channelAccountKeyPolicies,
+    ...buildPluginMetadataProviderFacts(plugins, enabledPluginIds),
+  };
 }
 
 function buildPluginMetadataManifestFacts(
@@ -448,8 +440,9 @@ export function loadPluginMetadataSnapshotForRegistry(
 function loadCachedPluginMetadataSnapshot(
   params: LoadPluginMetadataSnapshotParams,
 ): PluginMetadataSnapshot {
+  const cache = getPluginCache();
   const key = resolvePluginMetadataSnapshotCacheKey(params);
-  const cached = readPluginMetadataSnapshotCache(key);
+  const cached = cache.metadata.snapshots.get(key);
   if (cached) {
     return projectPluginMetadataSnapshot(
       cached,
@@ -483,7 +476,7 @@ function loadCachedPluginMetadataSnapshot(
       },
     },
   );
-  cachePluginMetadataSnapshot(key, frozen);
+  cache.metadata.snapshots.set(key, frozen);
   return projectPluginMetadataSnapshot(
     frozen,
     params.pluginIds ?? params.pluginIdScope?.resolve({ index: frozen.index }),
@@ -697,7 +690,7 @@ export function resolvePluginMetadataSnapshotInput(
     return selection.snapshot;
   }
   return (
-    readPluginMetadataSnapshotCache(resolvePluginMetadataSnapshotCacheKey(params)) ??
+    getPluginCache().metadata.snapshots.get(resolvePluginMetadataSnapshotCacheKey(params)) ??
     loadPluginMetadataSnapshotInput(params, () => registryReader(params.workspaceDir))
   );
 }

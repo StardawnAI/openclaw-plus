@@ -8,7 +8,6 @@ import type {
   StableChannelIngressIdentityParams,
 } from "openclaw/plugin-sdk/channel-ingress-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { asNullableRecord, readStringField } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { escapeRegExp } from "openclaw/plugin-sdk/text-utility-runtime";
@@ -173,12 +172,7 @@ export function isGroupInviteAllowed(
   }).allowed;
 }
 
-// Inline styles can nest arbitrarily deeply in remote content. Stop rendering past
-// this depth and degrade to truncated plain text rather than recursing until the
-// call stack overflows; legitimate inline markup never approaches this bound.
-const MAX_INLINE_DEPTH = 100;
-
-function renderInlineItem(item: unknown, topLevel = false, depth = 0): string {
+function renderInlineItem(item: unknown, topLevel = false): string {
   if (typeof item === "string") {
     return item;
   }
@@ -212,46 +206,23 @@ function renderInlineItem(item: unknown, topLevel = false, depth = 0): string {
     const linkContent = readStringField(link, "content");
     return topLevel ? linkHref : linkContent || linkHref;
   }
-  const bold = Array.isArray(record.bold) ? record.bold : undefined;
-  const italics = Array.isArray(record.italics) ? record.italics : undefined;
-  const strike = Array.isArray(record.strike) ? record.strike : undefined;
-  const blockquote = topLevel && Array.isArray(record.blockquote) ? record.blockquote : undefined;
-  const nested = bold ?? italics ?? strike ?? blockquote;
-  if (!nested) {
-    return "";
+  if (Array.isArray(record.bold)) {
+    return `**${extractInlineText(record.bold)}**`;
   }
-  if (depth >= MAX_INLINE_DEPTH) {
-    return "";
+  if (Array.isArray(record.italics)) {
+    return `*${extractInlineText(record.italics)}*`;
   }
-  const inner = extractInlineText(nested, depth + 1);
-  if (bold) {
-    return `**${inner}**`;
+  if (Array.isArray(record.strike)) {
+    return `~~${extractInlineText(record.strike)}~~`;
   }
-  if (italics) {
-    return `*${inner}*`;
+  if (topLevel && Array.isArray(record.blockquote)) {
+    return `> ${extractInlineText(record.blockquote)}`;
   }
-  if (strike) {
-    return `~~${inner}~~`;
-  }
-  return `> ${inner}`;
+  return "";
 }
 
-function extractInlineText(items: readonly unknown[], depth = 0): string {
-  return items.map((item) => renderInlineItem(item, false, depth)).join("");
-}
-
-// Extraction renders attacker-controlled content shapes; a throw must never tear down the
-// shared SSE stream (the event would replay unacked forever), so failures log and yield "".
-export function extractMessageTextSafely(
-  content: unknown,
-  runtime: { log?: (message: string) => void },
-): string {
-  try {
-    return extractMessageText(content);
-  } catch (error: unknown) {
-    runtime.log?.(`[tlon] Failed to extract message text: ${formatErrorMessage(error)}`);
-    return "";
-  }
+function extractInlineText(items: readonly unknown[]): string {
+  return items.map((item) => renderInlineItem(item)).join("");
 }
 
 export function extractMessageText(content: unknown): string {
@@ -287,7 +258,12 @@ export function extractMessageText(content: unknown): string {
         if (codeBlock) {
           const lang = readStringField(codeBlock, "lang") ?? "";
           const code = readStringField(codeBlock, "code") ?? "";
-          return `\n\`\`\`${lang}\n${code}\n\`\`\`\n`;
+          let fenceLength = 3;
+          for (const match of code.matchAll(/`+/g)) {
+            fenceLength = Math.max(fenceLength, match[0].length + 1);
+          }
+          const fence = "`".repeat(fenceLength);
+          return `\n${fence}${lang}\n${code}\n${fence}\n`;
         }
 
         const header = asNullableRecord(block.header);

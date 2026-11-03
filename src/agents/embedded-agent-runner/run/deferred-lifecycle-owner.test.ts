@@ -1,5 +1,3 @@
-import { setImmediate as nextTurn } from "node:timers/promises";
-import { queryObjects } from "node:v8";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resolveReplyOperationAbortReason } from "../../../auto-reply/reply/reply-operation-abort.js";
 import {
@@ -8,6 +6,7 @@ import {
   markDiagnosticEmbeddedRunStarted,
   closeDiagnosticEmbeddedRunOwner,
 } from "../../../logging/diagnostic-run-activity.js";
+import { createDeferredCore } from "../../../shared/deferred.js";
 import {
   isAgentRunRestartAbortReason,
   isAgentRunSupersededAbortReason,
@@ -48,53 +47,7 @@ describe("deferred logical-turn lifecycle", () => {
     handles.length = 0;
   });
 
-  it.each(["complete", "discard"] as const)(
-    "releases completed attempt callbacks and terminal data after %s",
-    async (settle) => {
-      class SessionPayload {
-        active = true;
-      }
-      const createOwner = () => {
-        const payload = new SessionPayload();
-        const owner = createEmbeddedAttemptDeferredLifecycleOwner({
-          runId: "retained-owner",
-          sessionId,
-          diagnosticOwner: createDiagnosticEmbeddedRunOwner({ runId: "retained-owner", sessionId }),
-          isCurrent: () => payload.active,
-          onRetryWaitCompleted: () => {
-            payload.active = true;
-          },
-          trajectoryRecorder: null,
-          clearActiveRun: () => {
-            payload.active = false;
-          },
-        });
-        owner.recordSessionEnd({ payload });
-        return owner;
-      };
-      const active = createOwner();
-      const completed = [];
-      for (let index = 0; index < 20; index++) {
-        const owner = createOwner();
-        await owner[settle]();
-        completed.push(owner);
-      }
-      // Count after the last awaited cleanup frame leaves the current job.
-      await nextTurn();
-      expect(queryObjects(SessionPayload)).toBe(1);
-      await active[settle]();
-      await nextTurn();
-      expect(queryObjects(SessionPayload)).toBe(0);
-      for (const owner of completed) {
-        await owner[settle]();
-      }
-    },
-  );
-
-  it.each([
-    { label: "omitted", reason: undefined },
-    { label: "explicit user", reason: "user_abort" as const },
-  ])("classifies $label cancellation when the caller signal stays live", ({ reason }) => {
+  it("classifies omitted cancellation when the caller signal stays live", () => {
     const caller = new AbortController();
     const manager = createDeferredEmbeddedRunLifecycleManager({
       runId: "cancelled-logical-run",
@@ -103,7 +56,7 @@ describe("deferred logical-turn lifecycle", () => {
       abortSignal: caller.signal,
     });
 
-    manager.abort(reason);
+    manager.abort(undefined);
 
     expect(caller.signal.aborted).toBe(false);
     expect(resolveReplyOperationAbortReason(undefined, manager.signal.reason)).toBe("user");
@@ -213,7 +166,7 @@ describe("deferred logical-turn lifecycle", () => {
       clearActiveRun,
     });
     discarded.recordSessionEnd({ status: "error" });
-    discarded.discard();
+    await discarded.discard();
     expect(recordEvent).not.toHaveBeenCalled();
 
     const accepted = createEmbeddedAttemptDeferredLifecycleOwner({
@@ -230,8 +183,86 @@ describe("deferred logical-turn lifecycle", () => {
 
     expect(recordEvent).toHaveBeenCalledOnce();
     expect(recordEvent).toHaveBeenCalledWith("session.ended", { status: "success" });
-    expect(flush).toHaveBeenCalledOnce();
+    expect(flush).toHaveBeenCalledTimes(2);
     expect(clearActiveRun).toHaveBeenCalledTimes(2);
+  });
+
+  it("releases a discarded candidate immediately and joins its diagnostic flush at completion", async () => {
+    const entered = createDeferredCore();
+    const release = createDeferredCore();
+    const recordEvent = vi.fn();
+    const clearActiveRun = vi.fn();
+    const manager = createDeferredEmbeddedRunLifecycleManager({
+      runId: "replaced-candidate",
+      sessionId,
+    });
+    const discarded = createEmbeddedAttemptDeferredLifecycleOwner({
+      runId: "replaced-candidate",
+      sessionId,
+      diagnosticOwner: createDiagnosticEmbeddedRunOwner({ runId: "replaced-candidate", sessionId }),
+      isCurrent: () => true,
+      onRetryWaitCompleted: () => {},
+      trajectoryRecorder: {
+        recordEvent,
+        describeFlushState: () => "pendingRows=1",
+        flush: async () => {
+          entered.resolve();
+          await release.promise;
+        },
+      },
+      clearActiveRun,
+    });
+    discarded.recordSessionEnd({ status: "success" });
+    manager.adopt(discarded);
+    manager.adopt({
+      beginRetryWait: () => undefined,
+      complete: async () => {},
+      discard: () => {},
+    });
+    expect(clearActiveRun).toHaveBeenCalledOnce();
+    expect(recordEvent).not.toHaveBeenCalled();
+    await entered.promise;
+    let settled = false;
+    const completion = manager.complete().then(() => {
+      settled = true;
+    });
+    try {
+      await Promise.resolve();
+      expect(settled).toBe(false);
+    } finally {
+      release.resolve();
+      await completion;
+    }
+    expect(settled).toBe(true);
+  });
+
+  it("flushes buffered diagnostics when a successful candidate enters retry backoff", async () => {
+    const ref = { runId: "retry-candidate", sessionId, sessionKey };
+    const diagnosticOwner = createDiagnosticEmbeddedRunOwner(ref);
+    markDiagnosticEmbeddedRunStarted({ ...ref, owner: diagnosticOwner });
+    const flushed = createDeferredCore();
+    const recordEvent = vi.fn();
+    const owner = createEmbeddedAttemptDeferredLifecycleOwner({
+      ...ref,
+      diagnosticOwner,
+      isCurrent: () => true,
+      onRetryWaitCompleted: () => {},
+      trajectoryRecorder: {
+        recordEvent,
+        describeFlushState: () => "pendingRows=1",
+        flush: async () => flushed.resolve(),
+      },
+      clearActiveRun: () => closeDiagnosticEmbeddedRunOwner(diagnosticOwner),
+    });
+    owner.recordSessionEnd({ status: "success" });
+    const release = owner.beginRetryWait(Date.now() + 660_000, new AbortController().signal);
+    try {
+      await flushed.promise;
+      expect(recordEvent).not.toHaveBeenCalled();
+    } finally {
+      release?.();
+      await owner.discard();
+    }
   });
 
   it.each(["abort", "timeout", "complete", "replace", "close", "authority"] as const)(

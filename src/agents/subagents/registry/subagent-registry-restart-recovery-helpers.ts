@@ -31,9 +31,7 @@ export function isRetiredSubagentSessionOwner(
     session !== undefined &&
     (session.status === undefined || session.status === "interrupted") &&
     isRetiredSubagentExecution(entry) &&
-    // Acceptance can persist before the child records its first lifecycle run.
-    ((session.lifecycleRunId === undefined && session.lastRunId === undefined) ||
-      ownsSubagentSessionExecution(entry, session))
+    ownsSubagentSessionExecution(entry, session)
   );
 }
 

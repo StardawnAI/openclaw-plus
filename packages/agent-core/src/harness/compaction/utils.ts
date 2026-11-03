@@ -282,7 +282,7 @@ function readPersistedSender(message: PersistedSenderCarrier) {
  * conversation label. Keep this shared with token accounting: adding a label
  * to the prompt without charging it can make bounded compaction overflow.
  */
-function formatPersistedSenderSuffix(message: PersistedSenderCarrier): string {
+export function formatPersistedSenderSuffix(message: PersistedSenderCarrier): string {
   const sender = readPersistedSender(message);
   return sender ? ` sender=${JSON.stringify(sender)}` : "";
 }

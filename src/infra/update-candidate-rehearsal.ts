@@ -1,11 +1,9 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import JSON5 from "json5";
 import { resolveAgentWorkspaceDir } from "../agents/agent-scope-config.js";
 import type { OpenClawConfigWithLegacyRoster } from "../config/legacy.roster.js";
 import type { AgentEntryConfig } from "../config/types.agents.js";
-import { coerceSecretRef } from "../config/types.secrets.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { resolveUserPath } from "./home-dir.js";
 import { tryListenOnPort } from "./ports-probe.js";
@@ -47,7 +45,6 @@ export type UpdateCandidateRehearsal = {
   snapshotWarnings?: string[];
   cleanupDirectories: string[];
   pluginCodeLinks?: UpdateCandidatePluginCodeLink[];
-  prepareRuntime: (assertCurrent: () => void) => Promise<void>;
   cleanup: (assertDirectoryCurrent?: (directory: string) => void) => Promise<void>;
 };
 
@@ -55,6 +52,7 @@ function isolatedConfig(
   config: OpenClawConfigWithLegacyRoster,
   sourceRoot: string,
   stateDir: string,
+  port: number,
   sourceEnv: NodeJS.ProcessEnv,
   pluginPaths: Record<string, string>,
   migrationPolicy?: "rehearse" | "startup-only",
@@ -128,37 +126,16 @@ function isolatedConfig(
   }
   // Copy effective config, never its include graph or ambient shell overrides.
   delete copied.env;
+  delete copied.diagnostics;
   delete copied.session?.store;
-  // Attest deployment posture and SecretRef provenance without persisting resolved credentials.
-  const auth = copied.gateway?.auth;
-  for (const key of ["token", "password"] as const) {
-    if (auth?.[key] !== undefined && !coerceSecretRef(auth[key], copied.secrets?.defaults)) {
-      auth[key] = randomUUID();
-    }
-  }
-  const headers = copied.diagnostics?.otel?.headers;
-  for (const [key, value] of Object.entries(headers ?? {})) {
-    if (!coerceSecretRef(value, copied.secrets?.defaults)) {
-      headers![key] = randomUUID();
-    }
-  }
   copied.logging = { ...copied.logging, file: path.join(stateDir, "canary.log") };
-  return copied;
-}
-
-/** Apply runtime-only isolation after deployment config checks have finished. */
-function isolatedRuntimeConfig(
-  config: OpenClawConfigWithLegacyRoster,
-  port: number,
-): OpenClawConfigWithLegacyRoster {
-  delete config.diagnostics;
-  config.gateway = {
-    ...config.gateway,
+  copied.gateway = {
+    ...copied.gateway,
     mode: "local",
     bind: "loopback",
     port,
     auth: {
-      ...config.gateway?.auth,
+      ...copied.gateway?.auth,
       mode: "token",
       token: randomUUID(),
       password: undefined,
@@ -168,14 +145,14 @@ function isolatedRuntimeConfig(
     tailscale: { mode: "off" },
     controlUi: { enabled: false },
   };
-  config.cron = { ...config.cron, enabled: false, triggers: { enabled: false } };
-  config.hooks = { enabled: false, internal: { enabled: false } };
-  config.transcripts = { enabled: false, autoStart: [] };
-  config.discovery = { mdns: { mode: "off" } };
-  if (config.mcp?.apps) {
-    config.mcp.apps.enabled = false;
+  copied.cron = { ...copied.cron, enabled: false, triggers: { enabled: false } };
+  copied.hooks = { enabled: false, internal: { enabled: false } };
+  copied.transcripts = { enabled: false, autoStart: [] };
+  copied.discovery = { mdns: { mode: "off" } };
+  if (copied.mcp?.apps) {
+    copied.mcp.apps.enabled = false;
   }
-  return config;
+  return copied;
 }
 
 /** Prepare one disposable generation for candidate diagnostics. */
@@ -288,6 +265,7 @@ export async function prepareUpdateCandidateRehearsal(params: {
         params.config,
         path.resolve(params.stateDir),
         tempDir,
+        port,
         sourceEnv,
         pluginPaths,
         params.migrationPolicy,
@@ -310,15 +288,6 @@ export async function prepareUpdateCandidateRehearsal(params: {
       snapshotWarnings,
       cleanupDirectories,
       pluginCodeLinks,
-      prepareRuntime: async (assertCurrent) => {
-        const config: OpenClawConfigWithLegacyRoster = JSON5.parse(
-          await fs.readFile(configPath, "utf8"),
-        );
-        assertCurrent();
-        await fs.writeFile(configPath, JSON.stringify(isolatedRuntimeConfig(config, port)), {
-          mode: 0o600,
-        });
-      },
       cleanup,
     };
   } catch (error) {

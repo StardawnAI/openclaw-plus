@@ -170,7 +170,6 @@ describe("meeting native continuous voice", () => {
     try {
       fixture.callbacks.onAudio(Buffer.alloc(48_000, 1));
       await vi.advanceTimersByTimeAsync(0);
-      vi.setSystemTime(Date.now() + 5_000);
       fixture.callbacks.onAudio(Buffer.alloc(48_000, 2));
       fixture.callbacks.onAudio(Buffer.alloc(960, 3));
       await vi.advanceTimersByTimeAsync(0);
@@ -182,30 +181,6 @@ describe("meeting native continuous voice", () => {
       expect(fixture.writeOutput).toHaveBeenCalledTimes(2);
       expect(fixture.writeOutput).toHaveBeenLastCalledWith(fresh);
       expect(fixture.handleBargeIn).not.toHaveBeenCalled();
-    } finally {
-      pending.resolve();
-      await fixture.handle.stop();
-    }
-  });
-
-  it("recovers stuck playback after the provider has finished sending", async () => {
-    vi.useFakeTimers();
-    const fixture = await createLiveFixture();
-    const pending = createDeferredCore();
-    fixture.writeOutput.mockImplementationOnce(() => pending.promise);
-    try {
-      for (let index = 1; index <= 3; index += 1) {
-        fixture.callbacks.onAudio(Buffer.alloc(48_000, index));
-      }
-      await vi.advanceTimersByTimeAsync(4_999);
-      expect(fixture.clearOutput).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(1);
-      expect(fixture.clearOutput).toHaveBeenCalledOnce();
-      const fresh = Buffer.alloc(960, 4);
-      fixture.callbacks.onAudio(fresh);
-      pending.resolve();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(fixture.writeOutput).toHaveBeenLastCalledWith(fresh);
     } finally {
       pending.resolve();
       await fixture.handle.stop();
@@ -235,38 +210,20 @@ describe("meeting native continuous voice", () => {
     }
   });
 
-  it.each(["safe-read-only", "none"] as const)(
-    "enforces the %s policy for native delegation",
-    async (toolPolicy) => {
-      const fixture = await createLiveFixture({ toolPolicy });
-      try {
-        const consult = fixture.callbacks.runAgentConsult;
-        expect(consult).toBeTypeOf("function");
-        if (!consult) {
-          throw new Error("Expected native agent delegation");
-        }
-        if (toolPolicy === "none") {
-          await expect(consult({ prompt: "Check the project" })).rejects.toThrow(
-            "meeting tool policy",
-          );
-          expect(fixture.consultAgent).not.toHaveBeenCalled();
-        } else {
-          await expect(consult({ prompt: "Check the project" })).resolves.toEqual({
-            text: "The answer.",
-          });
-          expect(fixture.consultAgent).toHaveBeenCalledWith(
-            expect.objectContaining({
-              meetingSessionId: "meeting-1",
-              requesterSessionKey: "agent:main:requester",
-              args: { question: "Check the project" },
-            }),
-          );
-        }
-      } finally {
-        await fixture.handle.stop();
+  it.each(["none"] as const)("enforces the %s policy for native delegation", async (toolPolicy) => {
+    const fixture = await createLiveFixture({ toolPolicy });
+    try {
+      const consult = fixture.callbacks.runAgentConsult;
+      expect(consult).toBeTypeOf("function");
+      if (!consult) {
+        throw new Error("Expected native agent delegation");
       }
-    },
-  );
+      await expect(consult({ prompt: "Check the project" })).rejects.toThrow("meeting tool policy");
+      expect(fixture.consultAgent).not.toHaveBeenCalled();
+    } finally {
+      await fixture.handle.stop();
+    }
+  });
 
   it.each(["native delegation", "function tool"] as const)(
     "rejects %s admission immediately after stop before bridge closure",

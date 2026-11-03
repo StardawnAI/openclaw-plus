@@ -4,8 +4,6 @@ import {
   type AdmittedRunContext,
   type OperationalRunInstanceRef,
 } from "../agents/admitted-run-context.js";
-import type { CommandLaneTaskMarker } from "../process/command-queue.js";
-import type { PreparedEffectUse } from "../shared/effect-authority.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import type { CronStandingGrantAuthority } from "./standing-grant-authority.types.js";
 
@@ -41,9 +39,7 @@ function captureCronJobMessageAuthority(
     operationalRunInstance: OperationalRunInstanceRef;
   },
   sourceSensitive: boolean,
-):
-  | ((() => void) & { prepareUse?: (assertCurrent?: () => void) => Promise<PreparedEffectUse> })
-  | undefined {
+): (() => void) | undefined {
   const { jobId } = params;
   const marker = getCurrentCronActiveJobMarker(jobId);
   const isAuthorityCurrent = sourceSensitive
@@ -88,25 +84,7 @@ function captureCronJobMessageAuthority(
     }
     assertLocal();
   };
-  const prepare = marker.prepareMessageUse;
-  return Object.assign(
-    assertCurrent,
-    prepare
-      ? {
-          prepareUse: (assertCallerCurrent?: () => void) => {
-            assertLocal();
-            return prepare(
-              sourceSensitive,
-              () => {
-                assertLocal();
-                assertCallerCurrent?.();
-              },
-              owner?.signal,
-            );
-          },
-        }
-      : {},
-  );
+  return assertCurrent;
 }
 
 export function captureCronJobMessageActionAuthority(params: {
@@ -176,11 +154,6 @@ export function captureCronJobStandingGrantAuthority(params: {
     context: receipt.context,
     handle: { ...receipt.handle },
     assertCurrent,
-    acquireUse: (assertUseCurrent, signal) =>
-      receipt.acquireUse(() => {
-        assertCurrent();
-        assertUseCurrent();
-      }, signal),
   };
 }
 
@@ -230,11 +203,6 @@ export type CronActiveJobMarker = {
   triggerMutated?: true;
   isMessageActionAuthorityCurrent?: () => boolean;
   isMessageSourceAuthorityCurrent?: () => boolean;
-  prepareMessageUse?: (
-    sourceSensitive: boolean,
-    assertCurrent: () => void,
-    signal?: AbortSignal,
-  ) => Promise<PreparedEffectUse>;
   messageActionAuthorityRevoked?: true;
   messageSourceAuthorityRevoked?: true;
   jobRemoved?: true;
@@ -242,9 +210,7 @@ export type CronActiveJobMarker = {
   preserveAcrossGenerationAdvance?: boolean;
   onInactive?: Set<() => void>;
   inactiveNotified?: true;
-  heartbeatWait?: {
-    owningCronLaneTaskMarker?: CommandLaneTaskMarker;
-  };
+  heartbeatWait?: symbol;
 };
 
 function getCronActiveJobState(): CronActiveJobState {
@@ -321,7 +287,6 @@ export function markCronJobActive(
     preserveAcrossGenerationAdvance?: boolean;
     isMessageActionAuthorityCurrent?: () => boolean;
     isMessageSourceAuthorityCurrent?: () => boolean;
-    prepareMessageUse?: CronActiveJobMarker["prepareMessageUse"];
   },
 ): CronActiveJobMarker | undefined {
   if (!jobId) {
@@ -340,7 +305,6 @@ export function markCronJobActive(
     ...(opts?.isMessageSourceAuthorityCurrent
       ? { isMessageSourceAuthorityCurrent: opts.isMessageSourceAuthorityCurrent }
       : {}),
-    ...(opts?.prepareMessageUse ? { prepareMessageUse: opts.prepareMessageUse } : {}),
     generation: state.generation,
     token,
     ...(opts?.preserveAcrossGenerationAdvance ? { preserveAcrossGenerationAdvance: true } : {}),
@@ -488,6 +452,11 @@ export function isCronJobActive(jobId: string) {
   return getCurrentCronActiveJobMarker(jobId) !== undefined;
 }
 
+/** Snapshot host-only activity before scheduling worker maintenance. */
+export function listActiveCronJobIds(): string[] {
+  return [...getCronActiveJobState().activeJobs.keys()].filter(isCronJobActive);
+}
+
 /** Includes admitted runs that have not entered their executing core yet. */
 export function hasActiveCronJobsForAgent(agentId: string): boolean {
   for (const marker of getCronActiveJobState().activeJobs.values()) {
@@ -542,12 +511,11 @@ export function hasActiveCronJobsExceptMarkers(markersToIgnore: readonly CronAct
 /** Records that an exact cron execution is idle until its heartbeat wake settles. */
 export function markCronJobWaitingForHeartbeat(
   marker: CronActiveJobMarker | undefined,
-  owningCronLaneTaskMarker?: CommandLaneTaskMarker,
 ): () => void {
   if (!marker || !isCronActiveJobMarkerCurrent(marker)) {
     return () => {};
   }
-  const heartbeatWait = owningCronLaneTaskMarker ? { owningCronLaneTaskMarker } : {};
+  const heartbeatWait = Symbol("cron-heartbeat-wait");
   marker.heartbeatWait = heartbeatWait;
   return () => {
     if (marker.heartbeatWait === heartbeatWait) {
@@ -556,24 +524,17 @@ export function markCronJobWaitingForHeartbeat(
   };
 }
 
-/** Returns exact live cron and lane owners currently waiting on heartbeat settlement. */
-export function listCronHeartbeatWaitOwners(): {
-  activeJobMarkers: CronActiveJobMarker[];
-  owningCronLaneTaskMarkers: CommandLaneTaskMarker[];
-} {
+/** Returns exact live cron executions currently waiting on heartbeat settlement. */
+export function listCronHeartbeatWaitOwners(): CronActiveJobMarker[] {
   const state = getCronActiveJobState();
   const activeJobMarkers: CronActiveJobMarker[] = [];
-  const owningCronLaneTaskMarkers: CommandLaneTaskMarker[] = [];
   for (const marker of state.activeJobs.values()) {
     if (!marker.heartbeatWait || !isMarkerActiveInGeneration(marker, state.generation)) {
       continue;
     }
     activeJobMarkers.push(marker);
-    if (marker.heartbeatWait.owningCronLaneTaskMarker) {
-      owningCronLaneTaskMarkers.push(marker.heartbeatWait.owningCronLaneTaskMarker);
-    }
   }
-  return { activeJobMarkers, owningCronLaneTaskMarkers };
+  return activeJobMarkers;
 }
 
 /** Returns the number of active cron runs in this process. */

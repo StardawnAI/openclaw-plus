@@ -41,8 +41,6 @@ export type McpServerCatalog = {
   marketplace?: string;
   title?: string;
   icons?: McpAppIcon[];
-  /** Complete server-level guidance from the upstream initialize result. */
-  instructions?: string;
   settings?: McpAppSettingsCapability;
   toolCount: number;
   resources?: {
@@ -216,6 +214,7 @@ export type SessionMcpRuntimeManager = {
   acquire: (params: {
     sessionId: string;
     sessionKey?: string;
+    agentId?: string;
     workspaceDir: string;
     agentDir?: string;
     cfg?: OpenClawConfig;

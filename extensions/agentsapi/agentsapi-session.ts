@@ -321,7 +321,7 @@ export function createAgentsApiSession(options: {
           const result = await options.executeFunction(call);
           assertCurrent();
           signal.throwIfAborted();
-          const terminate = result.terminate;
+          const terminate = result.terminate || result.sourceReplyDelivered;
           if (terminate) {
             // Fence new input before the acknowledgement can resume native work.
             // Already reserved input remains ahead of that acknowledgement.
@@ -706,7 +706,7 @@ export function createAgentsApiSession(options: {
     },
     async reconcileAfterClose(cleanupSignal: AbortSignal): Promise<Turn | undefined> {
       if (!closed) {
-        throw new Error("Agents API canonical cleanup requires a closed session attempt");
+        throw new Error("Agents API session cleanup requires a closed session attempt");
       }
       if (!submitted || !baselineCaptured) {
         return undefined;
@@ -718,7 +718,7 @@ export function createAgentsApiSession(options: {
         await options.onSessionFailed?.();
       }
       if (session.status !== "idle" && session.status !== "failed") {
-        throw new Error("Agents API canonical cleanup requires native work to be retired");
+        throw new Error("Agents API session cleanup requires native work to be retired");
       }
       const snapshot = await history.readSavedState(cleanupClient, cleanupSignal);
       await history.reconcilePriorHistory(cleanupClient, cleanupSignal, snapshot.itemsByTurn);

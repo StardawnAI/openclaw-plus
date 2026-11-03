@@ -18,12 +18,6 @@ export type PluginInstanceAdmission = {
 };
 
 /** Known disposal faults are reported outcomes, never new-call admission failures. */
-/** Reload observers get the bounded report; final resource owners join physical settlement. */
-export type PluginInstanceDisposal = {
-  observed: Promise<PluginInstanceDisposalResult>;
-  settled: Promise<PluginInstanceDisposalResult>;
-};
-
 export type PluginInstanceDisposalResult = {
   errors: readonly unknown[];
   /** Errors seen only in host cleanup, eligible for its named-hook reporting. */
@@ -48,10 +42,7 @@ export type PluginInstanceCallLease = {
 export interface PluginInstanceResource {
   readonly pluginId: string;
   quiesce(): boolean;
-  dispose(
-    beforeCleanup?: () => void | Promise<void>,
-    options?: { waitForSettlement?: boolean },
-  ): Promise<PluginInstanceDisposalResult>;
+  dispose(beforeCleanup?: () => void | Promise<void>): Promise<PluginInstanceDisposalResult>;
 }
 
 /** Captured code custody survives retiring a runtime until recovery consumes or releases it. */
@@ -79,7 +70,6 @@ export interface PluginModuleLoaderOwner extends PluginInstanceResource, PluginI
 export interface PluginInvocationInstance extends PluginModuleLoaderOwner {
   /** The current invocation's call or retained-consumer token is still admitted. */
   readonly hasActiveCall: boolean;
-  /** This instance's replacement is reserved and still joins the given live token. */
   holdsPendingReplacement(token: object): boolean;
   readonly slots: Map<string | symbol, { runtime: unknown }>;
   wrap<T>(value: T): T;

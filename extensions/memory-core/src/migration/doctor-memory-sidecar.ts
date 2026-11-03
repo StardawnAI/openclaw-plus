@@ -450,7 +450,7 @@ async function migrateLegacyMemorySidecarSource(params: {
         // Every imported table is a derived search index. A same-identity mismatch means the
         // current per-agent row wins; normal sync rebuilds any rows skipped with the sidecar.
         params.changes.push(
-          `Resolved Memory Core legacy memory index conflict for agent ${params.source.agentId} by keeping canonical per-agent SQLite rows`,
+          `Resolved Memory Core legacy memory index conflict for agent ${params.source.agentId} by keeping existing per-agent SQLite rows`,
         );
         return true;
       }
@@ -569,12 +569,7 @@ export const memorySidecarStateMigration: PluginDoctorStateMigration = {
         });
       }
     }
-    // These indexes are derived; failed imports retain their sources for a later repair.
-    return {
-      changes,
-      warnings,
-      ...(warnings.length > 0 ? { warningDisposition: "recoverable" as const } : {}),
-    };
+    return { changes, warnings };
   },
 };
 

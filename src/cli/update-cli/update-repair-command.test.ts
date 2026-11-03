@@ -9,6 +9,7 @@ import {
   buildStatusUpdateRows,
   formatUpdateRestartStatusValue,
 } from "../../commands/status-update-restart.js";
+import { GatewayStateOwnerContentionError } from "../../infra/gateway-state-owner.js";
 import {
   packageActivationIdentity,
   resolvePackageActivationAnchor,
@@ -53,9 +54,7 @@ const mocks = vi.hoisted(() => ({
     activatedPluginErrors: [] as { id: string; error: string }[],
     channelProbeErrors: [] as { id: string; error: string }[],
   })),
-  readiness: vi.fn<
-    typeof import("../daemon-cli/restart-health-probe.js").waitForGatewayHttpReadiness
-  >(async () => ({ healthz: 200, readyz: 200 })),
+  readiness: vi.fn(async () => ({ healthz: 200, readyz: 200 })),
   runtime: { log: vi.fn(), error: vi.fn(), writeJson: vi.fn(), exit: vi.fn() },
 }));
 
@@ -153,6 +152,15 @@ afterEach(async () => {
 });
 
 describe("update repair ledger recovery", () => {
+  it("tells operators to stop the live Gateway owner before repair", async () => {
+    mocks.ownershipAllowed.mockRejectedValueOnce(
+      new GatewayStateOwnerContentionError("/fixture/state/openclaw.sqlite"),
+    );
+    await expect(updateRepairCommand({ json: true })).rejects.toThrow(
+      /Stop the Gateway first \(openclaw gateway stop\)/,
+    );
+    expect(mocks.finalize).not.toHaveBeenCalled();
+  });
   it.each(["aborted", "publishing"])(
     "exits nonzero while a released %s package record remains pending",
     async (phase) => {
@@ -776,10 +784,10 @@ describe("update repair ledger recovery", () => {
     "missing installed version",
     "config",
     "plugin",
-    "channel-only outage",
+    "channel",
     "readiness",
     "handshake",
-  ])("chooses repair from the serving generation's observed health: %s", async (problem) => {
+  ])("retains full repair when the serving generation is unverified: %s", async (problem) => {
     const run = seedRun();
     const root = await mocks.resolveRoot();
     if (problem === "missing installed build") {
@@ -791,13 +799,6 @@ describe("update repair ledger recovery", () => {
       mocks.readConfig.mockResolvedValue({ valid: false, config: {} });
     } else if (problem === "readiness") {
       mocks.readiness.mockResolvedValue({ healthz: 200, readyz: 503 });
-    } else if (problem === "channel-only outage") {
-      mocks.readiness.mockResolvedValue({
-        healthz: 200,
-        readyz: 503,
-        coreReady: true,
-        failingChannels: ["test"],
-      });
     }
     mocks.reachable.mockResolvedValue({
       reachable: true,
@@ -810,23 +811,8 @@ describe("update repair ledger recovery", () => {
             ? null
             : "installed-build",
       activatedPluginErrors: problem === "plugin" ? [{ id: "test", error: "failed" }] : [],
-      channelProbeErrors:
-        problem === "channel-only outage" ? [{ id: "test", error: "failed" }] : [],
+      channelProbeErrors: problem === "channel" ? [{ id: "test", error: "failed" }] : [],
     });
-    if (problem === "channel-only outage") {
-      await updateRepairCommand({});
-
-      expect(mocks.finalize).not.toHaveBeenCalled();
-      expect(getUpdateRun(run.runId)?.steps).toContainEqual(
-        expect.objectContaining({ step: "reconcile:acknowledged", status: "completed" }),
-      );
-      expect(mocks.runtime.log).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "Channel health warnings: test. Run openclaw channels status --probe.",
-        ),
-      );
-      return;
-    }
     mocks.finalize.mockRejectedValueOnce(new Error("Stop the service through its owner"));
 
     await expect(updateRepairCommand({})).rejects.toThrow("Stop the service through its owner");

@@ -976,8 +976,8 @@
       "openclaw/plugin-sdk/memory-host-search": [
         "../packages/plugin-sdk/dist/src/plugin-sdk/memory-host-search.d.ts"
       ],
-      "openclaw/plugin-sdk/path-existence-runtime": [
-        "../packages/plugin-sdk/dist/src/plugin-sdk/path-existence-runtime.d.ts"
+      "openclaw/plugin-sdk/codex-client-version-runtime": [
+        "../packages/plugin-sdk/dist/src/plugin-sdk/codex-client-version-runtime.d.ts"
       ]
     }
   }

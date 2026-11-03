@@ -319,12 +319,10 @@ export const nostrPairingTextAdapter = {
     message: string;
     accountId?: string;
   }) => {
-    const aid = accountId ?? resolveDefaultNostrAccountId(cfg);
-    const bus = activeBuses.get(aid);
-    if (!bus) {
-      throw new Error(`Nostr bus not running for account ${aid}`);
+    const bus = activeBuses.get(accountId ?? resolveDefaultNostrAccountId(cfg));
+    if (bus) {
+      await bus.sendDm(id, message);
     }
-    await bus.sendDm(id, message);
   },
 };
 

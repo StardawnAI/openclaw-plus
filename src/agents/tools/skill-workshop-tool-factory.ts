@@ -18,7 +18,6 @@ export function createConfiguredSkillWorkshopTool(params: {
   sessionKey?: string;
   runId?: string;
   run?: SkillWorkshopRunOptions;
-  sandboxed?: boolean;
 }): AnyAgentTool {
   const sessionKey = normalizeOptionalString(params.sessionKey);
   const runId = normalizeOptionalString(params.runId);
@@ -37,6 +36,5 @@ export function createConfiguredSkillWorkshopTool(params: {
   return createLibrarySkillWorkshopTool(
     libraryAuthoring,
     libraryAuthoring.defaultTarget === "workspace" ? createWorkshop() : undefined,
-    { sandboxed: params.sandboxed },
   );
 }

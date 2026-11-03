@@ -119,46 +119,6 @@ describe("native service command inspection", () => {
     await fs.writeFile(filename, contents);
   }
 
-  it.each(["absent", "dangling", "empty"])(
-    "reinstall permits only absent plists while launchd retains a job (%s)",
-    async (condition) => {
-      const plist = resolveLaunchAgentPlistPath(env);
-      const result = (stdout: string, code = 0, stderr = "") => ({
-        code,
-        termination: "exit",
-        stdout,
-        stderr,
-      });
-      native.launchctl.mockImplementation(async (_command: string, args: string[]) =>
-        args[1]?.startsWith("system/")
-          ? result("", 113, "Could not find service")
-          : result(`${args[1]} = {\n\tstate = waiting\n}`),
-      );
-      if (condition === "dangling") {
-        await fs.mkdir(path.dirname(plist), { recursive: true });
-        await fs.symlink(path.join(root, "absent-definition"), plist);
-      } else if (condition === "empty") {
-        await writeFile(plist, renderPlist([]));
-      }
-      if (condition === "absent") {
-        await expect(
-          readLaunchAgentProgramArguments(env, { requireEffective: true }),
-        ).rejects.toThrow();
-      }
-      const command = readLaunchAgentProgramArguments(env, {
-        requireEffective: true,
-        allowMissingDefinition: true,
-      });
-      if (condition === "absent") {
-        await expect(command).resolves.toBeNull();
-      } else {
-        await expect(command).rejects.toThrow(
-          "Effective LaunchAgent service command could not be inspected",
-        );
-      }
-    },
-  );
-
   describe.each(readers)("$name", ({ name, read, resolvePath, render }) => {
     it.each(["dangling", "directory", "empty", "registered", "unavailable"])(
       "keeps a %s definition distinct from proven absence",
@@ -349,9 +309,9 @@ describe("native service command inspection", () => {
           expect(state.runtime?.missingUnit).not.toBe(true);
           expect(state.runtime?.inspectionFailure).toBeUndefined();
         }
-        expect(native.scheduler).toHaveBeenCalledTimes(condition === "absent" ? 4 : 6);
+        expect(native.scheduler).toHaveBeenCalledTimes(3);
         expect(run).not.toHaveBeenCalled();
-        expect(now).toBe(condition === "absent" ? 501.25 : 701.75);
+        expect(now).toBe(401);
         for (const allowance of schedulerAllowances) {
           expect(allowance.timeout).toBe(explicit ? Math.floor(allowance.remaining) : 60_000);
           expect(allowance.timeout).toBeGreaterThan(0);
@@ -362,10 +322,7 @@ describe("native service command inspection", () => {
       },
     );
 
-    it.each([
-      { condition: "absent", elapsed: 999.25 },
-      { condition: "installed", elapsed: 1_000 },
-    ])(
+    it.each([{ condition: "installed", elapsed: 1_000 }])(
       "does not launch further native work after reading $condition consumes $elapsed ms",
       async ({ condition, elapsed }) => {
         mockProcessPlatform("win32");

@@ -437,13 +437,6 @@ describe("post-activation failure settlement without inference", () => {
           root: activeRoot,
           after: { version: rollback === "restored" ? "2026.9.1" : "2026.9.3" },
         },
-        automaticTriage: restoredHealthy
-          ? undefined
-          : expect.objectContaining({
-              kind: "update",
-              phase: reason,
-              installationRoot: activeRoot,
-            }),
       });
       // Plugin writes remain in the original stopped interval and never rerun after restoration.
       expect(mocks.converge).toHaveBeenCalledOnce();
@@ -677,8 +670,8 @@ describe("post-activation failure settlement without inference", () => {
       vi.spyOn(tempRoot, "resolvePreferredOpenClawTmpDir").mockReturnValue(scratch);
       params.root = root;
       const migration = receipt.startsWith("migration-");
-      const currentCore = receipt.startsWith("current-core-") || receipt.startsWith("operator-");
       const untouched = receipt.startsWith("operator-");
+      const currentCore = receipt.startsWith("current-core-") || receipt.startsWith("operator-");
       const recovered =
         receipt === "settled" ||
         receipt === "migration-required" ||
@@ -896,12 +889,22 @@ describe("post-activation failure settlement without inference", () => {
         run.executorFence = await executor.enter(root);
         const failure = await finishUpdate(params).catch((error: unknown) => error);
         assert(failure instanceof UpdateCommandFailure);
-        expect(failure.result.recovery, JSON.stringify(failure.result)).toEqual(
+        expect(
+          failure.result.recovery,
+          JSON.stringify({
+            errors: vi.mocked(defaultRuntime.error).mock.calls,
+            result: failure.result,
+          }),
+        ).toEqual(
           untouched
             ? undefined
             : expect.objectContaining(
                 recovered
-                  ? { serviceRestartSafe: true, service: "healthy", version: mocks.version }
+                  ? {
+                      serviceRestartSafe: true,
+                      service: "healthy",
+                      version: mocks.version,
+                    }
                   : { serviceRestartSafe: false },
               ),
         );

@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { readAgentRosterProperty } from "../agents/agent-roster.js";
 import { resolveAgentWorkspaceDir } from "../agents/agent-scope-config.js";
 import { promoteConfigSnapshotToLastKnownGood, readConfigFileSnapshot } from "../config/config.js";
@@ -27,58 +27,6 @@ import { withDoctorConfigPreflightHome } from "./doctor-config-preflight.test-su
 describe("Doctor workspace persistence", () => {
   afterEach(() => {
     closeOpenClawStateDatabaseForTest();
-  });
-
-  it("keeps a valid Kubernetes reseed without metadata and still recovers a later invalid config", async () => {
-    await withDoctorConfigPreflightHome(async (home) => {
-      await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
-        const configPath = await writeOpenClawConfig(home, {
-          gateway: { mode: "local", port: 19091 },
-          plugins: { enabled: false },
-        });
-        await runInitialConfigWriteHealth(await prepareDoctorContext(configPath));
-        const baseline = await readConfigFileSnapshot();
-        expect(await promoteConfigSnapshotToLastKnownGood(baseline)).toBe(true);
-        for (const suffix of [".bak", ".bak.1"]) {
-          await fs.copyFile(configPath, `${configPath}${suffix}`);
-        }
-        const { meta: _meta, ...reseeded } = JSON.parse(await fs.readFile(configPath, "utf8"));
-        reseeded.gateway.port = 19092;
-        const reseededRaw = JSON.stringify(reseeded, null, 2);
-        await fs.unlink(configPath);
-        await fs.writeFile(configPath, reseededRaw);
-
-        const ctx = await prepareDoctorContext(configPath);
-        expect(ctx.cfg.gateway?.port).toBe(19092);
-        expect(await fs.readFile(configPath, "utf8")).toBe(reseededRaw);
-        expect(await fs.readdir(path.dirname(configPath))).not.toEqual(
-          expect.arrayContaining([expect.stringContaining(".clobbered.")]),
-        );
-        // Gateway startup promotes the accepted config; the meta-less reseed must qualify.
-        expect(await promoteConfigSnapshotToLastKnownGood(await readConfigFileSnapshot())).toBe(
-          true,
-        );
-
-        const invalidRaw = '{ "gateway": { "mode": 123 } }';
-        await fs.writeFile(configPath, invalidRaw);
-        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-        try {
-          const recovered = await prepareDoctorContext(configPath);
-          expect(recovered.cfg.gateway?.port).toBe(19092);
-          const clobbered = (await fs.readdir(path.dirname(configPath))).filter((name) =>
-            name.includes(".clobbered."),
-          );
-          expect(clobbered).toHaveLength(1);
-          const originalPath = path.join(path.dirname(configPath), clobbered[0]!);
-          expect(await fs.readFile(originalPath, "utf8")).toBe(invalidRaw);
-          const warnings = warn.mock.calls.flat().join("\n");
-          expect(warnings).toContain(originalPath);
-          expect(warnings).toContain("to undo, stop the Gateway and copy it back");
-        } finally {
-          warn.mockRestore();
-        }
-      });
-    });
   });
 
   it("refuses retired config until the bridge release migrates it", async () => {
@@ -133,7 +81,8 @@ describe("Doctor workspace persistence", () => {
         const original = await fs.readFile(configPath, "utf8");
         expect((await readConfigFileSnapshot()).valid).toBe(false);
         const repair = (async () => {
-          await runInitialConfigWriteHealth(await prepareDoctorContext(configPath));
+          await using ctx = await prepareDoctorContext(configPath);
+          await runInitialConfigWriteHealth(ctx);
         })();
         for (const setting of [
           "heartbeat",
@@ -206,7 +155,7 @@ describe("Doctor workspace persistence", () => {
           gateway: { mode: "local" },
           plugins: { enabled: false },
         });
-        const ctx = await prepareDoctorContext(configPath);
+        await using ctx = await prepareDoctorContext(configPath);
         await runInitialConfigWriteHealth(ctx);
         expect(ctx.configWriteRefusal).toBeUndefined();
         const saved = await readConfigFileSnapshot();
@@ -214,7 +163,7 @@ describe("Doctor workspace persistence", () => {
         const bytes = await fs.readFile(configPath, "utf8");
         expect(JSON.parse(bytes).agents).toHaveProperty("entries.main");
         expect(JSON.parse(bytes).agents).not.toHaveProperty("list");
-        const repeated = await prepareDoctorContext(configPath);
+        await using repeated = await prepareDoctorContext(configPath);
         expect(repeated.configResult.shouldWriteConfig).toBe(false);
         await runInitialConfigWriteHealth(repeated);
         expect(await fs.readFile(configPath, "utf8")).toBe(bytes);
@@ -258,7 +207,7 @@ describe("Doctor workspace persistence", () => {
             const original = await fs.readFile(configPath, "utf8");
             expect((await readConfigFileSnapshot()).valid).toBe(false);
 
-            const ctx = await prepareDoctorContext(configPath);
+            await using ctx = await prepareDoctorContext(configPath);
             await runInitialConfigWriteHealth(ctx);
             expect(ctx.configWriteRefusal).toBeUndefined();
             expect(await fs.readFile(`${configPath}.bak`, "utf8")).toBe(original);
@@ -282,9 +231,8 @@ describe("Doctor workspace persistence", () => {
               memory: { search: { provider: "openai" } },
             });
             expect((await readConfigFileSnapshot()).valid).toBe(true);
-            expect((await prepareDoctorContext(configPath)).configResult.shouldWriteConfig).toBe(
-              false,
-            );
+            await using repeated = await prepareDoctorContext(configPath);
+            expect(repeated.configResult.shouldWriteConfig).toBe(false);
           },
         );
       });
@@ -329,7 +277,7 @@ describe("Doctor workspace persistence", () => {
               value: [{ id: legacyId }, { id: "other" }],
             });
 
-            const ctx = await prepareDoctorContext(configPath);
+            await using ctx = await prepareDoctorContext(configPath);
             await runInitialConfigWriteHealth(ctx);
             const saved = await readConfigFileSnapshot();
             expect(saved.valid).toBe(true);
@@ -342,9 +290,8 @@ describe("Doctor workspace persistence", () => {
             for (const [name, content] of Object.entries(originals)) {
               expect(await fs.readFile(path.join(workspace, name), "utf8")).toBe(content);
             }
-            expect((await prepareDoctorContext(configPath)).configResult.shouldWriteConfig).toBe(
-              false,
-            );
+            await using repeated = await prepareDoctorContext(configPath);
+            expect(repeated.configResult.shouldWriteConfig).toBe(false);
           },
         );
       });
@@ -367,7 +314,7 @@ describe("Doctor workspace persistence", () => {
         expect(before.valid).toBe(false);
         expect(readAgentRosterProperty(before.sourceConfig)?.value).toHaveLength(1);
 
-        const ctx = await prepareDoctorContext(configPath);
+        await using ctx = await prepareDoctorContext(configPath);
         expect(ctx.configResult.shouldWriteConfig).toBe(true);
         expect(ctx.cfg.agents?.entries?.ops).toEqual({ heartbeat: { every: "30m" } });
         await runInitialConfigWriteHealth(ctx);
@@ -376,7 +323,8 @@ describe("Doctor workspace persistence", () => {
         expect(saved.agents.entries.ops).toEqual({ heartbeat: { every: "30m" } });
         expect(saved.agents).not.toHaveProperty("list");
         expect((await readConfigFileSnapshot()).valid).toBe(true);
-        expect((await prepareDoctorContext(configPath)).configResult.shouldWriteConfig).toBe(false);
+        await using repeated = await prepareDoctorContext(configPath);
+        expect(repeated.configResult.shouldWriteConfig).toBe(false);
       });
     });
   });
@@ -393,7 +341,7 @@ describe("Doctor workspace persistence", () => {
           gateway: { mode: "local" },
           plugins: { enabled: false },
         });
-        const ctx = await prepareDoctorContext(configPath);
+        await using ctx = await prepareDoctorContext(configPath);
 
         await runInitialConfigWriteHealth(ctx);
         expect((await readConfigFileSnapshot()).config.agents?.entries?.main?.workspace).toBe(
@@ -451,7 +399,7 @@ describe("Doctor workspace persistence", () => {
           let firstRows: unknown;
           for (const pass of [1, 2]) {
             await withDoctorConfigMaintenance(async () => {
-              const ctx = await prepareDoctorContext(configPath);
+              await using ctx = await prepareDoctorContext(configPath);
               await runInitialConfigWriteHealth(ctx);
               await runWriteConfigHealth(ctx);
             });
@@ -518,7 +466,8 @@ describe("Doctor workspace persistence", () => {
           await fs.writeFile(configPath, original);
           await expect
             .soft(async () => {
-              await runInitialConfigWriteHealth(await prepareDoctorContext(configPath));
+              await using ctx = await prepareDoctorContext(configPath);
+              await runInitialConfigWriteHealth(ctx);
             })
             .rejects.toThrow(
               /talk\.mode, talk\.transport, talk\.brain, talk\.model, talk\.voice[\s\S]*2026\.9\.5[\s\S]*openclaw doctor --fix/,

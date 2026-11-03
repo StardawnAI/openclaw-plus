@@ -88,12 +88,6 @@ export type AgentRunMessageContext = {
   taskSuggestionDeliveryMode?: TaskSuggestionDeliveryMode;
   /** Require explicit message tool targets (no implicit last-route sends). */
   requireExplicitMessageTarget?: boolean;
-  /**
-   * Whether a delivered source send that omits `final` ends the turn. Absent means yes:
-   * a send answers the inbound message. Runs that only deliver to a configured target
-   * set false, so post-send work still runs.
-   */
-  messageToolFinalByDefault?: boolean;
 };
 
 export type AgentRunChannelContext = {
@@ -128,6 +122,8 @@ export type AgentRunModelOptions = {
   /** Outer model-fallback owner facts for this admitted attempt. */
   modelRoutingProvenance?: ModelFallbackAttemptProvenance;
   thinkLevel?: ThinkLevel;
+  /** Run-scoped selection intent for declared chat-template effort. */
+  thinkingExplicit?: boolean;
   fastMode?: FastMode;
   /** Stable outer-run start time for auto fast-mode cutoff across retries/fallbacks. */
   fastModeStartedAtMs?: number;
@@ -159,7 +155,10 @@ export type AgentRunInputContext = {
   transcriptPrompt?: string;
   currentInboundEventKind?: InboundEventKind;
   inputProvenance?: InputProvenance;
+  heartbeatEventQueueSessionKey?: string;
   extraSystemPrompt?: string;
+  /** Exact producer-owned transient section; unannotated instructions remain persistent. */
+  extraSystemPromptTurnContext?: { start: number; text: string };
   images?: ImageContent[];
   imageOrder?: PromptImageOrderEntry[];
   /** Ordered facts represented by attachment text in the current prompt. */

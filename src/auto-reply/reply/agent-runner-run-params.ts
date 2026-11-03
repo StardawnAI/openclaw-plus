@@ -7,13 +7,64 @@ import type { runEmbeddedAgentEntry } from "../../agents/embedded-agent-runner/r
 import type { RunEmbeddedAgentInternalParams } from "../../agents/embedded-agent-runner/run/internal-params.js";
 import { findModelInCatalog, modelSupportsInput } from "../../agents/model-catalog-lookup.js";
 import { modelTransportRoutesMatch } from "../../agents/model-compat-catalog.js";
+import { resolveScheduledToolPolicyContext } from "../../agents/scheduled-tool-policy.js";
 import {
   findConfiguredProviderModel,
   resolveMergedModelProviderConfig,
 } from "../../config/model-provider-config.js";
+import { composeSessionSourceAssertion } from "../../config/sessions/session-source-authority.js";
+import { resolveCronFallbacksOverride } from "../../cron/isolated-agent/run-fallback-policy.js";
+import { resolveCronScheduledToolPolicy } from "../../cron/scheduled-tool-policy.js";
+import { resolveCronRunToolsAllow } from "../../cron/tools-allow.js";
+import {
+  assertAgentRunLifecycleGenerationCurrent,
+  getAgentEventLifecycleGeneration,
+} from "../../infra/agent-events.js";
 import type { AgentFallbackCandidateCommonParams } from "./agent-runner-fallback-cycle.types.js";
 import type { FollowupRun } from "./queue.js";
+import type { ReplyOperation } from "./reply-run-registry.js";
+import { getReplyOperationSessionReader } from "./reply-run-registry.state.js";
 import { resolveReplyRunTrigger } from "./reply-turn-kind.js";
+import { getReplySystemEventContext } from "./system-event-session-key.js";
+
+export function resolveReplyScheduledToolPolicy(
+  run: Pick<FollowupRun["run"], "scheduledAutomation" | "scheduledToolPolicy">,
+) {
+  const automation = run.scheduledAutomation;
+  automation?.assertCurrent();
+  if (!automation || run.scheduledToolPolicy) {
+    return run.scheduledToolPolicy;
+  }
+  const job = automation.job;
+  const toolsAllow = resolveCronRunToolsAllow(job);
+  return resolveScheduledToolPolicyContext({
+    toolsAllow,
+    scheduledToolPolicy: resolveCronScheduledToolPolicy({
+      toolsAllow,
+      scheduledToolPolicy: job.scheduledToolPolicy,
+      owner: job.owner,
+    }),
+    callerOrigin: job.toolsAllowProvenance?.callerOrigin,
+    execTarget: job.toolsAllowExecTarget,
+  });
+}
+
+export function createReplySourceReadGuard(
+  operation: ReplyOperation | undefined,
+  assertOperatorCurrent: (() => void) | undefined,
+) {
+  const readGeneration = getAgentEventLifecycleGeneration();
+  const sourceReader = getReplyOperationSessionReader(operation);
+  return {
+    sourceReader,
+    assertReadCurrent: composeSessionSourceAssertion([assertOperatorCurrent], (assertSource) => {
+      assertAgentRunLifecycleGenerationCurrent(readGeneration);
+      operation?.abortSignal.throwIfAborted();
+      sourceReader?.assertCurrent();
+      assertSource();
+    }),
+  };
+}
 
 export function resolveModelFallbackOptions(
   run: FollowupRun["run"],
@@ -23,11 +74,23 @@ export function resolveModelFallbackOptions(
     cfg: config,
     agentId: run.agentId,
     sessionKey: run.sessionKey,
-    hasSessionModelOverride: run.hasSessionModelOverride === true,
-    modelOverrideSource: run.modelOverrideSource,
-    hasAutoFallbackProvenance: run.hasAutoFallbackProvenance === true,
     modelSelectionLocked: run.modelSelectionLocked,
-    subagentSpawnLineage: run.subagentSpawnLineage,
+    ...(run.scheduledAutomation
+      ? {
+          hasSessionModelOverride: false,
+          modelFallbacksOverride: resolveCronFallbacksOverride({
+            cfg: config,
+            job: run.scheduledAutomation.job,
+            agentId: run.agentId,
+            ...run.scheduledAutomation.modelFallbackPolicy,
+          }),
+        }
+      : {
+          hasSessionModelOverride: run.hasSessionModelOverride === true,
+          modelOverrideSource: run.modelOverrideSource,
+          hasAutoFallbackProvenance: run.hasAutoFallbackProvenance === true,
+          subagentSpawnLineage: run.subagentSpawnLineage,
+        }),
   });
   return {
     cfg: config,
@@ -53,7 +116,13 @@ export function buildRunEntrySelection(
     requestedRouteResolution: selection.requestedRouteResolution,
     agentDir: selection.agentDir,
     fallbacksOverride: selection.fallbacksOverride,
-    userLockedAuthProfileId: run.authProfileIdSource === "user" ? run.authProfileId : undefined,
+    userLockedAuthProfileId: run.scheduledAutomation
+      ? run.scheduledAutomation.job.inferenceBinding?.source === "user"
+        ? run.scheduledAutomation.job.inferenceBinding.profileId
+        : undefined
+      : run.authProfileIdSource === "user"
+        ? run.authProfileId
+        : undefined,
   };
 }
 
@@ -101,14 +170,21 @@ export function buildFallbackCandidateTurnParams(params: AgentFallbackCandidateC
   const { turn } = params;
   return {
     preparedTtsPreferences: turn.opts?.preparedTtsPreferences,
+    awaitSessionDiffBaseline: turn.opts?.awaitSessionDiffBaseline,
     preparedRunAdmission: params.preparedRunAdmission,
     messageActionTurnCapability: params.messageActionTurnCapability,
     trigger: resolveReplyRunTrigger(turn),
+    heartbeatEventQueueSessionKey: getReplySystemEventContext(turn.opts)
+      ?.heartbeatEventQueueSessionKey,
     lane: params.runLane,
     fastModeStartedAtMs: params.fastModeStartedAtMs,
     fastModeAutoProgressState: params.fastModeAutoProgressState,
     isFinalFallbackAttempt: params.isFinalFallbackAttempt,
+    resolvedModelSelection: params.resolvedModelSelection,
+    modelFallbacksOverride: params.modelFallbacksOverride,
     prompt: turn.commandBody,
+    finalizePromptForResolvedTools:
+      turn.followupRun.run.scheduledAutomation?.finalizePromptForResolvedTools,
     transcriptPrompt: turn.transcriptCommandBody,
     media: turn.followupRun.media,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
@@ -117,9 +193,13 @@ export function buildFallbackCandidateTurnParams(params: AgentFallbackCandidateC
     currentInboundEventKind: turn.followupRun.currentInboundEventKind,
     currentInboundContext: turn.followupRun.currentInboundContext,
     extraSystemPrompt: turn.followupRun.run.extraSystemPrompt,
+    extraSystemPromptTurnContext: turn.followupRun.run.extraSystemPromptTurnContext,
     sourceReplyDeliveryMode: turn.followupRun.run.sourceReplyDeliveryMode,
-    // Omit false so heartbeat routes require explicit recipients without changing subagent defaults.
-    ...(turn.isHeartbeat ? { requireExplicitMessageTarget: true as const } : {}),
+    ...(turn.followupRun.run.scheduledAutomation
+      ? { requireExplicitMessageTarget: true }
+      : turn.isHeartbeat
+        ? { requireExplicitMessageTarget: turn.opts?.requireExplicitMessageTarget ?? true }
+        : {}),
     cleanupBundleMcpOnRunEnd: turn.opts?.cleanupBundleMcpOnRunEnd,
     silentReplyPromptMode: turn.followupRun.run.silentReplyPromptMode,
     suppressNextUserMessagePersistence: params.suppressQueuedUserPersistenceForCandidate,

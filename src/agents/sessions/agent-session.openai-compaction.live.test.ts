@@ -1,5 +1,5 @@
 // Live OpenAI AgentSession coverage for repeated automatic compaction and long-context opt-in.
-import { randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,7 @@ import { disposeOpenClawAgentDatabaseByPath } from "../../state/openclaw-agent-d
 import { closeOpenClawAgentDatabaseByPathAsync } from "../../state/openclaw-agent-db.js";
 import { prepareSystemAgentRunAdmission } from "../admitted-run-context.js";
 import { runEmbeddedAgent } from "../embedded-agent-runner.js";
+import { useLiveTestRuntimeConfig } from "../live-test-helpers.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
 import { createExtensionRuntime } from "./extensions/loader.js";
@@ -203,10 +204,7 @@ describeLive("OpenAI AgentSession repeated compaction live", () => {
         storePath: join(agentDir, "openclaw-agent.sqlite"),
       };
       ownedDatabasePaths.add(sessionTarget.storePath);
-      // The model must reproduce this marker verbatim after a model-written compaction summary.
-      // A short random token keeps the proof unguessable without testing 36-character UUID
-      // copy fidelity, which GPT-5.6 occasionally garbles.
-      const marker = `TOOL-MEMORY-${randomBytes(4).toString("hex").toUpperCase()}`;
+      const marker = `TOOL-MEMORY-${randomUUID()}`;
       const tailMarker = `SYNTHETIC-END-${randomUUID()}`;
       const sourceFile = join(workspaceDir, "synthetic-context.txt");
       const sourceText = `The durable verification marker is ${marker}. Remember it.\n${buildContextChunk(24_000)}\n${tailMarker}\n`;
@@ -262,6 +260,7 @@ describeLive("OpenAI AgentSession repeated compaction live", () => {
         process.stderr.write(`[openai-checkpoint-live] stage=${stage} phase=started\n`);
         const runId = randomUUID();
         const runConfig = structuredClone(config);
+        using _ = useLiveTestRuntimeConfig(runConfig);
         const admission = prepareSystemAgentRunAdmission(
           runConfig,
           runId,
@@ -283,9 +282,6 @@ describeLive("OpenAI AgentSession repeated compaction live", () => {
             thinkLevel: "low",
             timeoutMs: 2 * 60 * 1000,
             runId,
-            // The proof needs raw read output in tool history. Code Mode lets the model keep
-            // file data in guest state (for example a session-store entry) instead.
-            codeModeOverride: false,
             disableTools: !allowRead,
             ...(allowRead ? { toolsAllow: ["read"] } : {}),
             onExecutionPhase: ({ phase }) => {
@@ -319,13 +315,9 @@ describeLive("OpenAI AgentSession repeated compaction live", () => {
         );
         const seeded = await reopen();
         const history = seeded.buildSessionContext().messages;
-        // A rejected call (for example offset 0) may precede the retry that supplies the file.
         const suppliedText = history
-          .flatMap((message) =>
-            message.role === "toolResult" && message.toolName === "read" && !message.isError
-              ? message.content
-              : [],
-          )
+          .filter((message) => message.role === "toolResult")
+          .flatMap((message) => message.content)
           .filter((block) => block.type === "text")
           .map((block) => block.text)
           .join("\n");

@@ -127,9 +127,10 @@ NODE_VERSION_REQUESTED=0
 if [[ -n "${OPENCLAW_NODE_VERSION:-}" ]]; then
   NODE_VERSION_REQUESTED=1
 fi
-MIN_NODE_24_VERSION="24.22.1"
-MIN_NODE_26_VERSION="26.12.1"
-SUPPORTED_NODE_VERSION_LABEL="Node 24.22.1+ or Node 26.12.1+"
+# Compatibility floors mirror node-version.mjs, not the patched download default.
+MIN_NODE_24_VERSION="24.16.0"
+MIN_NODE_26_VERSION="26.1.0"
+SUPPORTED_NODE_VERSION_LABEL="Node 24.16.0+ or Node 26.1.0+"
 NODE_RELEASE_VERSION_CORE=""
 APK_NODE_BIN_DIR="/usr/bin"
 NPM_LOGLEVEL="${OPENCLAW_NPM_LOGLEVEL:-error}"
@@ -547,7 +548,7 @@ link_node_runtime_paths() {
   dir="$(node_dir)"
   runtime_bin="${node_path%/*}"
 
-  (umask 077; mkdir -p "${dir}/bin" "${PREFIX}/tools")
+  mkdir -p "${dir}/bin" "${PREFIX}/tools"
   ln -sfn "$node_path" "${dir}/bin/node"
   ln -sfn "$npm_path" "${dir}/bin/npm"
   for name in npx corepack; do
@@ -915,7 +916,7 @@ install_node() {
   emit_json step name node status start version "$NODE_VERSION"
   log "Installing Node ${NODE_VERSION} (user-space)..."
 
-  (umask 077; mkdir -p "${PREFIX}/tools")
+  mkdir -p "${PREFIX}/tools"
   # Darwin's default mktemp location can ignore TMPDIR; use the prepared path explicitly.
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/openclaw-node.XXXXXX")"
   TMPFILES+=("$tmp")
@@ -939,7 +940,7 @@ install_node() {
   fi
 
   rm -rf "$dir"
-  (umask 077; mkdir -p "$dir")
+  mkdir -p "$dir"
   tar -xzf "$tmp/node.tgz" -C "$dir" --strip-components=1
   rm -rf "$tmp"
 
@@ -1014,7 +1015,7 @@ fix_npm_prefix_if_needed() {
   fi
 
   local target="${HOME}/.npm-global"
-  (umask 077; mkdir -p "$target")
+  mkdir -p "$target"
   "$(npm_bin)" config set prefix "$target"
 
   local path_line="export PATH=\"${target}/bin:\$PATH\""
@@ -1032,7 +1033,7 @@ fix_npm_prefix_if_needed() {
 publish_executable_wrapper() {
   local target="$1" target_dir="" temp="" backup=""
   target_dir="${target%/*}"
-  (umask 077; mkdir -p "$target_dir")
+  mkdir -p "$target_dir"
   temp="$(mktemp "${target_dir}/.openclaw-wrapper.XXXXXX")" || return 1
   TMPFILES+=("$temp")
   cat > "$temp"
@@ -1109,6 +1110,7 @@ install_openclaw() {
     fi
   fi
 
+  mkdir -p "${PREFIX}/bin"
   publish_executable_wrapper "${PREFIX}/bin/openclaw" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1125,7 +1127,7 @@ install_openclaw_from_git() {
   if [[ -z "$repo_dir" ]]; then
     fail "Git install dir cannot be empty"
   fi
-  (umask 077; mkdir -p "$(dirname "$repo_dir")")
+  mkdir -p "$(dirname "$repo_dir")"
   if [[ -d "$repo_dir" ]]; then
     repo_dir="$(cd "$repo_dir" && pwd -P)"
   else
@@ -1211,6 +1213,7 @@ install_openclaw_from_git() {
   run_pnpm -C "$repo_dir" build
   emit_json step name cli-build status ok
 
+  mkdir -p "${PREFIX}/bin"
   publish_executable_wrapper "${PREFIX}/bin/openclaw" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail

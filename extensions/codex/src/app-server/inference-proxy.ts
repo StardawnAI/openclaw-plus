@@ -59,7 +59,7 @@ type ResidentTicket = {
   retiring: boolean;
 };
 
-/** Private, fixed-destination relay. No upstream credentials or model content are retained. */
+/** Private, fixed-destination relay. Upstream credentials are never retained. */
 export async function createCodexInferenceProxy(params: {
   upstream: URL;
   assertCurrent: () => void;
@@ -271,7 +271,6 @@ export async function createCodexInferenceProxy(params: {
             preparedUpload.assertCurrent();
             auth?.assertCurrent();
           };
-          assertAuthorized();
           if (auth) {
             for (const key of [
               "authorization",

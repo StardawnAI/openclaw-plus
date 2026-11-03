@@ -51,9 +51,7 @@ export async function gradiumTTS(params: {
   });
 
   try {
-    await assertOkOrThrowProviderError(response, "Gradium API error", {
-      requestHeaders: { "x-api-key": apiKey },
-    });
+    await assertOkOrThrowProviderError(response, "Gradium API error");
 
     return await readProviderBinaryResponse(response, "Gradium API error", "audio", {
       maxBytes,

@@ -2,13 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import * as fileLocks from "./file-lock-sync.js";
 import {
   assertManagedUpdateLeaseDatabaseIdentity,
   captureManagedUpdateLeaseDatabaseIdentity,
   createManagedHandoffLeaseDatabase,
   prepareManagedHandoffLeaseDatabase,
-  prepareManagedHandoffLeaseDatabaseIdentity,
 } from "./update-managed-service-handoff-database.js";
 import { prepareManagedHandoffLeaseStore } from "./update-managed-service-handoff-lease.js";
 
@@ -18,20 +16,24 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function fixture() {
+function fixture() {
   const root = fs.realpathSync(dirs.make("handoff-identity-"));
   const directory = path.join(root, "private-tmp");
   const databasePath = path.join(directory, "managed-update-handoffs.sqlite");
-  const binding = await prepareManagedHandoffLeaseDatabaseIdentity(databasePath);
+  // Opening SQLite retains an identity descriptor that prevents Windows parent renames.
+  // These diagnostics need only a private file identity, not an admitted connection.
+  fs.mkdirSync(directory, { mode: 0o700 });
+  fs.writeFileSync(databasePath, "original", { mode: 0o600 });
+  const binding = captureManagedUpdateLeaseDatabaseIdentity(databasePath);
   return { root, directory, databasePath, binding };
 }
 
 it.each(["file", "parent directory", "path", "missing file", "missing parent"] as const)(
   "explains a changed %s without accepting or repairing it",
-  async (change) => {
+  (change) => {
     vi.stubEnv("OPENCLAW_PROFILE", "diagnostic-test");
     vi.stubEnv("OPENCLAW_CONTAINER_HINT", "");
-    const { root, directory, databasePath, binding } = await fixture();
+    const { root, directory, databasePath, binding } = fixture();
     const retained = path.join(root, "retained");
     const original = fs.readFileSync(databasePath);
     let detail: string;
@@ -74,7 +76,7 @@ it.each(["file", "parent directory", "path", "missing file", "missing parent"] a
 it.each(["prepare", "create"] as const)(
   "explains a different path at %s admission",
   async (owner) => {
-    const { root, binding } = await fixture();
+    const { root, binding } = fixture();
     const current = path.join(root, "other.sqlite");
     const expected = `path (recorded ${binding.databasePath}; current ${current})`;
     if (owner === "prepare") {
@@ -86,13 +88,9 @@ it.each(["prepare", "create"] as const)(
   },
 );
 
-it.skipIf(process.platform === "win32").each([
-  { aliased: false, retainsOrdinaryAlias: false },
-  { aliased: true, retainsOrdinaryAlias: false },
-  { aliased: true, retainsOrdinaryAlias: true },
-])(
-  "preserves original admission through a prepared parent (%o)",
-  async ({ aliased, retainsOrdinaryAlias }) => {
+it.skipIf(process.platform === "win32").each([false, true])(
+  "preserves original admission through a prepared parent (aliased ancestor=%s)",
+  async (aliased) => {
     const directory = fs.realpathSync(dirs.make("handoff-original-parent-"));
     const root = path.join(directory, "install");
     const parent = path.join(directory, "private");
@@ -102,20 +100,6 @@ it.skipIf(process.platform === "win32").each([
     fs.symlinkSync(directory, alias, "dir");
     const databasePath = path.join(aliased ? alias : directory, "private", "handoffs.sqlite");
     const canonical = path.join(parent, "handoffs.sqlite");
-    if (retainsOrdinaryAlias) {
-      const ordinaryRealpath = fs.realpathSync;
-      // Windows S4U can retain a short TEMP spelling while native Root expands it.
-      vi.spyOn(fs, "realpathSync").mockImplementation((...args) => {
-        const resolved = ordinaryRealpath(...args);
-        return args[0] === databasePath && typeof resolved === "string" ? databasePath : resolved;
-      });
-      fs.realpathSync.native = ordinaryRealpath.native;
-    }
-    const acquireLock = fileLocks.acquireFileLockSyncWithRetry;
-    // Keep genuine self-contention deterministic without waiting for the retry budget.
-    vi.spyOn(fileLocks, "acquireFileLockSyncWithRetry").mockImplementation((file, options) =>
-      acquireLock(file, { ...options, timeoutMs: 0 }),
-    );
     const store = await prepareManagedHandoffLeaseStore({
       databasePath,
       serviceManagerEnv: process.env,

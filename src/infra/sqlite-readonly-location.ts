@@ -83,6 +83,10 @@ export function readSourceSidecars(pathname: string): SourceSidecars {
   };
 }
 
+function sameSidecars(left: SourceSidecars, right: SourceSidecars): boolean {
+  return left.journal === right.journal && left.shm === right.shm && left.wal === right.wal;
+}
+
 function openPinnedFile(
   pathname: string,
   expectedSourceIdentity?: DatabaseFileIdentity,
@@ -203,9 +207,7 @@ function sourceMatchesCopy(
 }
 
 function assertExpectedSidecars(pathname: string, expected: SourceSidecars): void {
-  const current = readSourceSidecars(pathname);
-  // The WAL index is rebuilt privately; concurrent readers may recreate the source index.
-  if (current.journal !== expected.journal || current.wal !== expected.wal) {
+  if (!sameSidecars(readSourceSidecars(pathname), expected)) {
     throw new SqliteSourceChangedError(`SQLite journal state changed while copying: ${pathname}`);
   }
 }
@@ -641,8 +643,16 @@ export async function inspectSqliteSchemaHeaderInProcess(
   pathname: string,
   stagingRoot?: string,
   agentSchemaVersionForOwnership?: number,
+  preserveSourceArtifacts = false,
 ) {
   const canonicalPath = fs.realpathSync.native(pathname);
+  if (preserveSourceArtifacts) {
+    return readSqliteSchemaHeaderFromSnapshot(
+      await prepareSqliteReadOnlyCopyInProcess(canonicalPath, stagingRoot),
+      undefined,
+      agentSchemaVersionForOwnership,
+    );
+  }
   const mode = readSourceJournalMode(canonicalPath);
   const sidecars = readSourceSidecars(canonicalPath);
   if (mode !== "wal" || (sidecars.wal && sidecars.shm)) {

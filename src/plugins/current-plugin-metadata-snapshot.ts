@@ -1,6 +1,5 @@
 import { listAgentWorkspaceDirs } from "../agents/workspace-dirs.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveImmutableInstallIdentity } from "./candidate-install-owner.js";
 import type {
   PluginMetadataSnapshotCandidate,
   ScopedPluginMetadataSnapshot,
@@ -12,11 +11,8 @@ import {
   setCurrentPluginMetadataSnapshotState,
   selectCurrentPluginMetadataCache,
 } from "./current-plugin-metadata-state.js";
-import { resolveInstalledPluginIndexInstallOwner } from "./installed-plugin-index-install-owner.js";
 import { resolveInstalledPluginIndexPolicyHash } from "./installed-plugin-index-policy.js";
 import { resolveInstalledManifestRegistryIndexFingerprint } from "./manifest-registry-installed.js";
-import { safeRealpathSync } from "./path-safety.js";
-import type { InspectionNativeEsmPolicy } from "./plugin-cache-artifacts.js";
 import {
   getPluginMetadataSnapshotCache,
   getScopedPluginCaches,
@@ -26,10 +22,7 @@ import {
   runOutsidePluginCache,
   withPluginCache,
 } from "./plugin-cache.js";
-import {
-  resolvePluginControlPlaneFingerprint,
-  resolvePluginDiscoveryContext,
-} from "./plugin-control-plane-context.js";
+import { resolvePluginControlPlaneFingerprint } from "./plugin-control-plane-context.js";
 import {
   createPluginExecutionFrame,
   getPluginExecutionFrame,
@@ -43,14 +36,7 @@ import type {
   PluginMetadataSnapshot,
   PluginMetadataSnapshotPluginIdScope,
 } from "./plugin-metadata-snapshot.types.js";
-import {
-  preparePluginNativeAdmissions,
-  publishInspectionNativeEsmPolicy,
-} from "./plugin-native-admission-state.js";
-import {
-  resolvePluginRuntimeArtifactSelection,
-  resolvePluginRuntimeExecutionArtifact,
-} from "./plugin-runtime-artifact-selection.js";
+import { preparePluginNativeAdmissions } from "./plugin-native-admission-state.js";
 import { normalizePluginIdScope, serializePluginIdScope } from "./plugin-scope.js";
 
 type CurrentPluginMetadataSnapshotOptions = {
@@ -87,60 +73,6 @@ export type PluginMetadataSnapshotScopeRunner = <T>(
 function resolveAgentWorkspaceFingerprint(config: OpenClawConfig, env?: NodeJS.ProcessEnv): string {
   // Discovery order determines schema precedence; retain the canonical resolver's order.
   return JSON.stringify(listAgentWorkspaceDirs(config, env));
-}
-
-function prepareInspectionNativeEsmPolicy(
-  snapshot: PluginMetadataSnapshot,
-  workspaces: readonly string[],
-  options: CurrentPluginMetadataSnapshotOptions,
-): InspectionNativeEsmPolicy {
-  const sources = new Map<string, string>();
-  const manifests = new Map(
-    snapshot.manifestRegistry.plugins.map((manifest) => [
-      `${manifest.rootDir}\0${manifest.id}`,
-      manifest,
-    ]),
-  );
-  for (const record of snapshot.index.plugins) {
-    const identity = resolveImmutableInstallIdentity(
-      record.origin,
-      resolveInstalledPluginIndexInstallOwner(record),
-      snapshot.index.installRecords,
-    );
-    const manifest = manifests.get(`${record.rootDir}\0${record.pluginId}`);
-    if (!identity || !manifest) {
-      continue;
-    }
-    for (const entryKind of ["runtime", "setup"] as const) {
-      const source = entryKind === "runtime" ? manifest.source : manifest.setupSource;
-      if (!source) {
-        continue;
-      }
-      for (const preferBuiltPluginArtifacts of [false, true]) {
-        const artifact = resolvePluginRuntimeExecutionArtifact(
-          resolvePluginRuntimeArtifactSelection({
-            ...manifest,
-            source,
-            entryKind,
-            preferBuiltPluginArtifacts,
-          }),
-        );
-        const canonicalSource = safeRealpathSync(artifact.source);
-        if (canonicalSource) {
-          sources.set(canonicalSource, identity);
-        }
-      }
-    }
-  }
-  return {
-    workspaces: new Set(workspaces),
-    sources,
-    devSourceRoot: resolvePluginDiscoveryContext({
-      config: options.config,
-      env: options.env,
-      workspaceDir: options.workspaceDir ?? snapshot.workspaceDir,
-    }).devSourceRoot,
-  };
 }
 
 function prepareConfigCompatibility(
@@ -191,13 +123,10 @@ function prepareCurrentPluginMetadataSnapshotPublication(
     snapshot.configFingerprint === defaultDiscoveryConfigFingerprint ||
     Boolean(compatibleConfigFingerprints?.includes(defaultDiscoveryConfigFingerprint));
   const envFingerprint = resolvePluginMetadataEnvFingerprint(options.env);
-  const agentWorkspaces =
+  const agentWorkspaceFingerprint =
     owner === "gateway" && options.config
-      ? listAgentWorkspaceDirs(options.config, options.env)
+      ? resolveAgentWorkspaceFingerprint(options.config, options.env)
       : undefined;
-  const agentWorkspaceFingerprint = agentWorkspaces && JSON.stringify(agentWorkspaces);
-  const inspectionPolicy =
-    agentWorkspaces && prepareInspectionNativeEsmPolicy(snapshot, agentWorkspaces, options);
   return () => {
     if (getCurrentPluginMetadataSnapshotState().owner === "gateway" && owner !== "gateway") {
       throw new Error("Gateway plugin metadata can only be replaced after shutdown");
@@ -216,9 +145,6 @@ function prepareCurrentPluginMetadataSnapshotPublication(
       defaultDiscoveryCompatible,
       agentWorkspaceFingerprint,
     );
-    if (inspectionPolicy) {
-      publishInspectionNativeEsmPolicy(getProcessPluginCache(), inspectionPolicy);
-    }
     for (const config of configIdentities) {
       currentPluginMetadataConfigIdentityCache.add(config);
     }
@@ -267,15 +193,15 @@ export function adoptCurrentPluginMetadataSnapshotIfAbsent(
   prepareCurrentPluginMetadataSnapshotPublication(snapshot, options)();
 }
 
-/** Installation revokes operation facts even when it runs between metadata scopes. */
-function revokeCurrentPluginMetadataSnapshotScopes(): void {
+/** Explicit installation refreshes the command before its next metadata phase. */
+function clearCurrentPluginMetadataOperation(): void {
   const caches = new Set(getScopedPluginCaches());
   const runtimeCaches = new Set();
-  for (let scoped = getPluginExecutionFrame()?.metadataScope; scoped; scoped = scoped.parent) {
-    if (scoped.immutableRuntimeGeneration) {
-      runtimeCaches.add(scoped.cache);
+  for (let scope = getPluginExecutionFrame()?.metadataScope; scope; scope = scope.parent) {
+    if (scope.immutableRuntimeGeneration) {
+      runtimeCaches.add(scope.cache);
     } else {
-      caches.add(scoped.cache);
+      caches.add(scope.cache);
     }
   }
   for (const cache of caches) {
@@ -546,6 +472,6 @@ registerPluginMetadataSnapshotReaders({
   getCurrentPluginMetadataSnapshot,
 });
 
-registerPluginMetadataProcessMemoLifecycleClear(revokeCurrentPluginMetadataSnapshotScopes, {
+registerPluginMetadataProcessMemoLifecycleClear(clearCurrentPluginMetadataOperation, {
   owner: "operation",
 });

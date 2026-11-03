@@ -32,16 +32,6 @@ const mocks = vi.hoisted(() => ({
   >(async () => null),
   converge: vi.fn<typeof import("./update-command-convergence.js").convergeUpdatePlugins>(),
   printResult: vi.fn(),
-  task: vi.fn<typeof import("../../daemon/schtasks-exec.js").execSchtasks>(),
-}));
-// Native Windows transport only; the finalizer and autostart recovery owner stay real.
-vi.mock("../../daemon/schtasks-exec.js", async () => ({
-  ...(await vi.importActual<typeof import("../../daemon/schtasks-exec.js")>(
-    "../../daemon/schtasks-exec.js",
-  )),
-  execSchtasks: mocks.task,
-  execScheduledTaskEnabledChange: (name: string, enabled: boolean) =>
-    mocks.task(["/Change", "/TN", name, enabled ? "/ENABLE" : "/DISABLE"]),
 }));
 vi.mock("./update-command-convergence.js", () => ({ convergeUpdatePlugins: mocks.converge }));
 vi.mock("./progress.js", () => ({ printResult: mocks.printResult }));
@@ -58,8 +48,6 @@ const dirs = useAutoCleanupTempDirTracker(afterEach);
 let root: string;
 beforeEach(async () => {
   vi.clearAllMocks();
-  mocks.converge.mockReset();
-  mocks.task.mockReset();
   mocks.activePort.mockReset();
   mocks.managedService.mockReset();
   vi.mocked(verifyUpdatedGateway)
@@ -81,57 +69,107 @@ afterEach(() => {
 
 describe("post-update failure recovery observation", () => {
   it.each([
-    { untouchedFailure: true, dataAtRisk: false, serviceStopped: false },
-    { untouchedFailure: false, dataAtRisk: false, serviceStopped: false },
-    { untouchedFailure: undefined, dataAtRisk: false, serviceStopped: false },
-    { untouchedFailure: true, dataAtRisk: true, serviceStopped: false },
-    { untouchedFailure: true, dataAtRisk: false, serviceStopped: true },
+    { mutationStarted: false, dataAtRisk: false, restart: false },
+    { mutationStarted: false, dataAtRisk: false, restart: true },
+    { mutationStarted: true, dataAtRisk: false, restart: false },
+    { mutationStarted: false, dataAtRisk: true, restart: false },
   ])(
-    "requires explicit untouched proof and no risk ($untouchedFailure, $dataAtRisk)",
-    async ({ untouchedFailure, dataAtRisk, serviceStopped }) => {
-      const { verifyUpdateFailureRecovery } = await import("./update-command-failure-recovery.js");
-      const result = await verifyUpdateFailureRecovery({
-        result: {
-          status: "error",
-          mode: "npm",
-          reason: "package-swap",
-          root,
-          before: { version: "2026.9.5" },
-          steps: [],
-          durationMs: 0,
-          ...(dataAtRisk
-            ? {
-                recovery: {
-                  serviceRestartSafe: false,
-                  reason: "runtime-verification-failed",
-                  dataAtRisk: "unreadable-state",
-                },
-              }
-            : {}),
-        },
-        root,
-        opts: { json: true },
-        untouchedFailure,
-        serviceStopped,
+    "records package-swap recovery (mutation=$mutationStarted, risk=$dataAtRisk, restart=$restart)",
+    async ({ mutationStarted, dataAtRisk, restart }) => {
+      const env = { ...process.env };
+      const run = { runId: updateLedger.createUpdateRun({ trigger: "cli" }, { env }).runId, env };
+      mocks.activePort.mockResolvedValueOnce(19431);
+      const readRuntime = vi.fn(async () => ({ status: "unknown" }));
+      vi.spyOn(gatewayService, "resolveGatewayService").mockReturnValue({
+        ...gatewayService.resolveGatewayService(),
+        readRuntime,
+        readCommand: vi.fn(async () => null),
+        isLoaded: vi.fn(async () => false),
       });
-      expect(result.reason).toBe("package-swap");
-      if (untouchedFailure === true && !dataAtRisk && !serviceStopped) {
+      const inspect = vi.spyOn(ports, "inspectPortUsage").mockImplementation(async (port) => ({
+        port,
+        status: "free",
+        listeners: [],
+        hints: [],
+      }));
+      const actual = await vi.importActual<typeof import("./update-command-verification.js")>(
+        "./update-command-verification.js",
+      );
+      vi.mocked(verifyUpdatedGateway).mockImplementationOnce(actual.verifyUpdatedGateway);
+      const failure = await finishSuccessfulPackageSwitch(
+        { packageRoot: root, json: true, run },
+        {
+          mutationStarted,
+          shouldRestart: restart,
+          opts: { json: true, restart, run },
+          preManagedServiceStop: {
+            stopped: false,
+            inspected: true,
+            runtimeInspected: true,
+            running: true,
+            serviceEnv: env,
+          },
+          result: {
+            status: "error",
+            mode: "pnpm",
+            root,
+            reason: "package-swap",
+            durationMs: 0,
+            before: { version: "2026.9.5" },
+            ...(dataAtRisk && {
+              recovery: {
+                serviceRestartSafe: false,
+                reason: "state-migration-started",
+              },
+            }),
+            steps: [
+              { name: "package-swap", command: "swap", cwd: root, durationMs: 0, exitCode: 1 },
+            ],
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({
+        name: "UpdateCommandFailure",
+        result: { status: "error", reason: "package-swap" },
+      });
+      if (!(failure instanceof ReportedUpdateCommandFailure)) {
+        throw failure;
+      }
+      const recorded = updateLedger.getUpdateRun(run.runId, { env });
+      assert(recorded);
+      if (mutationStarted || dataAtRisk) {
+        expect(verifyUpdatedGateway).toHaveBeenCalledOnce();
+        expect(recorded.steps).toContainEqual(
+          expect.objectContaining({ step: "gateway recovery verification", exitCode: 1 }),
+        );
+        if (dataAtRisk) {
+          expect(recorded.verification.recovery).toMatchObject({
+            reason: "state-migration-started",
+            serviceRestartSafe: false,
+          });
+        }
+      } else {
+        expect(verifyUpdatedGateway).not.toHaveBeenCalled();
         expect(mocks.activePort).not.toHaveBeenCalled();
         expect(mocks.managedService).not.toHaveBeenCalled();
-        expect(verifyUpdatedGateway).not.toHaveBeenCalled();
-        expect(result.verification).toEqual({});
-        expect(result.steps).toContainEqual(
-          expect.objectContaining({ name: "gateway recovery observation", exitCode: 0 }),
+        expect(recorded.steps).toContainEqual(
+          expect.objectContaining({ step: "gateway recovery observation", exitCode: 0 }),
         );
-      } else {
-        expect(verifyUpdatedGateway).toHaveBeenCalledOnce();
-      }
-      if (dataAtRisk) {
-        expect(result.recovery?.serviceRestartSafe).toBe(false);
-        expect(result.recovery?.serviceRestartSafe === false && result.recovery.dataAtRisk).toBe(
-          "unreadable-state",
+        const report = renderUpdateRunReport(recorded).markdown;
+        expect(report).not.toContain("restart-unhealthy");
+        expect(failure.result.steps).toContainEqual(
+          expect.objectContaining({
+            name: "gateway recovery observation",
+            diagnostics: [
+              "No recovery needed; still serving 2026.9.5. No service was stopped or started.",
+            ],
+          }),
         );
+        expect(readRuntime).not.toHaveBeenCalled();
+        expect(inspect).not.toHaveBeenCalled();
+        expect(recorded.verification.readyz).toBeUndefined();
       }
+      expect(mocks.converge).not.toHaveBeenCalled();
     },
   );
 
@@ -249,7 +287,7 @@ describe("post-update failure recovery observation", () => {
     { activated: true, json: false, deferred: true },
     { activated: true, json: true, deferred: true },
   ])(
-    "observes untouched failures and defers recorded state contention (activated=$activated, json=$json, deferred=$deferred)",
+    "defers only recorded state contention (activated=$activated, json=$json, deferred=$deferred)",
     async ({ activated, json, deferred }) => {
       const env = { ...process.env };
       const run = { runId: updateLedger.createUpdateRun({ trigger: "cli" }, { env }).runId, env };

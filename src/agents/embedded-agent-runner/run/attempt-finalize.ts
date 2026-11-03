@@ -16,11 +16,11 @@ import { runAgentEndSideEffectsAsync } from "../../harness/agent-end-side-effect
 import { finalizeHarnessContextEngineTurn } from "../../harness/context-engine-lifecycle.js";
 import { bindAgentHarnessHookMessages } from "../../harness/lifecycle-hook-messages.js";
 import type { AgentSession, SessionMessageEntry } from "../../sessions/index.js";
+import { withSessionManagerAppend } from "../../sessions/session-manager-append-admission.js";
 import {
   completedTurnMessageAnchor,
   captureCompletedTurnMessageAnchor,
 } from "../../sessions/session-manager-message-anchor.js";
-import { withSessionManagerWrite } from "../../sessions/session-manager-write-admission.js";
 import { runContextEngineMaintenance } from "../context-engine-maintenance.js";
 import { log } from "../logger.js";
 import { markActiveEmbeddedRunAbandoned, type EmbeddedAgentQueueHandle } from "../runs.js";
@@ -208,7 +208,6 @@ export async function completeEmbeddedAttemptAfterTurn(
       : undefined;
     await finalizeHarnessContextEngineTurn({
       ...attempt,
-      abortSignal: input.runAbortController.signal,
       contextEngine: activeContextEngine,
       promptError: Boolean(promptError),
       aborted: lifecycleState.aborted,
@@ -272,7 +271,7 @@ export async function completeEmbeddedAttemptAfterTurn(
   };
   if (!beforeAgentFinalizeRevisionReason && shouldPersistBootstrapCompletion()) {
     await withOwnedTranscriptWrite(() =>
-      withSessionManagerWrite(sessionManager, async () => {
+      withSessionManagerAppend(sessionManager, async () => {
         // Cancellation can arrive while an eligible completion waits for its writer.
         if (!shouldPersistBootstrapCompletion()) {
           return;
@@ -493,11 +492,6 @@ export function createEmbeddedAttemptExternalAbortController(input: {
     },
     dispose: () => {
       removeListener?.();
-      // Retained abort reasons can keep this controller after its attempt ends.
-      abortActiveSession = undefined;
-      abortRun = undefined;
-      isCompactionPendingOrRetrying = undefined;
-      isCompactionInFlight = undefined;
     },
     setActiveSessionAbort: (abort) => {
       abortActiveSession = abort;
@@ -523,6 +517,27 @@ export function createEmbeddedAttemptExternalAbortController(input: {
       await input.cleanupAfterEarlyAbort();
       throw abortError;
     },
+  };
+}
+
+/** Interrupts an owned idle request without cancelling the enclosing reply or lane. */
+export function createEmbeddedAttemptIdleInterruption(input: {
+  runAbortController: AbortController;
+  activeSession: Pick<AgentSession, "isCompacting">;
+  state: Pick<EmbeddedAttemptExecutionState, "terminal">;
+  abortRun: RunAbort;
+}): (error: Error) => boolean {
+  return (error) => {
+    if (input.runAbortController.signal.aborted) {
+      return false;
+    }
+    input.state.terminal = mergeAgentRunAttemptTerminal(input.state.terminal, {
+      kind: "timeout",
+      phase: input.activeSession.isCompacting ? "compaction" : "prompt",
+      source: "idle",
+    });
+    input.abortRun(true, error);
+    return true;
   };
 }
 

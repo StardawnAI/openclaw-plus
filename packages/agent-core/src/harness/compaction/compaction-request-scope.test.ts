@@ -72,6 +72,7 @@ describe("run-owned compaction requests", () => {
         messageEntry(assistant("The internal task is still running.", 4), 3),
       ];
       const preparation = prepare(entries);
+      expect(preparation.requestState).toBe("unresolved");
       expect(preparation.isSplitTurn).toBe(true);
       const result = compactWithoutSummary(preparation);
       if (!result.ok) {

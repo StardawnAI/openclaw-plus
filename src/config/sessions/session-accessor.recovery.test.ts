@@ -12,6 +12,7 @@ import * as workerStore from "../../infra/sqlite-worker-store.js";
 import { onSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
 import { sessionChanges } from "../../sessions/session-row-changes.js";
 import { runInDetachedAsyncContext } from "../../shared/detached-async-context.js";
+import type { OpenClawAgentDatabaseOptions } from "../../state/openclaw-agent-db-contract.js";
 import {
   closeOpenClawAgentDatabaseByPathAsync,
   resolveOpenClawAgentSqlitePath,
@@ -23,11 +24,11 @@ import {
   loadTranscriptEvents,
   recoverSessionEntryFromRestartTombstone,
   replaceSessionEntry,
-  replaceTranscriptEvents,
 } from "./session-accessor.js";
 import { readSessionTranscriptMessageEventPage } from "./session-accessor.sqlite-active-events.js";
 import { readPreparedSessionEntryChange } from "./session-accessor.sqlite-entry-cache-publication.js";
 import { resolveSqliteReadScope, toDatabaseOptions } from "./session-accessor.sqlite-scope.js";
+import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.test-support.js";
 import { waitForSessionTranscriptIndexReconcilesInStateDir } from "./session-transcript-reconcile.js";
 import type { InternalSessionEntry } from "./types.js";
 
@@ -387,6 +388,10 @@ describe("recoverSessionEntryFromRestartTombstone", () => {
     let verifiedCommands = 0;
     const runOperation = workerStore.runSqliteWorkerStoreOperation;
     const captures = vi.spyOn(agentExecution, "captureOpenClawAgentDatabaseExecution");
+    const preparations = vi.spyOn(
+      agentExecution,
+      "captureOpenClawAgentDatabasePreparationExecution",
+    );
     const observer = vi
       .spyOn(workerStore, "runSqliteWorkerStoreOperation")
       .mockImplementation(
@@ -425,6 +430,8 @@ describe("recoverSessionEntryFromRestartTombstone", () => {
                   verifiedCommands++;
                   if (retireOwner && verifiedCommands === 1) {
                     // Retirement belongs to an independent caller after the native commit.
+                    captures.mockClear();
+                    preparations.mockClear();
                     closing = runInDetachedAsyncContext(() =>
                       closeOpenClawAgentDatabaseByPathAsync(
                         resolveOpenClawAgentSqlitePath(databaseOptions),
@@ -432,7 +439,6 @@ describe("recoverSessionEntryFromRestartTombstone", () => {
                       ),
                     );
                     void closing.catch(() => undefined);
-                    captures.mockClear();
                   }
                   if (dropReceipt) {
                     const receipt = vi
@@ -486,9 +492,18 @@ describe("recoverSessionEntryFromRestartTombstone", () => {
       }
       await closing;
       if (retireOwner) {
-        expect(captures).not.toHaveBeenCalled();
+        // The spies are module-wide: earlier cases' databases keep automatic session
+        // maintenance owners whose quiet-window passes can land here. Only captures of
+        // the retired database would mean recovery work outlived its owner.
+        const retiredPath = resolveOpenClawAgentSqlitePath(databaseOptions);
+        const capturesRetired = (
+          calls: ReadonlyArray<readonly [OpenClawAgentDatabaseOptions, ...unknown[]]>,
+        ) => calls.filter(([options]) => resolveOpenClawAgentSqlitePath(options) === retiredPath);
+        expect(capturesRetired(captures.mock.calls)).toEqual([]);
+        expect(capturesRetired(preparations.mock.calls)).toEqual([]);
       }
       captures.mockRestore();
+      preparations.mockRestore();
       expect(
         loadSessionEntry({
           agentId: "main",
@@ -526,6 +541,7 @@ describe("recoverSessionEntryFromRestartTombstone", () => {
       expect(verifiedCommands).toBe(2);
     } finally {
       captures.mockRestore();
+      preparations.mockRestore();
       observer.mockRestore();
       for (const restore of restoreFaults) {
         restore();

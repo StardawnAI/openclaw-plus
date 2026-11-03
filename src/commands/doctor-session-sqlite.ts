@@ -85,6 +85,7 @@ import {
   countRetainedSessionSources,
   prepareRetainedSessionImport,
   retireDeferredPluginSessionImport,
+  collectRetainedTrajectoryPointers,
 } from "./doctor-session-sqlite-retained.js";
 import { settleDuplicateSessionSqliteArchives } from "./doctor-session-sqlite-retirement.js";
 import {
@@ -212,7 +213,7 @@ export async function runDoctorSessionSqlite(
                   pending: pendingPlugins,
                 }),
               });
-        settlementIssuesForStore(target.storePath).forEach((issue) => report.issues.push(issue));
+        report.issues.push(...settlementIssuesForStore(target.storePath));
         return report;
       },
     });
@@ -261,7 +262,7 @@ export async function runDoctorSessionSqlite(
     );
   }
   for (const report of reports) {
-    settlementIssuesForStore(report.storePath).forEach((issue) => report.issues.push(issue));
+    report.issues.push(...settlementIssuesForStore(report.storePath));
   }
   if (activeRun && coverage) {
     for (const owner of archiveTargets) {
@@ -615,11 +616,11 @@ export async function settleRetainedDoctorSessionSources(
     );
     for (const [index, owner] of owners.entries()) {
       const ownIssue = owner.report.issues.find((issue) => !isRetainedSourceSettlementIssue(issue));
-      for (const issue of plan.owners[index]!.owner.report.issues) {
-        if (issue.code === "plugin_migration_source_retained") {
-          owner.report.issues.push(issue);
-        }
-      }
+      owner.report.issues.push(
+        ...plan.owners[index]!.owner.report.issues.filter(
+          (issue) => issue.code === "plugin_migration_source_retained",
+        ),
+      );
       if (failedOwners.length === 0 || failedOwners.includes(owner)) {
         owner.report.issues.push({
           code: "retained_plugin_source_settlement_failed",
@@ -991,7 +992,7 @@ async function inspectOrMigrateTarget(params: {
         if (indexless) {
           report.issues.push({
             code: "retained_plugin_source_index_rebuilt",
-            message: `Derived the retained source index from verified transcripts for ${path.dirname(params.target.storePath)}. Recorded their identities in the completed import receipt without creating sessions.json or replaying canonical metadata.`,
+            message: `Derived the retained source index from verified transcripts for ${path.dirname(params.target.storePath)}. Recorded their identities in the completed import receipt without creating sessions.json or replaying existing metadata.`,
           });
         }
       }
@@ -1291,18 +1292,11 @@ async function archiveLegacyArtifacts(
         pointers.add(pointer);
       }
     }
-    // A pointer sidecar only locates its transcript's trajectory, so it settles with that
-    // transcript, including a receipt-verified one an earlier run archived without it.
-    for (const transcript of receiptSources) {
-      const pointer = resolveTrajectoryPointerPath(transcript);
-      if (
-        pointer &&
-        receiptSources.has(pointer) &&
-        !owner.sourceConflicts?.has(transcript) &&
-        !fs.existsSync(transcript)
-      ) {
-        pointers.add(pointer);
-      }
+    for (const pointer of collectRetainedTrajectoryPointers(
+      receiptSources,
+      owner.sourceConflicts,
+    )) {
+      pointers.add(pointer);
     }
     for (const pointer of pointers) {
       const source = canonicalMigrationFilePath(pointer);

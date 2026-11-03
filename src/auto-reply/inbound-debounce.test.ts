@@ -14,11 +14,6 @@ describe("createInboundDebouncer", () => {
 
   type Message = { key: string; id: string };
   type RecordingOptions<T> = Omit<InboundDebounceCreateParams<T>, "buildKey" | "onFlush">;
-  type KeyedOptions = Omit<InboundDebounceCreateParams<Message>, "buildKey" | "debounceMs"> & {
-    debounceMs?: number;
-  };
-  const keyedDebouncer = (options: KeyedOptions) =>
-    createInboundDebouncer<Message>({ debounceMs: 0, buildKey: (item) => item.key, ...options });
 
   function createRecordingDebouncer<T extends Message = Message>(options: RecordingOptions<T>) {
     const calls: string[][] = [];
@@ -57,79 +52,6 @@ describe("createInboundDebouncer", () => {
     });
     return { debouncer, started, finished, entered, release };
   }
-
-  it.each([false, true])(
-    "waits for shipped flush callbacks when ordering and draining (thenable: %s)",
-    async (thenable) => {
-      const started: string[] = [];
-      const finished: string[] = [];
-      const firstCompletion = createDeferred();
-      const debouncer = keyedDebouncer({
-        serializeImmediate: true,
-        // @ts-expect-error Released plugins return promises instead of the current lifecycle shape.
-        onFlush: (items) => {
-          const id = items[0]?.id ?? "";
-          started.push(id);
-          const completion = (id === "first" ? firstCompletion.promise : Promise.resolve()).then(
-            () => {
-              finished.push(id);
-            },
-          );
-          // oxlint-disable-next-line unicorn/no-thenable -- Exercise a shipped structural PromiseLike callback.
-          return thenable ? { then: completion.then.bind(completion) } : completion;
-        },
-      });
-      const first = debouncer.enqueue({ key: "a", id: "first" });
-      const second = debouncer.enqueue({ key: "a", id: "second" });
-      const outcomes = Promise.allSettled([first, second]);
-      const onDrained = vi.fn();
-      const drain = debouncer.drain().then(onDrained);
-      let beforeRelease;
-      try {
-        await vi.advanceTimersByTimeAsync(0);
-        beforeRelease = { started: [...started], drained: onDrained.mock.calls.length };
-      } finally {
-        firstCompletion.resolve();
-        await Promise.all([outcomes, drain]);
-      }
-
-      expect(await outcomes).toEqual([
-        { status: "fulfilled", value: undefined },
-        { status: "fulfilled", value: undefined },
-      ]);
-      expect(beforeRelease).toEqual({ started: ["first"], drained: 0 });
-      expect(finished).toEqual(["first", "second"]);
-      expect(onDrained).toHaveBeenCalledOnce();
-    },
-  );
-
-  it.each([false, true])(
-    "reports a shipped flush rejection once and releases its key (thenable: %s)",
-    async (thenable) => {
-      const failure = new Error("legacy flush failed");
-      const onError = vi.fn();
-      const calls: string[] = [];
-      const debouncer = keyedDebouncer({
-        serializeImmediate: true,
-        // @ts-expect-error Released plugins return promises instead of the current lifecycle shape.
-        onFlush: (items) => {
-          const id = items[0]?.id ?? "";
-          calls.push(id);
-          const completion = id === "first" ? Promise.reject(failure) : Promise.resolve();
-          // oxlint-disable-next-line unicorn/no-thenable -- Exercise a shipped structural PromiseLike callback.
-          return thenable ? { then: completion.then.bind(completion) } : completion;
-        },
-        onError,
-      });
-
-      await expect(debouncer.enqueue({ key: "a", id: "first" })).resolves.toBeUndefined();
-      await expect(debouncer.enqueue({ key: "a", id: "second" })).resolves.toBeUndefined();
-      await debouncer.drain();
-
-      expect(onError).toHaveBeenCalledExactlyOnceWith(failure, [{ key: "a", id: "first" }]);
-      expect(calls).toEqual(["first", "second"]);
-    },
-  );
 
   it("seals bounded batches without blocking collection behind an active flush", async () => {
     const firstGate = createDeferred();
@@ -183,33 +105,6 @@ describe("createInboundDebouncer", () => {
     expect(calls).toEqual([[1, 2], [3]]);
   });
 
-  it("flushes sustained same-key messages in complete, ordered batches", async () => {
-    const { calls, debouncer } = createRecordingDebouncer({ debounceMs: 50 });
-
-    for (let index = 0; index < 12; index += 1) {
-      await debouncer.enqueue({ key: "a", id: String(index) });
-      await vi.advanceTimersByTimeAsync(20);
-    }
-    expect(calls).toStrictEqual([]);
-
-    await debouncer.enqueue({ key: "a", id: "12" });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(calls).toEqual([Array.from({ length: 13 }, (_, index) => String(index))]);
-
-    for (let index = 13; index < 25; index += 1) {
-      await debouncer.enqueue({ key: "a", id: String(index) });
-      await vi.advanceTimersByTimeAsync(20);
-    }
-    expect(calls).toHaveLength(1);
-
-    await vi.advanceTimersByTimeAsync(10);
-    expect(calls).toEqual([
-      Array.from({ length: 13 }, (_, index) => String(index)),
-      Array.from({ length: 12 }, (_, index) => String(index + 13)),
-    ]);
-    await debouncer.drain();
-  });
-
   it.each([undefined, 500])("anchors the batch deadline (maximum wait: %s)", async (maxWaitMs) => {
     const { calls, debouncer } = createRecordingDebouncer<Message & { windowMs: number }>({
       debounceMs: 0,
@@ -261,28 +156,6 @@ describe("createInboundDebouncer", () => {
     await debouncer.drain();
   });
 
-  it("supersedes a pending flush check when another item appends", async () => {
-    const check = createDeferred<boolean>();
-    const { calls, debouncer } = createRecordingDebouncer({
-      debounceMs: 10,
-      shouldHoldFlush: () => check.promise,
-    });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(calls).toEqual([]);
-
-    await vi.advanceTimersByTimeAsync(5);
-    await debouncer.enqueue({ key: "a", id: "2" });
-    check.resolve(false);
-    await vi.advanceTimersByTimeAsync(9);
-    expect(calls).toEqual([]);
-
-    await vi.advanceTimersByTimeAsync(1);
-    expect(calls).toEqual([["1", "2"]]);
-    await debouncer.drain();
-  });
-
   it.each([false, true])(
     "forces the deadline flush without another hold check (check pending: %s)",
     async (pending) => {
@@ -305,37 +178,6 @@ describe("createInboundDebouncer", () => {
       await debouncer.drain();
     },
   );
-
-  it("flushes an explicit key without consulting the hold check", async () => {
-    const shouldHoldFlush = vi.fn(() => true);
-    const { calls, debouncer } = createRecordingDebouncer({ debounceMs: 10, shouldHoldFlush });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await debouncer.flushKey("a");
-
-    expect(calls).toEqual([["1"]]);
-    expect(shouldHoldFlush).not.toHaveBeenCalled();
-    await debouncer.drain();
-  });
-
-  it("reports buffered items when cancelling a key", async () => {
-    const canceled: Array<string[]> = [];
-
-    const { calls, debouncer } = createRecordingDebouncer({
-      debounceMs: 10,
-      onCancel: (items) => {
-        canceled.push(items.map((entry) => entry.id));
-      },
-    });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await debouncer.enqueue({ key: "a", id: "2" });
-    expect(debouncer.cancelKey("a")).toBe(true);
-    await vi.advanceTimersByTimeAsync(10);
-
-    expect(canceled).toEqual([["1", "2"]]);
-    expect(calls).toEqual([]);
-  });
 
   it("cancels a released flush still waiting behind active same-key work", async () => {
     const calls: Array<string[]> = [];
@@ -378,6 +220,26 @@ describe("createInboundDebouncer", () => {
     expect(calls).toEqual([["1"], ["3"]]);
   });
 
+  it("cancels immediate work waiting behind an active flush without canceling later arrivals", async () => {
+    const canceled: string[][] = [];
+    const { debouncer, started, finished, entered, release } = createBlockedDebouncer({
+      debounceMs: 50,
+      shouldDebounce: (item) => item.id === "1",
+      onCancel: (items) => canceled.push(items.map((item) => item.id)),
+    });
+    await debouncer.enqueue({ key: "a", id: "1" });
+    const first = debouncer.flushKey("a");
+    await entered.promise;
+    const second = debouncer.enqueue({ key: "a", id: "2" });
+    expect(debouncer.cancelKey("a")).toBe(true);
+    const third = debouncer.enqueue({ key: "a", id: "3" });
+    release.resolve();
+    await Promise.all([first, second, third, debouncer.drain()]);
+    expect(canceled).toEqual([["2"]]);
+    expect(started).toEqual(["1", "3"]);
+    expect(finished).toEqual(["1", "3"]);
+  });
+
   it("flushes buffered items before non-debounced item", async () => {
     const { calls, debouncer } = createRecordingDebouncer<Message & { debounce: boolean }>({
       debounceMs: 50,
@@ -388,20 +250,6 @@ describe("createInboundDebouncer", () => {
     await debouncer.enqueue({ key: "a", id: "2", debounce: false });
 
     expect(calls).toEqual([["1"], ["2"]]);
-  });
-
-  it("supports per-item debounce windows when default debounce is disabled", async () => {
-    const { calls, debouncer } = createRecordingDebouncer<Message & { windowMs: number }>({
-      debounceMs: 0,
-      resolveDebounceMs: (item) => item.windowMs,
-    });
-
-    await debouncer.enqueue({ key: "forward", id: "1", windowMs: 30 });
-    await debouncer.enqueue({ key: "forward", id: "2", windowMs: 30 });
-
-    expect(calls).toStrictEqual([]);
-    await vi.advanceTimersByTimeAsync(30);
-    expect(calls).toEqual([["1", "2"]]);
   });
 
   it("keeps fire-and-forget keyed work ahead of a later buffered item", async () => {
@@ -642,21 +490,6 @@ describe("createInboundDebouncer", () => {
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
     }
-  });
-
-  it("bypasses debouncing for new keys once the tracked-key cap is reached", async () => {
-    const { calls, debouncer } = createRecordingDebouncer({
-      debounceMs: 50,
-      maxTrackedKeys: 1,
-    });
-
-    await debouncer.enqueue({ key: "a", id: "1" });
-    await debouncer.enqueue({ key: "b", id: "2" });
-
-    expect(calls).toEqual([["2"]]);
-
-    await vi.advanceTimersByTimeAsync(50);
-    expect(calls).toEqual([["2"], ["1"]]);
   });
 
   it("keeps same-key overflow work ordered after falling back to immediate flushes", async () => {

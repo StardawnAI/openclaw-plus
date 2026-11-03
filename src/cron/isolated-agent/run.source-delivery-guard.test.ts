@@ -85,8 +85,6 @@ describe("cron source delivery policy", () => {
       disableMessageTool: row.disabled,
       forceMessageTool: false,
       requireExplicitMessageTarget: row.explicitTarget,
-      // A send to the configured target never ends the job's turn on its own.
-      messageToolFinalByDefault: false,
       messageChannel: row.channel,
       ...(row.channel
         ? { messageTo: "123", agentAccountId: "acct-1", messageThreadId: "thread-99" }
@@ -112,7 +110,7 @@ describe("cron source delivery policy", () => {
             force: true,
             requireExplicitTarget: false,
             requireExplicitTargetEvidence: false,
-            finalByDefault: true,
+            finalByDefault: false,
           },
           fallback: { directDelivery: true, skipWhenMessageToolSentToTarget: true },
         },

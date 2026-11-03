@@ -11,16 +11,14 @@ vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof import("node:child_process")>()),
   execFileSync: mocks.execFileSyncMock,
 }));
-vi.mock("openclaw/plugin-sdk/websocket-runtime", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("openclaw/plugin-sdk/websocket-runtime")>()),
-  WebSocket: mocks.FakeWebSocket,
-}));
+vi.mock("ws", () => ({ default: mocks.FakeWebSocket }));
 vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
   fetchWithSsrFGuard: mocks.fetchWithSsrFGuardMock,
 }));
 vi.mock("openclaw/plugin-sdk/provider-auth", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/provider-auth")>()),
   isProviderAuthProfileConfigured: mocks.isProviderAuthProfileConfiguredMock,
+  isProviderAuthProfileConfiguredAsync: mocks.isProviderAuthProfileConfiguredMock,
   resolveProviderAuthProfileApiKey: mocks.resolveProviderAuthProfileApiKeyMock,
 }));
 const { isProviderAuthProfileConfiguredMock } = mocks;
@@ -46,7 +44,7 @@ describe("OpenAI realtime public projection", () => {
 
   it.each([false, true])(
     "advertises the subscription relay capability independently of OAuth readiness=%s",
-    (hasOAuth) => {
+    async (hasOAuth) => {
       isProviderAuthProfileConfiguredMock.mockImplementation(
         ({ profileTypes }: { profileTypes?: readonly string[] }) =>
           hasOAuth && profileTypes?.includes("oauth") === true,
@@ -60,9 +58,9 @@ describe("OpenAI realtime public projection", () => {
         config: providerConfig,
         clientHints: { gatewayRelaySupported: true },
       });
-      expect(internalApi.isGatewayRelayConfigured({ providerConfig, agentId: "main" })).toBe(
-        hasOAuth,
-      );
+      expect(
+        await internalApi.isGatewayRelayConfiguredAsync({ providerConfig, agentId: "main" }),
+      ).toBe(hasOAuth);
       for (const [azureConfig, supportsRelay] of [
         [{ azureEndpoint: " https://example.openai.azure.com " }, false],
         [{ azureDeployment: " live-deployment " }, false],
@@ -82,7 +80,7 @@ describe("OpenAI realtime public projection", () => {
           clientHints: { gatewayRelaySupported: supportsRelay },
         });
         expect(
-          internalApi.isGatewayRelayConfigured({
+          await internalApi.isGatewayRelayConfiguredAsync({
             providerConfig: azureProviderConfig,
             agentId: "main",
           }),
@@ -91,7 +89,7 @@ describe("OpenAI realtime public projection", () => {
     },
   );
 
-  it("admits opaque realtime models without publishing them", () => {
+  it("admits opaque realtime models without publishing them", async () => {
     const { broker } = createQuicksilverBrowserBrokerFixture();
     const provider = buildOpenAIRealtimeVoiceProvider({
       quicksilverBrowserSessionBroker: broker,
@@ -104,7 +102,7 @@ describe("OpenAI realtime public projection", () => {
 
     expect(provider.models).not.toContain(OPAQUE_REALTIME_MODEL);
     expect(
-      internalApi.isGatewayRelayConfigured({
+      await internalApi.isGatewayRelayConfiguredAsync({
         providerConfig,
         agentId: "main",
       }),

@@ -1,4 +1,4 @@
-import { createSqliteReadOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
+import { captureSqliteReadOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
 import { getSpawnBroker, runWithSpawnBroker } from "../process/spawn-broker/context.js";
 import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { getBoundLegacyPluginSdkResourceHost } from "./legacy-sdk-resource-host.js";
@@ -16,9 +16,7 @@ export function createPluginBackgroundRunner(
   isCleanup: (token: object) => boolean,
 ): <T>(run: () => T) => T {
   const spawnBroker = getSpawnBroker();
-  const readOnlyWorkers = createSqliteReadOnlyWorkerScope();
-  // Close after admitted work and plugin cleanup, never with the loading caller.
-  instance.onModuleDispose(() => readOnlyWorkers.close());
+  const runWithReadOnlyWorkers = captureSqliteReadOnlyWorkerScope();
   const resourceHost = withPluginRuntimeGatewayContextResolver(
     undefined,
     getBoundLegacyPluginSdkResourceHost,
@@ -27,7 +25,7 @@ export function createPluginBackgroundRunner(
   return (run) => {
     const current = pluginInstanceInvocation.getStore();
     const cleanup =
-      current?.instance === instance && instance.hasActiveCall && isCleanup(current.token)
+      current?.instance === instance && isCleanup(current.token)
         ? { instance, token: current.token }
         : undefined;
     const registry = instance.owner?.registry;
@@ -35,7 +33,7 @@ export function createPluginBackgroundRunner(
     const resolver = runtime && getGatewayContextResolver(runtime);
     return runInDetachedAsyncContext(() =>
       runWithSpawnBroker(spawnBroker, () =>
-        readOnlyWorkers.run(() =>
+        runWithReadOnlyWorkers(() =>
           withPluginRuntimeGatewayContextResolver(resolver, () => {
             // Only an already admitted cleanup may cross ordinary retirement.
             const invoke = () =>

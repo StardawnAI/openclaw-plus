@@ -38,6 +38,7 @@ import {
   type CapturedAgentEvent,
   type CodexNativeUsageSnapshot,
 } from "../../test/helpers/gateway-codex-harness.js";
+import { storeLiveApiKeyProfile } from "../../test/helpers/live-api-key-profile.js";
 import {
   renderBitmapTextPngBase64,
   renderSolidColorPngBase64,
@@ -71,6 +72,8 @@ import {
   isExpectedYieldedAgentTimeout,
   isRetryableCodexHarnessLiveError,
   isStrictExpectedCodexModelsCommandText,
+  resolveBoundedPositiveIntEnv,
+  resolveLiveTimeoutMs,
   shouldUseCodexHarnessSubagentOnlyFastPath,
 } from "./gateway-codex-harness.live-helpers.js";
 import {
@@ -263,31 +266,6 @@ type CodexHarnessThinkingLevel =
   | "xhigh"
   | "max"
   | "ultra";
-
-function resolveLiveTimeoutMs(raw: string | undefined, fallback: number): number {
-  const parsed = raw ? Number(raw) : Number.NaN;
-  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
-}
-
-function resolveBoundedPositiveIntEnv(
-  name: string,
-  raw: string | undefined,
-  fallback: number,
-  max: number,
-  min = 1,
-): number {
-  if (raw === undefined || raw.trim() === "") {
-    return fallback;
-  }
-  if (!/^\d+$/u.test(raw)) {
-    throw new Error(`invalid ${name}: ${raw}`);
-  }
-  const parsed = Number(raw);
-  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) {
-    throw new Error(`${name} must be between ${min} and ${max}`);
-  }
-  return parsed;
-}
 
 function resolveCodexHarnessThinkingLevel(raw: string | undefined): CodexHarnessThinkingLevel {
   const normalized = raw?.trim().toLowerCase() || "low";
@@ -483,6 +461,7 @@ async function writeLiveGatewayConfig(params: {
   codeModeOnly?: boolean;
   compactionMode: CodexCompactionStressMode;
   nativeSupervision?: { command: string };
+  sessionCatalogHomes?: string[];
   loopDetectionPreToolUseRelay?: boolean;
   queueMode?: "steer";
   configPath: string;
@@ -509,6 +488,9 @@ async function writeLiveGatewayConfig(params: {
           enabled: true,
           config: {
             ...(params.nativeSupervision ? { supervision: { enabled: true } } : {}),
+            ...(params.sessionCatalogHomes
+              ? { sessionCatalog: { homes: params.sessionCatalogHomes } }
+              : {}),
             appServer: {
               ...(params.nativeSupervision
                 ? { command: params.nativeSupervision.command, homeScope: "user" as const }
@@ -903,6 +885,52 @@ async function waitForChatFinalText(params: {
     await delay(50);
   }
   throw new Error(`timed out waiting for chat final for ${params.runId}`);
+}
+
+/**
+ * A transcript-owned message-tool reply is delivered by its committed history row; the
+ * chat final then omits it so clients do not render it twice (chat-send-source-finalization).
+ */
+async function waitForChatRunReplyText(params: {
+  client: GatewayClient;
+  events: EventFrame[];
+  runId: string;
+  sessionKey: string;
+  timeoutMs: number;
+}): Promise<string> {
+  const deadline = Date.now() + params.timeoutMs;
+  while (Date.now() < deadline) {
+    const finals = params.events.filter(
+      (event) =>
+        event.event === "chat" &&
+        asOptionalRecord(event.payload)?.runId === params.runId &&
+        asOptionalRecord(event.payload)?.state === "final",
+    );
+    if (finals.length > 0) {
+      const text = finals.map((event) => extractChatFinalText(event, params.runId)).find(Boolean);
+      if (text) {
+        return text;
+      }
+      const history = await params.client.request<{ messages: unknown[] }>("chat.history", {
+        sessionKey: params.sessionKey,
+        limit: 100,
+      });
+      const committed = history.messages
+        .map(asOptionalRecord)
+        .filter(
+          (message) =>
+            message?.role === "assistant" &&
+            asOptionalRecord(message["__openclaw"])?.runId === params.runId,
+        )
+        .map((message) => extractFirstTextBlock(message)?.trim())
+        .filter((reply): reply is string => Boolean(reply));
+      if (committed.length > 0) {
+        return committed.at(-1)!;
+      }
+    }
+    await delay(250);
+  }
+  throw new Error(`timed out waiting for the reply to ${params.runId}`);
 }
 
 async function waitForChatAgentRunOk(client: GatewayClient, runId: string): Promise<void> {
@@ -1464,6 +1492,15 @@ function randomBitmapTextToken(length = 6): string {
   return [...randomBytes(length)].map((byte) => alphabet[byte % alphabet.length]).join("");
 }
 
+function randomSpelledWordsToken(count: number): string {
+  // Models sometimes drop trailing characters when echoing long hex runs; spelled words echo intact.
+  const words = (
+    "ALPHA BRAVO CHARLIE DELTA ECHO FOXTROT GOLF HOTEL INDIA JULIET KILO LIMA MIKE " +
+    "NOVEMBER OSCAR PAPA QUEBEC ROMEO SIERRA TANGO UNIFORM VICTOR WHISKEY XRAY YANKEE ZULU"
+  ).split(" ");
+  return [...randomBytes(count)].map((byte) => words[byte % words.length]).join("-");
+}
+
 function findGuardianReviewStatus(events: CapturedAgentEvent[]): "approved" | "denied" | undefined {
   const status = events.findLast((event) => event.data?.phase === "completed" && event.data?.status)
     ?.data?.status;
@@ -1601,11 +1638,21 @@ async function verifyCodexGuardianProbe(params: {
 async function verifyCodexCronMcpProbe(params: {
   client: GatewayClient;
   env: NodeJS.ProcessEnv;
+  modelKey: string;
   port: number;
   sessionKey: string;
   token: string;
 }): Promise<void> {
-  const cronProbe = createLiveCronProbeSpec();
+  const profileId =
+    CODEX_HARNESS_AUTH_MODE === "api-key" && parseModelKey(params.modelKey).provider === "openai"
+      ? await storeLiveApiKeyProfile(
+          { url: `ws://127.0.0.1:${params.port}`, gatewayToken: params.token },
+          { provider: "openai", apiKey: params.env.OPENAI_API_KEY, agentId: "dev" },
+        )
+      : undefined;
+  const cronProbe = createLiveCronProbeSpec({
+    model: profileId ? `${params.modelKey}@${profileId}` : undefined,
+  });
   let createdJob: CronListJob | undefined;
   let lastReply = "";
 
@@ -1957,7 +2004,7 @@ describeLive("gateway live (Codex harness)", () => {
           const sessionKey = `agent:dev:live-codex-steering-${mode}`;
           const runId = `steering-root-${randomUUID()}`;
           const steerRunId = `steering-input-${randomUUID()}`;
-          const marker = `CODEX-STEER-${randomBytes(8).toString("hex").toUpperCase()}`;
+          const marker = `CODEX-STEER-${randomSpelledWordsToken(4)}`;
           const startedPath = path.join(workspace, `${mode}-started`);
           const releasePath = path.join(workspace, `${mode}-release`);
           const commandPath = path.join(workspace, `${mode}-wait.cjs`);
@@ -2048,9 +2095,11 @@ describeLive("gateway live (Codex harness)", () => {
             await fs.writeFile(releasePath, "release");
           }
           await waitForChatAgentRunOk(firstClient, runId);
-          const finalText = await waitForChatFinalText({
+          const finalText = await waitForChatRunReplyText({
+            client: firstClient,
             events: gatewayEvents,
             runId,
+            sessionKey,
             timeoutMs: CODEX_HARNESS_REQUEST_TIMEOUT_MS,
           });
           // On mismatch, report the transcript answer to separate stream loss from model output.
@@ -2185,6 +2234,7 @@ describeLive("gateway live (Codex harness)", () => {
           workspace,
           compactionMode: { kind: "off" },
           nativeSupervision: { command: codexCommand },
+          sessionCatalogHomes: [codexHome],
         });
         const deviceIdentity = await ensurePairedTestGatewayClientIdentity({
           displayName: "vitest-codex-canonical-live",
@@ -2677,6 +2727,7 @@ describeLive("gateway live (Codex harness)", () => {
               logCodexLiveStep("cron-mcp-probe:start", { sessionKey });
               await verifyCodexCronMcpProbe({
                 client: activeClient,
+                modelKey,
                 sessionKey,
                 port,
                 token,

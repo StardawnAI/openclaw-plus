@@ -151,9 +151,11 @@ export async function createPtyAdapter(
       }
     },
     end: () => {
-      stdinEnded = true;
-      const eof = process.platform === "win32" ? "\x1a" : "\x04";
-      pty.write(eof);
+      try {
+        stdinEnded = true;
+        const eof = process.platform === "win32" ? "\x1a" : "\x04";
+        pty.write(eof);
+      } catch {}
     },
     destroy: () => {
       stdinDestroyed = true;

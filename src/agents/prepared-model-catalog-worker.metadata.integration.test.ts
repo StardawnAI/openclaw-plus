@@ -17,7 +17,6 @@ import { createCatalogFixture, PROVIDER_ID } from "./prepared-model-catalog-work
 import type { PreparedModelRuntimeAgentFacts } from "./prepared-model-runtime.catalog-contract.js";
 import { prepareFullCatalogFacts } from "./prepared-model-runtime.full-catalog.js";
 import { prepareOwnedPluginLoadContext } from "./prepared-model-runtime.plugin-context.js";
-import { discardPreparedPluginGeneration } from "./prepared-model-runtime.plugin-lifetime.js";
 import { AuthStorage } from "./sessions/auth-storage.js";
 import { usePreparedCatalogWorkerFixtures } from "./test-helpers/prepared-model-catalog-worker-fixture.js";
 
@@ -126,9 +125,6 @@ describe("prepared catalog parent metadata ownership", () => {
           {
             pluginMetadataSnapshot: metadata,
             pluginRegistry: registry,
-            inlineProviderModels: [],
-            remoteCatalog: null,
-            configuredCatalogEntries: [],
           },
           "live",
           { modelsJsonContents: null, pluginCatalogs: [] },
@@ -224,9 +220,6 @@ describe("prepared catalog parent metadata ownership", () => {
         if (!prepared) {
           throw new Error("prepared runtime produced no snapshot");
         }
-        await using _ = {
-          [Symbol.asyncDispose]: () => discardPreparedPluginGeneration(prepared.pluginGeneration),
-        };
         registry = prepared.pluginGeneration.pluginRegistry;
         expect(registry).toBeDefined();
         expect(prepared.snapshot.metadataSnapshot).toBe(metadata);

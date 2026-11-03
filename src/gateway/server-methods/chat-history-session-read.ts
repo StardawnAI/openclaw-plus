@@ -85,20 +85,14 @@ export async function prepareChatHistorySessionRead({
     const identity = record
       ? { agentId: record.agentId, canonicalKey: record.key }
       : requestedIdentity;
-    const storePath =
-      record?.storeTarget.storePath ??
-      resolveSessionStorePathCore(cfg.session?.store, { agentId: identity.agentId });
     return {
       cfg,
       ...identity,
       record,
       entry: record?.storedEntry ?? record?.entry,
-      storePath,
-      // Retained publication compares physical owners; row lookup keeps the configured locator.
-      sourcePath:
-        retainedSessionId && record && !isIncognitoSessionKey(record.key)
-          ? read.readSource(record)?.path
-          : storePath,
+      storePath:
+        record?.storeTarget.storePath ??
+        resolveSessionStorePathCore(cfg.session?.store, { agentId: identity.agentId }),
       storeKeys: [identity.canonicalKey],
       store: {},
     };
@@ -293,7 +287,7 @@ export async function prepareChatHistorySessionRead({
             (target &&
               (target.agentId !== sessionAgentId ||
                 target.canonicalKey !== canonicalKey ||
-                current.sourcePath !== selectedSession.sourcePath)) ||
+                current.sourcePath !== storePath)) ||
             (publication.requireCurrentSession && target?.entry.sessionId !== retainedSessionId)
           ) {
             unavailable("retained session changed while reading history");

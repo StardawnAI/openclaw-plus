@@ -1,14 +1,12 @@
-import { once } from "node:events";
 import { Server } from "node:http";
 import path from "node:path";
 import * as agentHarnessRuntime from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { initializeGlobalHookRunner } from "openclaw/plugin-sdk/hook-runtime";
 import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { awaitGateBeforeSettlement } from "openclaw/plugin-sdk/test-fixtures";
+import { setRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { describe, expect, it, vi } from "vitest";
 import { readAttemptTerminal } from "./attempt-terminal.test-helper.js";
-import { CodexAppServerClient } from "./client.js";
 import { createCodexTestHostCapabilities } from "./host-capability.test-support.js";
 import {
   getCodexInferenceThread,
@@ -17,7 +15,6 @@ import {
 } from "./inference-routing.js";
 import { nativeHookRelayUnregisterQueue } from "./native-hook-relay-state.js";
 import { codexNativeSubagentMonitorRuntime } from "./native-subagent-monitor.js";
-import * as nativeToolCatalog from "./native-tool-catalog.js";
 import type { CodexDynamicToolSpec } from "./protocol.js";
 import { prepareCodexAttemptConnection } from "./run-attempt-connection.js";
 import { prepareCodexAttemptContext } from "./run-attempt-context.js";
@@ -43,15 +40,15 @@ import {
   testCodexAppServerBindingStore,
   writeCodexAppServerBinding,
 } from "./session-binding.test-helpers.js";
-import { createIsolatedCodexAppServerClient } from "./shared-client.js";
-import { createClientHarness } from "./test-support.js";
 import { codexDynamicToolsFingerprint } from "./thread-fingerprints.js";
 import * as threadLifecyclePreflight from "./thread-lifecycle-preflight.js";
 import { startOrResumeThread } from "./thread-lifecycle-run.js";
 import { createLeasedCodexLifecycleHarness } from "./thread-lifecycle.test-fixtures.js";
-import { CODEX_APP_SERVER_VERSION } from "./version.js";
 
-function participantHostCapabilities(assertNativeSubagentSpawnAllowed: () => void) {
+function participantHostCapabilities(
+  assertNativeSubagentSpawnAllowed: () => void,
+  modelPolicyRequired = false,
+) {
   const bindModelExecution = () => ({
     signal: new AbortController().signal,
     assertCurrent: () => {},
@@ -61,7 +58,7 @@ function participantHostCapabilities(assertNativeSubagentSpawnAllowed: () => voi
     bindModelExecution,
     retainSourceAuthority: () => ({
       ...bindModelExecution(),
-      modelPolicyRequired: false,
+      modelPolicyRequired,
       bindModelExecution,
     }),
     assertNativeSubagentSpawnAllowed,
@@ -155,6 +152,7 @@ describe("Codex participant native admission", () => {
           nativeHookRelay: hooks === "disabled" ? { enabled: false } : undefined,
         },
       });
+      using _ = { [Symbol.dispose]: connection.releaseBindingAuthority };
       try {
         const runtime = await prepareCodexAttemptRuntime(connection);
         const tools = await prepareCodexAttemptTools(runtime);
@@ -307,6 +305,113 @@ describe("Codex participant native admission", () => {
 
 describe("Codex native hook Gateway fallback", () => {
   setupRunAttemptTestHooks();
+  it.each(["managed-only", "disabled"] as const)(
+    "waits for workspace preparation before starting a supported %s native turn",
+    async (hooks) => {
+      const params = createParams(
+        path.join(tempDir, `workspace-${hooks}.jsonl`),
+        path.join(tempDir, `workspace-${hooks}`),
+      );
+      const ready = createDeferred<void>();
+      const waiting = createDeferred<void>();
+      let prepared = false;
+      const waitUntilReady = vi.fn(async () => {
+        waiting.resolve();
+        await ready.promise;
+        prepared = true;
+      });
+      params.hostCapabilities = createCodexTestHostCapabilities({
+        ...participantHostCapabilities(() => {}),
+        workspaceReadiness: { toolNames: ["exec", "read"], waitUntilReady },
+      });
+      const harness = createStartedThreadHarness(async (method) => {
+        if (method === "configRequirements/read") {
+          return { requirements: { allowManagedHooksOnly: hooks === "managed-only" } };
+        }
+        if (method === "account/read") {
+          return { account: { type: "apiKey" } };
+        }
+        if (method === "thread/start" || method === "turn/start") {
+          expect(prepared, `${method} requires the complete workspace without native hooks`).toBe(
+            true,
+          );
+        }
+        return undefined;
+      });
+      ownCodexInferenceClient(harness.client);
+      const preflight = vi.spyOn(threadLifecyclePreflight, "prepareCodexThreadLifecyclePreflight");
+      const abort = new AbortController();
+      params.abortSignal = abort.signal;
+      const run = runCodexAppServerAttempt(params, {
+        bindingStore: createCodexTestBindingStore(),
+        nativeHookRelay: hooks === "disabled" ? { enabled: false } : undefined,
+      });
+      try {
+        await Promise.race([
+          waiting.promise,
+          run.waitForTurnAccepted().then(() => {
+            throw new Error("Native turn started before workspace preparation");
+          }),
+        ]);
+        expect(harness.requests.some(({ method }) => method === "thread/start")).toBe(false);
+        expect(preflight).toHaveBeenCalledWith(
+          expect.objectContaining({ nativeHookRelayRequired: false }),
+        );
+        ready.resolve();
+        await run.waitForTurnAccepted();
+        expect(waitUntilReady).toHaveBeenCalled();
+        await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
+        await run;
+      } finally {
+        ready.resolve();
+        abort.abort("test cleanup");
+        await run.catch(() => undefined);
+        harness.close();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps required model admission fail closed under managed-only hooks (relay disabled: %s)",
+    async (disabled) => {
+      const params = createParams(
+        path.join(tempDir, `workspace-required-${disabled}.jsonl`),
+        path.join(tempDir, `workspace-required-${disabled}`),
+      );
+      const waitUntilReady = vi.fn(async () => {});
+      params.hostCapabilities = createCodexTestHostCapabilities({
+        ...participantHostCapabilities(() => {}, true),
+        workspaceReadiness: { toolNames: ["exec", "read"], waitUntilReady },
+      });
+      const harness = createStartedThreadHarness(async (method) => {
+        if (method === "configRequirements/read") {
+          return { requirements: { allowManagedHooksOnly: true } };
+        }
+        if (method === "account/read") {
+          return { account: { type: "apiKey" } };
+        }
+        return undefined;
+      });
+      ownCodexInferenceClient(harness.client);
+      try {
+        await expect(
+          runCodexAppServerAttempt(params, {
+            bindingStore: createCodexTestBindingStore(),
+            nativeHookRelay: disabled ? { enabled: false } : undefined,
+          }),
+        ).rejects.toThrow(/managed-only hooks.*OpenClaw native hook relay/i);
+        expect(waitUntilReady).not.toHaveBeenCalled();
+        expect(
+          harness.requests.filter(({ method }) =>
+            ["thread/start", "thread/resume", "turn/start"].includes(method),
+          ),
+        ).toEqual([]);
+      } finally {
+        harness.close();
+      }
+    },
+  );
+
   it("publishes cross-profile steering from effective delegation policy and installed admission", async () => {
     const registered = vi.spyOn(agentHarnessRuntime, "setActiveEmbeddedRun");
     for (const { hooks, policy, supportsSteering } of [
@@ -483,6 +588,7 @@ describe("Codex native hook Gateway fallback", () => {
     );
     const params = createParams(sessionFile, workspaceDir);
     params.config = { tools: { loopDetection: { enabled: true } } };
+    setRuntimeConfigSnapshot(params.config);
     const closeHost = await bindProductionHarnessHostCapabilitiesForTest(params);
     const abort = new AbortController();
     params.abortSignal = abort.signal;
@@ -533,88 +639,4 @@ describe("Codex native hook Gateway fallback", () => {
       closeHost();
     }
   });
-});
-
-describe("Codex native tool catalog probe cleanup", () => {
-  setupRunAttemptTestHooks();
-
-  it.each([false, true])(
-    "awaits isolated catalog probe exit before continuing (read failure: %s)",
-    async (fails) => {
-      const params = createParams(path.join(tempDir, "session.jsonl"), tempDir);
-      const attempt = createStartedThreadHarness();
-      const connection = await prepareCodexAttemptConnection({
-        params,
-        options: {
-          bindingStore: testCodexAppServerBindingStore,
-          clientFactory: async () => attempt.client,
-          nativeHookRelay: { enabled: false },
-        },
-      });
-      const probe = createClientHarness({
-        autoEmitExit: false,
-        onWrite: (line, send) => {
-          const { id, method } = JSON.parse(line);
-          if (method === "initialize") {
-            send({ id, result: { userAgent: `codex-cli/${CODEX_APP_SERVER_VERSION}` } });
-          }
-        },
-      });
-      let pending: ReturnType<typeof prepareCodexAttemptTools> | undefined;
-      try {
-        const runtime = await prepareCodexAttemptRuntime(connection);
-        connection.mutable.startupBinding = {
-          threadId: "catalog-thread",
-          cwd: params.workspaceDir,
-          connectionScope: "supervision",
-        };
-        vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(probe.client);
-        connection.attemptClientFactory = createIsolatedCodexAppServerClient;
-        connection.appServer.start = {
-          transport: "stdio",
-          command: process.execPath,
-          args: [],
-          headers: {},
-        };
-        connection.startupClientAuthProfileId = null;
-        const failure = new Error("native catalog unavailable");
-        const read = vi.spyOn(nativeToolCatalog, "loadCodexNativeToolCatalog");
-        if (fails) {
-          read.mockRejectedValue(failure);
-        } else {
-          read.mockResolvedValue([]);
-        }
-        const stdinClosed = once(probe.process.stdin, "close");
-        let settled = false;
-        pending = prepareCodexAttemptTools(runtime);
-        const outcome = pending.then(
-          () => {
-            settled = true;
-          },
-          () => {
-            settled = true;
-          },
-        );
-        await awaitGateBeforeSettlement(stdinClosed, outcome, "probe returned without closing");
-        expect(settled).toBe(false);
-        expect(probe.process.exitCode).toBeNull();
-        probe.emitExit();
-        if (fails) {
-          await expect(pending).rejects.toBe(failure);
-        } else {
-          await pending;
-        }
-      } finally {
-        probe.emitExit();
-        await pending?.then(
-          (tools) => tools.disposeTools("completed"),
-          () => undefined,
-        );
-        await probe.client.closeAndWait();
-        await attempt.client.closeAndWait();
-        connection.cancellation.dispose();
-        connection.releaseModelExecution();
-      }
-    },
-  );
 });

@@ -1,4 +1,4 @@
-import { randomBytes, timingSafeEqual, X509Certificate } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import {
   createServer as createHttpServer,
@@ -180,6 +180,35 @@ function substituteRequest(params: {
     return swapped;
   };
   const target = new URL(swap(params.target.toString(), true));
+  const swapHeader = (name: string, value: string) => {
+    if (name !== "authorization" || !/^Basic(?:\s|$)/iu.test(value)) {
+      return swap(value);
+    }
+    const basic = /^(Basic)\s+([A-Za-z0-9+/]+={0,2})$/iu.exec(value);
+    if (!basic?.[2]) {
+      if (containsSecretSentinel(value)) {
+        throw new SecretEgressSubstitutionError("unresolved-sentinel");
+      }
+      return value;
+    }
+    const bytes = Buffer.from(basic[2], "base64");
+    const credentials = bytes.toString("utf8");
+    if (!containsSecretSentinel(credentials)) {
+      return value;
+    }
+    // Buffer's decoder is permissive. Accept only canonical UTF-8 credentials.
+    const canonical = bytes.toString("base64");
+    if (
+      (basic[2].includes("=") ? canonical : canonical.replace(/=+$/u, "")) !== basic[2] ||
+      !Buffer.from(credentials, "utf8").equals(bytes) ||
+      !credentials.includes(":") ||
+      // oxlint-disable-next-line no-control-regex -- Basic credentials prohibit C0 controls and DEL.
+      /[\u0000-\u001f\u007f]/u.test(credentials)
+    ) {
+      throw new SecretEgressSubstitutionError("unresolved-sentinel");
+    }
+    return `${basic[1]} ${Buffer.from(swap(credentials), "utf8").toString("base64")}`;
+  };
   const output: IncomingHttpHeaders = {};
   for (const [name, rawValue] of Object.entries(params.headers)) {
     const lowerName = name.toLowerCase();
@@ -187,9 +216,9 @@ function substituteRequest(params: {
       continue;
     }
     if (Array.isArray(rawValue)) {
-      output[name] = rawValue.map((value) => swap(value));
+      output[name] = rawValue.map((value) => swapHeader(lowerName, value));
     } else if (rawValue !== undefined) {
-      output[name] = swap(rawValue);
+      output[name] = swapHeader(lowerName, rawValue);
     }
   }
   output.host = target.host;
@@ -206,23 +235,12 @@ export async function startSecretEgressProxyServer(params: {
 }): Promise<SecretEgressProxyHandle> {
   const certificates = await createSecretEgressCertificates(params.caDir);
   const { caPem } = certificates;
-  // Adopt the released emSign ECC G3 root removal for PEM consumers too:
-  // https://github.com/rustls/webpki-roots/releases/tag/v%2F1.0.10
-  // Runtime verifier blocks do not survive exporting tls.rootCertificates.
-  const trustedCertificates = [
-    ...rootCertificates.filter(
-      (pem) =>
-        new X509Certificate(pem).fingerprint256 !==
-        "86:A1:EC:BA:08:9C:4A:8D:3B:BE:27:34:C6:12:BA:34:1D:81:3E:04:3C:F9:E8:A8:62:CD:5C:57:A3:6B:BE:6B",
-    ),
-    caPem,
-  ];
   const trustBundlePath = path.join(params.caDir, "trust-bundle.pem");
-  fs.writeFileSync(trustBundlePath, trustedCertificates.join("\n"), { mode: 0o644 });
+  fs.writeFileSync(trustBundlePath, `${rootCertificates.join("\n")}\n${caPem}`, { mode: 0o644 });
   // The CA set is immutable for this proxy lifetime. A new proxy owns new trust;
   // leaf renewal does not change it. Share only parsed CAs across process grants.
   const upstreamSecureContext = createSecureContext({
-    ca: trustedCertificates,
+    ca: [...rootCertificates, caPem],
   });
   const bypassHosts = new Set((params.bypassHosts ?? []).map(normalizeHostname));
   const allowedHosts =

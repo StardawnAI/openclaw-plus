@@ -182,7 +182,6 @@ describe("gateway probe endpoints", () => {
   it("returns 404 for probe namespace variants instead of false-green Control UI HTML", async () => {
     const getReadiness: ReadinessChecker = () => ({
       ready: false,
-      coreReady: false,
       failing: ["gateway-draining"],
       uptimeMs: 1_000,
     });
@@ -378,85 +377,7 @@ describe("gateway probe endpoints", () => {
     }
   });
 
-  it("returns only readiness state for unauthenticated remote /ready requests", async () => {
-    const getReadiness: ReadinessChecker = () => ({
-      ready: false,
-      coreReady: true,
-      failing: ["discord", "telegram"],
-      uptimeMs: 8_000,
-    });
-
-    await withGatewayServer({
-      prefix: "probe-not-ready",
-      resolvedAuth: AUTH_NONE,
-      overrides: { getReadiness },
-      run: async (server) => {
-        const { res, getBody } = await sendRequest(server, {
-          path: "/ready",
-          remoteAddress: "10.0.0.8",
-          host: "gateway.test",
-        });
-
-        expect(res.statusCode).toBe(503);
-        expect(JSON.parse(getBody())).toEqual({ ready: false });
-      },
-    });
-  });
-
-  it("serves bounded probes from headerless trusted proxies while protecting other routes", async () => {
-    let healthy = true;
-    await withGatewayServer({
-      prefix: "probe-headerless-trusted-proxy",
-      resolvedAuth: AUTH_TOKEN,
-      overrides: {
-        getRuntimeConfig: () => ({ gateway: { trustedProxies: ["10.0.0.0/24"] } }),
-        getReadiness: () => ({
-          ready: healthy,
-          coreReady: true,
-          failing: healthy ? [] : ["discord"],
-          uptimeMs: 8_000,
-        }),
-        getStartup: () =>
-          healthy
-            ? { ok: true, status: "started", uptimeMs: 8_000 }
-            : {
-                ok: false,
-                status: "starting",
-                uptimeMs: 8_000,
-                pendingReason: "private-startup-detail",
-              },
-      },
-      run: async (server) => {
-        for (const ready of [true, false]) {
-          healthy = ready;
-          for (const path of ["/ready", "/readyz", "/startup", "/startupz"]) {
-            const body = path.startsWith("/ready")
-              ? { ready }
-              : { ok: ready, status: ready ? "started" : "starting" };
-            for (const method of ["GET", "HEAD"]) {
-              const response = await sendRequest(server, {
-                path,
-                method,
-                remoteAddress: "10.0.0.8",
-                host: "gateway.test",
-              });
-              expect(response.res.statusCode, `${method} ${path}`).toBe(ready ? 200 : 503);
-              expect(response.getBody()).toBe(method === "HEAD" ? "" : JSON.stringify(body));
-            }
-          }
-        }
-        const protectedResponse = await sendRequest(server, {
-          path: "/tools/invoke",
-          remoteAddress: "10.0.0.8",
-          host: "gateway.test",
-        });
-        expect(protectedResponse.res.statusCode).toBe(403);
-        expect(protectedResponse.getBody()).toContain("proxy_attribution_required");
-      },
-    });
-  });
-
-  it("rejects untrusted proxy ingress before probes, hooks, and watch-node handlers", async () => {
+  it("rejects unattributable proxy ingress before hooks and watch-node handlers", async () => {
     const handleHooksRequest = vi.fn(async () => true);
     const handleWatchNodeRequest = vi.fn(async () => true);
 
@@ -465,7 +386,7 @@ describe("gateway probe endpoints", () => {
       resolvedAuth: AUTH_TOKEN,
       overrides: { handleHooksRequest, handleWatchNodeRequest },
       run: async (server) => {
-        for (const path of ["/readyz", "/startupz", "/hooks/test", "/api/nodes/watch/node-1"]) {
+        for (const path of ["/hooks/test", "/api/nodes/watch/node-1"]) {
           const { res, getBody } = await sendRequest(server, {
             path,
             remoteAddress: "127.0.0.1",
@@ -484,7 +405,6 @@ describe("gateway probe endpoints", () => {
   it("re-resolves auth for remote /ready requests after shared auth rotation", async () => {
     const getReadiness: ReadinessChecker = () => ({
       ready: false,
-      coreReady: true,
       failing: ["discord", "telegram"],
       uptimeMs: 8_000,
     });
@@ -513,7 +433,6 @@ describe("gateway probe endpoints", () => {
           statusCode: 503,
           body: {
             ready: false,
-            coreReady: true,
             failing: ["discord", "telegram"],
             uptimeMs: 8_000,
           },
@@ -532,7 +451,6 @@ describe("gateway probe endpoints", () => {
           statusCode: 503,
           body: {
             ready: false,
-            coreReady: true,
             failing: ["discord", "telegram"],
             uptimeMs: 8_000,
           },
@@ -544,7 +462,6 @@ describe("gateway probe endpoints", () => {
   it("hides readiness details when trusted-proxy auth violates browser origin policy", async () => {
     const getReadiness: ReadinessChecker = () => ({
       ready: false,
-      coreReady: true,
       failing: ["discord", "telegram"],
       uptimeMs: 8_000,
     });
@@ -611,12 +528,7 @@ describe("gateway probe endpoints", () => {
         const { res, getBody } = await sendRequest(server, { path: "/ready" });
 
         expect(res.statusCode).toBe(503);
-        expect(JSON.parse(getBody())).toEqual({
-          ready: false,
-          coreReady: false,
-          failing: ["internal"],
-          uptimeMs: 0,
-        });
+        expect(JSON.parse(getBody())).toEqual({ ready: false, failing: ["internal"], uptimeMs: 0 });
       },
     });
   });
@@ -693,7 +605,6 @@ describe("gateway probe endpoints", () => {
         expect(drainingReadiness.res.statusCode).toBe(503);
         expect(JSON.parse(drainingReadiness.getBody())).toMatchObject({
           ready: false,
-          coreReady: false,
           failing: ["gateway-draining"],
         });
         gatewayDraining = false;
@@ -731,7 +642,6 @@ describe("gateway probe endpoints", () => {
         expect(readiness.res.statusCode).toBe(503);
         expect(JSON.parse(readiness.getBody())).toMatchObject({
           ready: false,
-          coreReady: true,
           failing: ["whatsapp"],
         });
 
@@ -839,7 +749,6 @@ describe("gateway probe endpoints", () => {
     const shouldEnforcePluginGatewayAuth = vi.fn(() => true);
     const getReadiness = vi.fn(() => ({
       ready: true,
-      coreReady: true,
       failing: [],
       uptimeMs: 123,
     }));
@@ -864,12 +773,7 @@ describe("gateway probe endpoints", () => {
           if (path.startsWith("/health")) {
             expect(body, path).toEqual({ ok: true, status: "live" });
           } else if (path.startsWith("/ready")) {
-            expect(body, path).toEqual({
-              ready: true,
-              coreReady: true,
-              failing: [],
-              uptimeMs: 123,
-            });
+            expect(body, path).toEqual({ ready: true, failing: [], uptimeMs: 123 });
           } else {
             expect(body, path).toMatchObject({
               ok: true,

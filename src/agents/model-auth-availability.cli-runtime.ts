@@ -1,4 +1,4 @@
-/** CLI-runtime availability follows execution's forwarded account or native login. */
+/** CLI-runtime model availability: a CLI route follows its own login, not provider credentials. */
 import {
   normalizeProviderId,
   normalizeProviderIdForAuth,
@@ -8,12 +8,10 @@ import { normalizePluginsConfig } from "../plugins/config-state.js";
 import { passesManifestOwnerBasePolicy } from "../plugins/manifest-owner-policy.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import type { PreparedAgentCredentialModes } from "./agent-auth-credential-modes.js";
-import type { AuthProfileStore } from "./auth-profiles/types.js";
 import {
   resolveCliRuntimeCanonicalProvider,
   resolveCliRuntimeModelBackendBinding,
 } from "./cli-backends.js";
-import { selectCliExecutionAuthProfile } from "./cli-execution-auth.js";
 import { resolveBundledCliBackendAuthPolicy } from "./cli-runner/cli-backend-auth-policy.js";
 import type {
   ModelAuthAvailabilityEvaluation,
@@ -33,7 +31,6 @@ import {
 export function createCliRuntimeModelAuthEvaluator(
   params: {
     cfg: OpenClawConfig;
-    authStore: AuthProfileStore;
     agentId?: string;
     metadataSnapshot?: PluginMetadataSnapshot;
     preparedCliRuntimeAuthDirectories?: CliRuntimeAuthDirectories;
@@ -116,34 +113,21 @@ export function createCliRuntimeModelAuthEvaluator(
           })
         : evaluation;
     }
-    if (!selectedProfileId && authPolicy?.strictSelectedProfile) {
-      const profile = selectCliExecutionAuthProfile({
-        cliExecutionProvider: runtimeProvider,
-        authProfileProvider: provider,
-        config: params.cfg,
-        store: params.authStore,
-        readinessMode: "read-only",
-        metadataSnapshot: params.metadataSnapshot,
-      });
-      if (profile) {
-        return evaluateProviderAuth(profile.provider, {
-          modelId: ref.modelId,
-          requiredProfileId: profile.profileId,
-        });
-      }
-    }
+    const runtimeAuth = { id: runtimeProvider, source: "native" as const };
     if (normalizeProviderId(runtimeProvider) === normalizeProviderId(provider)) {
-      return runtimeOwners?.length ? evaluation : undefined;
+      return runtimeOwners?.length ? { ...evaluation, runtimeAuth } : undefined;
     }
     const runtimeAuthMode =
       params.preparedRuntimeAuthModes?.[normalizeProviderIdForAuth(runtimeProvider)];
     if (typeof runtimeAuthMode === "string") {
-      // Without a forwarded account, the prepared native login owns readiness.
+      // The prepared native-runtime result is authoritative for this route. Provider
+      // credentials cannot prove that the separately authenticated CLI is usable.
       return {
         availability: true,
         routeResolution: null,
         selectedAuthMode: runtimeAuthMode,
         evidence: "runtime",
+        runtimeAuth,
       };
     }
     // Preparation probes the native login of every configured runtime; only routes found by
@@ -159,7 +143,12 @@ export function createCliRuntimeModelAuthEvaluator(
     );
     return params.preparedSyntheticAuthComplete ||
       configuredRuntimes.has(normalizeProviderId(runtimeProvider))
-      ? { availability: false, routeResolution: null, unavailableReason: "missing-auth" }
-      : { availability: undefined, routeResolution: null };
+      ? {
+          availability: false,
+          routeResolution: null,
+          unavailableReason: "missing-auth",
+          runtimeAuth,
+        }
+      : { availability: undefined, routeResolution: null, runtimeAuth };
   };
 }

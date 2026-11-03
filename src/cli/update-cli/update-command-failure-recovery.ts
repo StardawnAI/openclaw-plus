@@ -17,6 +17,7 @@ import { UpdateCommandRecoveryPendingError } from "./update-command-recovery-err
 import type {
   ManagedGatewayUpdateVerdict,
   PreManagedServiceStop,
+  UpdateServiceDefinitionRecovery,
 } from "./update-command-service-context-types.js";
 import {
   readManagedGatewayServiceForUpdate,
@@ -50,9 +51,11 @@ export async function verifyUpdateFailureRecovery(params: {
   opts: UpdateCommandOptions;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  mutationStarted?: boolean;
   serviceStopped?: boolean;
-  /** Omitted/unknown callers retain recovery probing. */
-  untouchedFailure?: boolean;
+  preManagedServiceStop?: PreManagedServiceStop;
+  gatewayStartAttempted?: boolean;
+  definitionRecovery?: UpdateServiceDefinitionRecovery;
   serviceUpdateVerdict?: ManagedGatewayUpdateVerdict;
   waitForStartup?: boolean;
   assertCurrent?: () => void;
@@ -94,14 +97,13 @@ export async function verifyUpdateFailureRecovery(params: {
     warnRecording(`Could not read update recovery history: ${formatErrorMessage(error)}`);
   }
   const constraint = recorded?.verification.recovery;
-  const dataAtRisk = [result.recovery, constraint].some(
-    (recovery) => recovery?.serviceRestartSafe === false && Boolean(recovery.dataAtRisk),
-  );
-  const riskRecovery = [result.recovery, constraint].find(
-    (recovery) => recovery?.serviceRestartSafe === false && recovery.dataAtRisk,
+  // This release records safety as a coarse restart refusal, not a separate
+  // data-at-risk field. Preserve every such refusal when observing a failed swap.
+  const unsafeRecovery = [constraint, result.recovery].find(
+    (recovery) => recovery?.serviceRestartSafe === false,
   );
   const previousRecovery =
-    riskRecovery ??
+    unsafeRecovery ??
     (constraint?.serviceRestartSafe === false
       ? constraint
       : (result.recovery ?? constraint ?? undefined));
@@ -111,7 +113,17 @@ export async function verifyUpdateFailureRecovery(params: {
   const rollback = previousRecovery?.packageRollbackVerified;
   try {
     await withCommandProcessScope(async () => {
-      if (params.untouchedFailure === true && !params.serviceStopped && !dataAtRisk) {
+      const untouched =
+        !unsafeRecovery &&
+        (params.mutationStarted === false ||
+          ["managed-service-preflight", "gateway-stop-unverified"].includes(result.reason ?? "")) &&
+        !params.serviceStopped &&
+        !params.preManagedServiceStop?.stopped &&
+        !params.gatewayStartAttempted &&
+        !params.definitionRecovery?.backup &&
+        !params.definitionRecovery?.unverified;
+      // An untouched refusal or absent service has no restart to recover.
+      if (untouched || params.serviceUpdateVerdict?.kind === "absent") {
         result.steps.push({
           name: "gateway recovery observation",
           command: "gateway verification",
@@ -119,24 +131,9 @@ export async function verifyUpdateFailureRecovery(params: {
           durationMs: 0,
           exitCode: 0,
           diagnostics: [
-            "No recovery needed; still serving " +
-              (result.before?.version ?? "the previous version") +
-              ". No service was stopped or started.",
-          ],
-        });
-        return;
-      }
-      // Package rollback restores files even on a headless install. Its original
-      // service observation cannot become a request to wait for a new Gateway.
-      if (params.serviceUpdateVerdict?.kind === "absent") {
-        result.steps.push({
-          name: "gateway recovery observation",
-          command: "gateway verification",
-          cwd: root,
-          durationMs: 0,
-          exitCode: 0,
-          diagnostics: [
-            "Gateway readiness was not checked: no Gateway service or listener was present before maintenance.",
+            untouched
+              ? `No recovery needed; ${params.preManagedServiceStop?.running ? "still serving" : "installation unchanged at"} ${result.before?.version ?? recorded?.before.version ?? "the previous version"}. No service was stopped or started.`
+              : "Gateway readiness was not checked: no Gateway service or listener was present before maintenance.",
           ],
         });
         return;
@@ -167,7 +164,6 @@ export async function verifyUpdateFailureRecovery(params: {
             // Native process identity alone cannot reconfirm earlier readiness.
             versionMatch: undefined,
             readyz: false,
-            coreReady: false,
             settled: false,
             channelsReady: false,
           };

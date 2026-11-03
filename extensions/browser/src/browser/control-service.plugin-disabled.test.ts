@@ -2,6 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  ensureBrowserControlAuth: vi.fn(async () => ({ generatedToken: false })),
   createBrowserRuntimeState: vi.fn(async () => ({ ok: true })),
   loadConfig: vi.fn(() => ({
     browser: {
@@ -23,7 +24,8 @@ vi.mock("openclaw/plugin-sdk/runtime-config-snapshot", async () => {
   >("openclaw/plugin-sdk/runtime-config-snapshot");
   return {
     ...actual,
-    getRuntimeConfig: mocks.loadConfig,
+    readRuntimeConfig: mocks.loadConfig,
+    captureRuntimeConfigAsyncReader: () => async () => mocks.loadConfig(),
     loadConfig: mocks.loadConfig,
   };
 });
@@ -34,6 +36,10 @@ vi.mock("./config.js", () => ({
     controlPort: 18791,
     profiles: { openclaw: { cdpPort: 18800 } },
   })),
+}));
+
+vi.mock("./control-auth.js", () => ({
+  ensureBrowserControlAuth: mocks.ensureBrowserControlAuth,
 }));
 
 vi.mock("./runtime-lifecycle.js", () => ({
@@ -50,6 +56,7 @@ vi.doUnmock("./server-context.js");
 
 describe("startBrowserControlServiceFromConfig", () => {
   beforeEach(() => {
+    mocks.ensureBrowserControlAuth.mockClear();
     mocks.createBrowserRuntimeState.mockClear();
     mocks.loadConfig.mockClear();
   });
@@ -58,6 +65,7 @@ describe("startBrowserControlServiceFromConfig", () => {
     const started = await startBrowserControlServiceFromConfig();
 
     expect(started).toBeNull();
+    expect(mocks.ensureBrowserControlAuth).not.toHaveBeenCalled();
     expect(mocks.createBrowserRuntimeState).not.toHaveBeenCalled();
   });
 });

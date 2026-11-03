@@ -9,18 +9,30 @@ import type { CoreConfig, NextcloudTalkAccountConfig } from "./src/types.js";
 
 type NextcloudAccount = NonNullable<NonNullable<CoreConfig["channels"]>["nextcloud-talk"]>;
 
-export const {
+const {
   listAccountIds: listNextcloudTalkAccountIds,
   resolveDefaultAccountId: resolveDefaultNextcloudTalkAccountId,
   resolveAccountConfig: mergeNextcloudTalkAccountConfig,
 } = createAccountListHelpers<NextcloudTalkAccountConfig>("nextcloud-talk", {
   normalizeAccountId,
   omitKeys: ["defaultAccount"],
-  hasImplicitDefaultAccount: (cfg) =>
-    hasConfiguredNextcloudAccount(cfg.channels?.["nextcloud-talk"], process.env),
+  hasImplicitDefaultAccount: (cfg) => {
+    const channel = cfg.channels?.["nextcloud-talk"];
+    return Boolean(
+      channel?.baseUrl?.trim() &&
+      (hasConfiguredAccountValue(channel.botSecret) ||
+        channel.botSecretFile?.trim() ||
+        process.env.NEXTCLOUD_TALK_BOT_SECRET?.trim()),
+    );
+  },
 });
+export {
+  listNextcloudTalkAccountIds,
+  mergeNextcloudTalkAccountConfig,
+  resolveDefaultNextcloudTalkAccountId,
+};
 
-export function hasConfiguredNextcloudAccount(
+function hasConfiguredNextcloudAccount(
   account: NextcloudAccount | undefined,
   env: NodeJS.ProcessEnv,
 ) {

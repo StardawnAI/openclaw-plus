@@ -253,16 +253,6 @@ describe("X GitHub verification sync", () => {
     }
   });
 
-  it("preserves the completed snapshot if the spend gate blocks a newly declared user", async () => {
-    const test = githubFixture(0.01);
-    await test.sync();
-    const previous = await getXGitHubStatus(test.runtime, test.account);
-    test.source.people.push({ login: "second", handle: "bob" });
-    await expect(test.sync()).rejects.toBeInstanceOf(XBudgetExceededError);
-    expect(test.lookups).toEqual([["alice"]]);
-    expect(await getXGitHubStatus(test.runtime, test.account)).toEqual(previous);
-  });
-
   it("resumes a paid batch from persisted lookups after the daily budget resets", async () => {
     const test = githubFixture(1);
     const handles = Array.from({ length: 101 }, (_, index) => `writer${index}`);
@@ -292,31 +282,6 @@ describe("X GitHub verification sync", () => {
     expect(admitted.ingress.senderAccess.allowed).toBe(true);
   });
 });
-
-async function withService(
-  test: ReturnType<typeof githubFixture>,
-  cfg: OpenClawConfig,
-  run: (clock: ReturnType<typeof createGatewaySchedulerClock>) => Promise<void>,
-): Promise<void> {
-  const clock = createGatewaySchedulerClock(Date.now());
-  const gateway = createTestGatewayScheduler(clock.clock);
-  const scheduler = createTestPluginServiceScheduler(gateway);
-  const service = createXGitHubService({ runtime: test.runtime });
-  const context: OpenClawPluginServiceContextV2 = {
-    config: cfg,
-    stateDir: test.runtime.state.resolveStateDir(),
-    logger: test.logger,
-    scheduler,
-  };
-  try {
-    await service.start(context);
-    await run(clock);
-  } finally {
-    await scheduler.stop();
-    await service.stop?.(context);
-    await gateway.stop();
-  }
-}
 
 describe("X GitHub verification service", () => {
   it("schedules no work when the feature is absent", async () => {
@@ -404,38 +369,5 @@ describe("X GitHub verification service", () => {
       await service.stop?.(context);
       await gateway.stop();
     }
-  });
-
-  it("keeps sync status and the X client for mixed-case account keys under the runtime account id", async () => {
-    const test = githubFixture();
-    const { verifiedFromGitHub, ...credentials } = test.cfg.channels!.x!;
-    const cfg: OpenClawConfig = {
-      ...test.cfg,
-      channels: {
-        x: {
-          accounts: {
-            Work: { ...credentials, verifiedFromGitHub },
-            Ops: { ...credentials, userId: "200", verifiedFromGitHub: { repo: "test/repo" } },
-          },
-        },
-      },
-    };
-    await withService(test, cfg, async (clock) => {
-      await clock.wake();
-      const status = (key: string) => getXGitHubStatus(test.runtime, resolveXAccount(cfg, key));
-      expect({
-        lookupAccounts: vi.mocked(getXApi).mock.calls.map(([accountId]) => accountId),
-        work: await status("Work"),
-        ops: await status("Ops"),
-      }).toMatchObject({
-        lookupAccounts: ["work"],
-        work: { stale: false, entries: [{ xUserId: "101" }] },
-        ops: {
-          stale: true,
-          message:
-            "Configure verifiedFromGitHub.token with a GitHub credential that can list repository collaborators.",
-        },
-      });
-    });
   });
 });

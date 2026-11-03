@@ -21,9 +21,13 @@ import {
   createTestRegistry,
 } from "../../test-utils/channel-plugins.js";
 import { normalizeSessionDeliveryState } from "../../utils/delivery-context.shared.js";
+import { createAdmittedRunOperatorAuthority } from "../admitted-run-context.js";
 import { buildAgentSystemPrompt } from "../system-prompt.js";
 import { prepareCommandConversationContext } from "./conversation-context.js";
-import { prepareEmbeddedSessionState } from "./session-preparation.js";
+import {
+  prepareCommandSessionRecoveryEntry,
+  prepareEmbeddedSessionState,
+} from "./session-preparation.js";
 
 vi.mock("../embedded-agent-runner/runs.js", () => ({
   resolveEmbeddedAgentSessionProgressState: () => undefined,
@@ -39,15 +43,89 @@ vi.mock("../../skills/discovery/agent-filter.js", () => ({
   resolveEffectiveAgentSkillFilter: () => undefined,
 }));
 vi.mock("./attempt-execution.shared.js", () => ({ persistAgentSession: vi.fn() }));
+// mock-isolation: Session-preparation tests own their skill snapshot and exec eligibility without host storage.
 vi.mock("./runtime-loaders.js", () => ({
   loadSkillsRuntime: async () => ({
     getRemoteSkillEligibility: () => ({}),
     resolveReusableWorkspaceSkillSnapshot: () => ({ snapshot: undefined, shouldRefresh: false }),
   }),
   loadExecDefaultsRuntime: async () => ({
-    resolveNodeExecEligibility: () => ({ canExec: false }),
+    resolveNodeExecEligibilityAsync: () => ({ canExec: false }),
   }),
 }));
+
+it.each(["subagent_settle", "subagent_announce", "sessions_send"])(
+  "retains original operator recovery custody only for the exact requester settle source: %s",
+  (sourceTool) => {
+    const runId = "announce:requester-settle:main:agent:main:main:child-run";
+    const operatorAuthority = createAdmittedRunOperatorAuthority({
+      profileId: "original-operator",
+      scopes: ["operator.read"],
+      assertCurrent() {},
+      recoverySnapshot: {
+        profileId: "original-operator",
+        scopes: ["operator.read"],
+        assignedRole: null,
+        githubLogin: null,
+        grant: null,
+        aliasBindingIds: [],
+        authPolicy: {
+          generation: "",
+          grantGeneration: "original-grant",
+          role: "operator",
+          authMethod: "token",
+        },
+        controlUiAdmin: false,
+        localOperator: false,
+        sourceIngress: "control-ui",
+      },
+    });
+    const { nextEntry } = prepareCommandSessionRecoveryEntry({
+      entry: {
+        sessionId: "requester-session",
+        lifecycleRevision: "requester-revision",
+        updatedAt: 1,
+      },
+      sessionId: "requester-session",
+      sessionKey: "agent:main:main",
+      agentId: "main",
+      runId,
+      now: 2,
+      lifecycleGeneration: "current-generation",
+      isSessionRollover: false,
+      opts: {
+        message: "Child completed",
+        operatorAuthority,
+        inputProvenance: {
+          kind: "inter_session",
+          sourceTool,
+          sourceChannel: "internal",
+          sourceSessionKey: "agent:main:subagent:child",
+        },
+      },
+    });
+    if (sourceTool !== "subagent_settle") {
+      expect(nextEntry.restartRecoveryOperatorSource).toBeUndefined();
+      return;
+    }
+    expect(nextEntry).toMatchObject({
+      restartRecoveryDeliverySourceRunId: runId,
+      restartRecoverySourceIngress: "internal",
+      restartRecoveryOperatorSource: {
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        sessionId: "requester-session",
+        lifecycleRevision: "requester-revision",
+        sourceRunId: runId,
+        snapshot: {
+          profileId: "original-operator",
+          scopes: ["operator.read"],
+          controlUiAdmin: false,
+        },
+      },
+    });
+  },
+);
 
 it.each([
   { internal: false, coordination: false },
@@ -135,6 +213,46 @@ it.each(["agent:main:cron:nightly:run:123", "agent:main:subagent:123"])(
     });
     expect(opts.extraSystemPrompt).toBe("Continue the isolated task.");
     expect(opts.silentReplyPromptMode).toBeUndefined();
+    expect(opts.extraSystemPromptTurnContext).toBeUndefined();
+  },
+);
+
+it.each([undefined, "Persistent cron policy.\n"])(
+  "marks only delivery context for direct cron execution (policy=%s)",
+  async (extraSystemPrompt) => {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: {
+            ...createOutboundTestPlugin({
+              id: "telegram",
+              outbound: createDirectOutboundTestAdapter({ channel: "telegram" }),
+            }),
+            agentPrompt: { inboundFormattingHints: () => ({ text_markup: "markdown", rules: [] }) },
+          } satisfies ChannelPlugin,
+        },
+      ]),
+    );
+    try {
+      const opts = await prepareCommandConversationContext({
+        cfg: {},
+        opts: { message: "Run the scheduled task.", deliver: true, extraSystemPrompt },
+        runContext: { messageChannel: "telegram" },
+        sessionKey: "agent:main:cron:nightly:run:123",
+        sessionAgentId: "main",
+      });
+      const context = opts.extraSystemPromptTurnContext;
+      expect(context?.text).toContain("### Delivery Format");
+      expect(context?.start).toBe(extraSystemPrompt ? extraSystemPrompt.length + 2 : 0);
+      expect(opts.extraSystemPrompt).toBe(
+        [extraSystemPrompt, context?.text].filter(Boolean).join("\n\n"),
+      );
+      expect(context?.text).not.toContain("Persistent cron policy.");
+    } finally {
+      resetPluginRuntimeStateForTest();
+    }
   },
 );
 
@@ -218,6 +336,7 @@ it.each([
           silentReplyPromptMode: "none",
         });
       expect(prompt(prepared.opts.extraSystemPrompt)).toBe(prompt(normalContext));
+      expect(prepared.opts.extraSystemPromptTurnContext).toEqual({ start: 0, text: normalContext });
       expect(prepared.opts.privateCompletion).toBe(privateCompletion);
       expect(prepared.opts.silentReplyPromptMode).toBe("none");
       expect(prepared.opts.inputProvenance).toEqual({

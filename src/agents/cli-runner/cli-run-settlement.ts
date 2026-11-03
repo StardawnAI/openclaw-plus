@@ -1,11 +1,10 @@
 import { setReplyPayloadMetadata, type ReplyPayload } from "../../auto-reply/reply-payload.js";
 import { SILENT_REPLY_TOKEN } from "../../auto-reply/tokens.js";
-import type { CliSessionBinding } from "../../config/sessions.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import {
   externalCliDiscoveryForProviderAuth,
-  loadAuthProfileStoreForRuntime,
+  loadAuthProfileStoreForRuntimeAsync,
   markAuthProfileFailure,
   markAuthProfileSuccess,
   type AuthProfileStore,
@@ -20,12 +19,14 @@ import {
   shouldClearInterruptedCliSessionBinding,
 } from "../cli-session.js";
 import type { EmbeddedAgentRunResult } from "../embedded-agent-runner.js";
-import { resolveExplicitFinalSourceReplyDeliveryEvidence } from "../embedded-agent-runner/delivery-evidence.js";
+import {
+  hasCompletedSourceReplyDeliveryEvidence,
+  resolveExplicitFinalSourceReplyDeliveryEvidence,
+} from "../embedded-agent-runner/delivery-evidence.js";
 import { resolveAuthProfileFailureReason } from "../embedded-agent-runner/run/auth-profile-failure-policy.js";
 import { buildEmbeddedRunPayloads } from "../embedded-agent-runner/run/payloads.js";
 import { mergeAttemptToolMediaPayloads } from "../embedded-agent-runner/run/tool-media-payloads.js";
 import { isFailoverError } from "../failover-error.js";
-import { resolveRetryAfterMs } from "../failover/retry-evidence.js";
 import { resolveReplyExpectation } from "../reply-completion.js";
 import { recordAgentCleanupFailure } from "../run-cleanup-timeout.js";
 import { CliAuthProfilePreparationError } from "./auth-profile-preparation-error.js";
@@ -43,79 +44,13 @@ export function formatCliTerminalInterruption(interruption: CliTerminalInterrupt
   return `CLI turn ${interruption.reason} after partial output`;
 }
 
-/** Marks the history reseed this native session received, so imports can strip it. */
-export function buildCliReseedReceipt(params: {
-  runParams: RunCliAgentParams;
-  output: Pick<CliOutput, "finalPromptText">;
-  usedHistoryPrompt: boolean;
-  userTurnHandled: boolean;
-}): CliSessionBinding["reseedReceipt"] {
-  const { runParams, output } = params;
-  if (
-    !params.usedHistoryPrompt ||
-    !isClaudeCliBackend(runParams.provider) ||
-    output.finalPromptText === undefined ||
-    !params.userTurnHandled ||
-    !runParams.sessionId
-  ) {
-    return undefined;
-  }
-  return {
-    version: 1,
-    promptHash: hashCliReseedPrompt(output.finalPromptText),
-    localSessionId: runParams.sessionId,
-    userTurnDisposition: runParams.userTurnTranscriptRecorder?.hasPersisted()
-      ? "persisted"
-      : "omitted",
-  };
-}
-
-/** Native continuity for a returned session, keyed to this run's auth and prompt facts. */
-export function buildCliSessionBinding(
-  context: PreparedCliRunContext,
-  sessionId: string,
-  output: Pick<CliOutput, "resumeCheckpointId" | "terminalInterruption">,
-  reseedReceipt?: CliSessionBinding["reseedReceipt"],
-): CliSessionBinding {
-  return {
-    sessionId,
-    ...(context.effectiveAuthProfileId ? { authProfileId: context.effectiveAuthProfileId } : {}),
-    ...(output.resumeCheckpointId ? { resumeCheckpointId: output.resumeCheckpointId } : {}),
-    ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
-    authEpochVersion: context.authEpochVersion,
-    ...(context.extraSystemPromptHash
-      ? { extraSystemPromptHash: context.extraSystemPromptHash }
-      : {}),
-    ...(context.messageToolPolicyHash
-      ? { messageToolPolicyHash: context.messageToolPolicyHash }
-      : {}),
-    ...(context.promptToolNamesHash ? { promptToolNamesHash: context.promptToolNamesHash } : {}),
-    ...(context.cwdHash ? { cwdHash: context.cwdHash } : {}),
-    ...(context.preparedBackend.mcpConfigHash
-      ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
-      : {}),
-    ...(context.preparedBackend.mcpResumeHash
-      ? { mcpResumeHash: context.preparedBackend.mcpResumeHash }
-      : {}),
-    ...(reseedReceipt ? { reseedReceipt } : {}),
-    ...(context.transcriptCursor && !output.terminalInterruption
-      ? {
-          transcriptCursor: {
-            ...context.transcriptCursor,
-            userEntryId: context.params.userTurnTranscriptRecorder?.getAdmissionReceipt()?.entryId,
-          },
-        }
-      : {}),
-  };
-}
-
 async function settleCliAuthProfile(params: {
   store: AuthProfileStore;
   profileId: string;
   provider: string;
   agentDir?: string;
   terminal:
-    | { outcome: "success" }
+    | { outcome: "success"; modelId?: string }
     | {
         outcome: "failure";
         error: unknown;
@@ -130,6 +65,7 @@ async function settleCliAuthProfile(params: {
         store: params.store,
         profileId: params.profileId,
         provider: params.provider,
+        modelId: params.terminal.modelId,
         agentDir: params.agentDir,
       });
       return;
@@ -151,7 +87,6 @@ async function settleCliAuthProfile(params: {
         agentDir: params.agentDir,
         runId: params.terminal.runId,
         modelId: params.terminal.modelId,
-        retryAfterMs: resolveRetryAfterMs(formatErrorMessage(error), Date.now(), error),
       });
     }
   } catch (error) {
@@ -205,7 +140,7 @@ export async function settleCliPreparationError(
     if (!(error instanceof CliAuthProfilePreparationError)) {
       return;
     }
-    const store = loadAuthProfileStoreForRuntime(error.agentDir, {
+    const store = await loadAuthProfileStoreForRuntimeAsync(error.agentDir, {
       externalCli: externalCliDiscoveryForProviderAuth({
         cfg: params.config,
         provider: error.provider,
@@ -261,21 +196,40 @@ async function retireCliRunMcpRuntime(
 export async function settlePreparedCliRun(params: {
   context: PreparedCliRunContext;
   diagnosticLifecycle?: ClaudeCliRunDiagnosticLifecycle;
-  run: () => Promise<EmbeddedAgentRunResult>;
+  run: (complete: (result: EmbeddedAgentRunResult) => void) => Promise<EmbeddedAgentRunResult>;
 }): Promise<EmbeddedAgentRunResult> {
   const { context, diagnosticLifecycle, run } = params;
   const runParams = context.params;
+  let completed: EmbeddedAgentRunResult | undefined;
+  const warnAfterCommit = (error: unknown) =>
+    log.warn(
+      `CLI run ${runParams.runId} settlement failed after final reply commit: ${formatErrorMessage(error)}`,
+    );
   let outcome: { result: EmbeddedAgentRunResult } | { error: unknown };
   try {
-    outcome = { result: await run() };
+    outcome = {
+      result: await run((result) => {
+        completed = result;
+      }),
+    };
   } catch (error) {
-    outcome = { error };
+    if (completed) {
+      warnAfterCommit(error);
+    }
+    outcome = completed ? { result: completed } : { error };
   }
   let cleanupError: Error | undefined;
   const recordCleanupError = (error: unknown) => {
     recordAgentCleanupFailure();
     cleanupError ??= error instanceof Error ? error : new Error(formatErrorMessage(error));
   };
+  try {
+    await runCliCleanup(runParams, "cli-backend-release", async () => {
+      await context.preparedBackend.cleanup?.();
+    });
+  } catch (error) {
+    recordCleanupError(error);
+  }
   if (runParams.cleanupCliLiveSessionOnRunEnd === true) {
     try {
       const { closeCliLiveSession } = await import("./cli-live-session-registry.js");
@@ -289,48 +243,56 @@ export async function settlePreparedCliRun(params: {
   } catch (error) {
     recordCleanupError(error);
   }
+  const delivered = "result" in outcome && hasCompletedSourceReplyDeliveryEvidence(outcome.result);
   if (cleanupError) {
-    if ("error" in outcome || outcome.result.didSendViaMessagingTool === true) {
+    if (completed || "error" in outcome || delivered) {
       log.warn(`cli run cleanup failed after completion: ${formatErrorMessage(cleanupError)}`);
     } else {
       diagnosticLifecycle?.setPhase("cleanup");
     }
   }
   // Retiring a caller is not a provider failure and must not quarantine its credential.
-  runParams.assertCurrent?.();
-  // Settle only after backend recovery is exhausted. Recording inside an
-  // attempt would quarantine a healthy profile for a recovered session fault.
-  if (context.effectiveAuthProfileId && context.authProfileStore) {
-    const profileId = context.effectiveAuthProfileId;
-    const authProfileStore = context.authProfileStore;
-    const terminal: Parameters<typeof settleCliAuthProfile>[0]["terminal"] | undefined =
-      "error" in outcome
-        ? {
-            outcome: "failure",
-            error: outcome.error,
-            config: runParams.config,
-            runId: runParams.runId,
-            modelId: context.modelId,
-          }
-        : outcome.result.meta.executionTrace?.attempts?.at(-1)?.result === "success"
-          ? { outcome: "success" }
-          : undefined;
-    if (terminal) {
-      await settleCliAuthProfile({
-        store: authProfileStore,
-        profileId,
-        provider: authProfileStore.profiles[profileId]?.provider ?? runParams.provider,
-        agentDir: context.agentDir,
-        terminal,
-      });
+  try {
+    runParams.assertCurrent?.();
+    // Settle only after backend recovery is exhausted. Recording inside an
+    // attempt would quarantine a healthy profile for a recovered session fault.
+    if (context.effectiveAuthProfileId && context.authProfileStore) {
+      const profileId = context.effectiveAuthProfileId;
+      const authProfileStore = context.authProfileStore;
+      const terminal: Parameters<typeof settleCliAuthProfile>[0]["terminal"] | undefined =
+        "error" in outcome
+          ? {
+              outcome: "failure",
+              error: outcome.error,
+              config: runParams.config,
+              runId: runParams.runId,
+              modelId: context.modelId,
+            }
+          : outcome.result.meta.executionTrace?.attempts?.at(-1)?.result === "success"
+            ? { outcome: "success", modelId: context.modelId }
+            : undefined;
+      if (terminal) {
+        await settleCliAuthProfile({
+          store: authProfileStore,
+          profileId,
+          provider: authProfileStore.profiles[profileId]?.provider ?? runParams.provider,
+          agentDir: context.agentDir,
+          terminal,
+        });
+      }
     }
+  } catch (error) {
+    if (!completed) {
+      throw error;
+    }
+    warnAfterCommit(error);
   }
   if ("error" in outcome) {
     throw outcome.error instanceof Error
       ? outcome.error
       : new Error(formatErrorMessage(outcome.error));
   }
-  if (cleanupError && outcome.result.didSendViaMessagingTool !== true) {
+  if (cleanupError && !completed && !delivered) {
     throw cleanupError;
   }
   return outcome.result;
@@ -527,6 +489,7 @@ export function buildCliRunResult(params: {
   const runParams = context.params;
   const text = output.text?.trim();
   const rawText = output.rawText?.trim();
+  const rawFinalText = output.rawFinalText?.trim();
   const sourceReplyMirror = resolveCliSourceReplyMirror({
     evidence: output,
     runParams,
@@ -578,9 +541,22 @@ export function buildCliRunResult(params: {
         effectiveCliSessionId !== resolveCliSessionId(context.reusableCliSession),
     });
   const persistedCliSessionId = cliSessionBindingCleared ? undefined : effectiveCliSessionId;
-  const createdReseedReceipt = persistedCliSessionId
-    ? buildCliReseedReceipt({ runParams, output, usedHistoryPrompt, userTurnHandled })
-    : undefined;
+  const createdReseedReceipt =
+    persistedCliSessionId &&
+    usedHistoryPrompt &&
+    isClaudeCliBackend(runParams.provider) &&
+    output.finalPromptText !== undefined &&
+    userTurnHandled &&
+    runParams.sessionId
+      ? {
+          version: 1 as const,
+          promptHash: hashCliReseedPrompt(output.finalPromptText),
+          localSessionId: runParams.sessionId,
+          userTurnDisposition: runParams.userTurnTranscriptRecorder?.hasPersisted()
+            ? ("persisted" as const)
+            : ("omitted" as const),
+        }
+      : undefined;
   const preservedReseedReceipt =
     runParams.cliSessionBinding && persistedCliSessionId === runParams.cliSessionBinding.sessionId
       ? runParams.cliSessionBinding.reseedReceipt
@@ -595,27 +571,39 @@ export function buildCliRunResult(params: {
   const yielded = output.yielded === true;
   const stopReason = terminalInterruption?.reason ?? (yielded ? "end_turn" : "completed");
 
-  if (!terminalInterruption) {
-    runParams.onSuccessfulAuthBinding?.({
-      ...(context.effectiveAuthProfileId ? { authProfileId: context.effectiveAuthProfileId } : {}),
-      ...(context.authBindingFingerprint
-        ? { authFingerprint: context.authBindingFingerprint }
-        : {}),
-      ...(!context.authBindingFingerprint && context.runtimeOwnerFingerprint
-        ? {
-            runtimeOwnerFingerprint: context.runtimeOwnerFingerprint,
-            runtimeOwnerKind: "cli-runtime" as const,
-            runtimeOwnerId: context.backendResolved.id,
-          }
-        : {}),
-      ...(context.runtimeArtifactFingerprint
-        ? {
-            runtimeArtifactFingerprint: context.runtimeArtifactFingerprint,
-            runtimeArtifactId: context.backendResolved.id,
-          }
-        : {}),
-      ...(context.authBindingSkipsLocalCredential ? { skipLocalCredential: true } : {}),
-    });
+  try {
+    if (!terminalInterruption && runParams.onSuccessfulAuthBinding) {
+      runParams.assertCurrent?.();
+      runParams.onSuccessfulAuthBinding({
+        ...(context.effectiveAuthProfileId
+          ? { authProfileId: context.effectiveAuthProfileId }
+          : {}),
+        ...(context.authBindingFingerprint
+          ? { authFingerprint: context.authBindingFingerprint }
+          : {}),
+        ...(!context.authBindingFingerprint && context.runtimeOwnerFingerprint
+          ? {
+              runtimeOwnerFingerprint: context.runtimeOwnerFingerprint,
+              runtimeOwnerKind: "cli-runtime" as const,
+              runtimeOwnerId: context.backendResolved.id,
+            }
+          : {}),
+        ...(context.runtimeArtifactFingerprint
+          ? {
+              runtimeArtifactFingerprint: context.runtimeArtifactFingerprint,
+              runtimeArtifactId: context.backendResolved.id,
+            }
+          : {}),
+        ...(context.authBindingSkipsLocalCredential ? { skipLocalCredential: true } : {}),
+      });
+    }
+  } catch (error) {
+    if (!assistantTranscriptIdempotencyKey || terminalInterruption || yielded) {
+      throw error;
+    }
+    log.warn(
+      `CLI run ${runParams.runId} auth binding notification failed after final reply commit: ${formatErrorMessage(error)}`,
+    );
   }
 
   return {
@@ -625,6 +613,11 @@ export function buildCliRunResult(params: {
       ...(output.finalPromptText ? { finalPromptText: output.finalPromptText } : {}),
       ...(finalAssistantVisibleText ? { finalAssistantVisibleText } : {}),
       ...(rawText ? { finalAssistantRawText: rawText } : {}),
+      // An empty final message is recorded as "" so capture never falls back to
+      // the cumulative raw text.
+      ...(rawFinalText !== undefined && rawFinalText !== rawText
+        ? { finalAssistantMessageRawText: rawFinalText }
+        : {}),
       systemPromptReport: context.systemPromptReport,
       ...(terminalInterruption
         ? {
@@ -663,12 +656,34 @@ export function buildCliRunResult(params: {
         ...(output.diagnosticUsage ? { diagnosticUsage: output.diagnosticUsage } : {}),
         ...(persistedCliSessionId
           ? {
-              cliSessionBinding: buildCliSessionBinding(
-                context,
-                persistedCliSessionId,
-                output,
-                reseedReceipt,
-              ),
+              cliSessionBinding: {
+                sessionId: persistedCliSessionId,
+                ...(context.effectiveAuthProfileId
+                  ? { authProfileId: context.effectiveAuthProfileId }
+                  : {}),
+                ...(output.resumeCheckpointId
+                  ? { resumeCheckpointId: output.resumeCheckpointId }
+                  : {}),
+                ...(context.authEpoch ? { authEpoch: context.authEpoch } : {}),
+                authEpochVersion: context.authEpochVersion,
+                ...(context.extraSystemPromptHash
+                  ? { extraSystemPromptHash: context.extraSystemPromptHash }
+                  : {}),
+                ...(context.messageToolPolicyHash
+                  ? { messageToolPolicyHash: context.messageToolPolicyHash }
+                  : {}),
+                ...(context.promptToolNamesHash
+                  ? { promptToolNamesHash: context.promptToolNamesHash }
+                  : {}),
+                ...(context.cwdHash ? { cwdHash: context.cwdHash } : {}),
+                ...(context.preparedBackend.mcpConfigHash
+                  ? { mcpConfigHash: context.preparedBackend.mcpConfigHash }
+                  : {}),
+                ...(context.preparedBackend.mcpResumeHash
+                  ? { mcpResumeHash: context.preparedBackend.mcpResumeHash }
+                  : {}),
+                ...(reseedReceipt ? { reseedReceipt } : {}),
+              },
             }
           : {}),
         ...(cliSessionBindingCleared ? { clearCliSessionBinding: true } : {}),

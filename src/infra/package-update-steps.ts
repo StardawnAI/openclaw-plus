@@ -27,6 +27,7 @@ import {
   validatePnpmIsolatedUpdate,
 } from "./package-update-manager-preflight.js";
 import { prepareNpmGitSourceInstallSpec } from "./package-update-npm-pack.js";
+import { PACKAGE_REFUSAL_CODES, type PackageRefusalCode } from "./package-update-refusal.js";
 import {
   PackageUpdateActivationError,
   type PackageActivationOptions,
@@ -64,7 +65,7 @@ import {
 
 type PackageUpdateStepsResult = {
   localOverrides?: LocalPackageOverridesResult;
-  reason?: "already-current" | typeof UPDATE_GLOBAL_PERMISSION_REASON;
+  reason?: "already-current" | typeof UPDATE_GLOBAL_PERMISSION_REASON | PackageRefusalCode;
   steps: UpdateStepResult[];
   activePackageRoot: string | null;
   afterVersion: string | null;
@@ -163,11 +164,9 @@ export async function runGlobalPackageUpdateSteps(params: {
       : await verifyUnchangedPackageUpdateRecovery(originalPackageRoot, initialRecovery);
     return {
       localOverrides,
-      ...(finalFailedStep.failureFacts?.some(
-        (fact) => fact.code === UPDATE_GLOBAL_PERMISSION_REASON,
-      )
-        ? { reason: UPDATE_GLOBAL_PERMISSION_REASON }
-        : {}),
+      reason: ([UPDATE_GLOBAL_PERMISSION_REASON, ...PACKAGE_REFUSAL_CODES] as const).find((code) =>
+        finalFailedStep.failureFacts?.some((fact) => fact.code === code),
+      ),
       steps: finalFailedSteps,
       activePackageRoot,
       afterVersion,
@@ -572,13 +571,9 @@ export async function runGlobalPackageUpdateSteps(params: {
         return await packageUpdateFailure(lifecycle.step, steps);
       }
     }
-    const verificationWarnings: string[] = [];
     if (!params.expectedGitCheckout && verificationErrors.length === 0) {
       verificationErrors.push(
-        ...(await collectPackageDistContentInventoryErrors(
-          verificationPackageRoot,
-          verificationWarnings,
-        )),
+        ...(await collectPackageDistContentInventoryErrors(verificationPackageRoot)),
       );
     }
     if (verificationErrors.length > 0) {
@@ -589,15 +584,6 @@ export async function runGlobalPackageUpdateSteps(params: {
           params.env,
         ),
       );
-    } else if (verificationWarnings.length) {
-      steps.push({
-        name: "package-verify",
-        command: `verify ${verificationPackageRoot}`,
-        cwd: verificationPackageRoot,
-        durationMs: 0,
-        exitCode: 0,
-        warnings: verificationWarnings,
-      });
     }
     let failedVerification = verificationErrors.length > 0;
     if (verificationErrors.length === 0) {

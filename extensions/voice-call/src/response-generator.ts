@@ -5,6 +5,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
   applyModelOverrideWithAuthProfileCompatibility,
   ModelSelectionLockedError,
+  prepareAuthProfileProvider,
   resolvePersistedSessionRuntimeId,
 } from "openclaw/plugin-sdk/model-session-runtime";
 import { isValidAgentHarnessSessionStoreEntry } from "openclaw/plugin-sdk/session-store-runtime";
@@ -270,17 +271,12 @@ export async function generateVoiceResponse(
         await agentRuntime.ensureAgentWorkspace({ dir: workspaceDir });
 
         const now = Date.now();
-        let sessionEntry = agentRuntime.session.getSessionEntry({
+        let sessionEntry = await agentRuntime.session.getSessionEntryAsync({
           storePath,
           sessionKey: resolvedSessionKey,
         });
 
-        const { provider, model } = resolveVoiceResponseModel({
-          cfg,
-          agentId,
-          voiceConfig,
-          agentRuntime,
-        });
+        const { provider, model } = resolveVoiceResponseModel({ voiceConfig, agentRuntime });
         const configuredModel = resolveDefaultModelForAgent({ cfg, agentId });
 
         if (sessionEntry?.modelSelectionLocked === true && voiceConfig.responseModel) {
@@ -288,7 +284,7 @@ export async function generateVoiceResponse(
         }
         if (!sessionEntry?.sessionId || voiceConfig.responseModel) {
           sessionEntry =
-            (await agentRuntime.session.patchSessionEntry({
+            (await agentRuntime.session.prepareSessionEntryPatch({
               storePath,
               sessionKey: resolvedSessionKey,
               replaceEntry: true,
@@ -296,7 +292,7 @@ export async function generateVoiceResponse(
                 sessionId: crypto.randomUUID(),
                 updatedAt: now,
               },
-              update: (entry) => {
+              prepare: async (entry) => {
                 const next = entry.sessionId
                   ? { ...entry }
                   : {
@@ -305,10 +301,15 @@ export async function generateVoiceResponse(
                       updatedAt: now,
                     };
                 if (voiceConfig.responseModel) {
+                  const profileId = entry.authProfileOverride?.trim();
+                  const recordedProvider = profileId
+                    ? await prepareAuthProfileProvider({ agentDir, profileId })
+                    : undefined;
                   applyModelOverrideWithAuthProfileCompatibility({
                     cfg,
                     agentDir,
                     entry: next,
+                    recordedProvider,
                     currentProvider:
                       entry.providerOverride?.trim() ||
                       entry.modelProvider?.trim() ||

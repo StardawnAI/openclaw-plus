@@ -22,7 +22,6 @@ export function registerGatewayStartupReadinessTests(params: {
         updateCanary,
         getReadiness: () => ({
           ready: false,
-          coreReady: false,
           failing: ["agent-database:main"],
           uptimeMs: 0,
         }),

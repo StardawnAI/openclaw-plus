@@ -4,7 +4,6 @@ import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { withAgentRosterFactsBatch } from "./agent-scope-config.js";
-import { PreparedModelRuntimeRecoveryError } from "./prepared-model-runtime-admission-errors.js";
 import { assertPreparedModelRuntimeAdmissionCanWait } from "./prepared-model-runtime-admission.js";
 import { listConfiguredOwnerInputs } from "./prepared-model-runtime.configured.js";
 import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
@@ -155,30 +154,27 @@ export function updateOwnersForScopedRefresh(
   retiredPublications.forEach(releasePreparedPluginPublication);
 }
 
-/** Keeps a requested scope only when every retained owner has identical prepared dependencies. */
+/** Includes unfinished or changed owners without replacing unrelated prepared generations. */
 export function resolveSafeRefreshAgentIds(
   config: OpenClawConfig,
   options: PreparedModelRuntimeRefreshOptions,
   owners: Map<string, PreparedModelRuntimeOwner>,
 ): ReadonlySet<string> | undefined {
-  const requested = options.agentIds;
-  if (!requested) {
+  if (!options.agentIds) {
     return undefined;
   }
+  const agentIds = new Set(options.agentIds);
   const inputs = new Map(
     listConfiguredRefreshInputs(config, options, owners).flatMap((input) =>
       input.agentId ? [[input.agentId, input] as const] : [],
     ),
   );
   for (const owner of owners.values()) {
-    if (
-      owner.provenance !== "configured" ||
-      !owner.input.agentId ||
-      requested.has(owner.input.agentId)
-    ) {
+    if (owner.provenance !== "configured" || !owner.input.agentId) {
       continue;
     }
     const input = inputs.get(owner.input.agentId);
+    inputs.delete(owner.input.agentId);
     if (
       !input ||
       !owner.snapshot ||
@@ -188,10 +184,13 @@ export function resolveSafeRefreshAgentIds(
         owner.snapshot.metadataSnapshot !== options.pluginMetadataSnapshot) ||
       ownerKey({ ...owner.input, config: input.config }) !== ownerKey(input)
     ) {
-      return undefined;
+      agentIds.add(owner.input.agentId);
     }
   }
-  return requested;
+  for (const agentId of inputs.keys()) {
+    agentIds.add(agentId);
+  }
+  return agentIds;
 }
 
 /** Recovery operations share configured owners and the lifecycle's existing publication barrier. */
@@ -281,7 +280,7 @@ export function createPreparedModelRuntimeRecovery(host: {
     }
   }
 
-  /** Rechecks failed publications using the existing publication barrier. */
+  /** Rechecks only failed catalog-worker replacements, using the existing publication barrier. */
   async function ensureGatewayPreparedModelRuntimeReady({
     agentId,
     demand = "interactive",
@@ -305,15 +304,6 @@ export function createPreparedModelRuntimeRecovery(host: {
       return;
     }
     const assertLifetime = host.captureLifetime();
-    if (recovery.pending) {
-      assertPreparedModelRuntimeAdmissionCanWait();
-      if (demand === "scheduled") {
-        recovery.scheduledAttempted = true;
-      }
-      await racePromiseWithAbortSignal(recovery.pending, abortSignal);
-      assertLifetime();
-      return;
-    }
     const replacement = host.getAdmissionReplacement();
     if (replacement && !replacement.degraded) {
       assertPreparedModelRuntimeAdmissionCanWait();
@@ -332,14 +322,9 @@ export function createPreparedModelRuntimeRecovery(host: {
     if (
       !owner.needsRefresh ||
       owner.refreshError !== recovery.error ||
-      (demand === "scheduled" && recovery.scheduledAttempted)
+      (demand === "scheduled" ? recovery.scheduledAttempted : Date.now() < recovery.retryAfter)
     ) {
       return;
-    }
-    if (Date.now() < recovery.retryAfter) {
-      throw new PreparedModelRuntimeRecoveryError(agentId, "backoff", recovery.retryAfter, {
-        cause: recovery.error,
-      });
     }
     assertPreparedModelRuntimeAdmissionCanWait(owner);
     if (demand === "scheduled") {
@@ -348,14 +333,18 @@ export function createPreparedModelRuntimeRecovery(host: {
     const affected = [...host.owners.values()].filter(
       (candidate) => candidate.catalogRecovery === recovery,
     );
+    const recoveryClaim: { gateId?: PreparedModelRuntimeReplacement["gateId"] } = {};
     const publication = host
       .publish(owner.input.config, {
-        catalogMode: owner.catalogMode,
-        allowGatewaySubagentBinding: owner.input.allowGatewaySubagentBinding,
+        catalogMode: "static",
+        allowGatewaySubagentBinding: true,
         agentIds: new Set(affected.flatMap((candidate) => candidate.input.agentId ?? [])),
         pluginMetadataSnapshot: owner.snapshot?.metadataSnapshot,
         isPublicationCurrent: () =>
-          host.canRecover() && host.owners.get(ownerKey(owner.input)) === owner,
+          host.canRecover() &&
+          (host.owners.get(ownerKey(owner.input)) === owner ||
+            (recoveryClaim.gateId !== undefined &&
+              host.getReplacement()?.gateId === recoveryClaim.gateId)),
       })
       .catch((error: unknown) => {
         if (
@@ -367,22 +356,13 @@ export function createPreparedModelRuntimeRecovery(host: {
         ) {
           recovery.error = error;
           recovery.retryAfter = Date.now() + CATALOG_RECOVERY_DEMAND_COOLDOWN_MS;
-          throw new PreparedModelRuntimeRecoveryError(
-            agentId,
-            "attempt-failed",
-            recovery.retryAfter,
-            { cause: error },
-          );
         }
         throw error;
-      })
-      .finally(() => {
-        if (recovery.pending === publication) {
-          recovery.pending = undefined;
-        }
       });
-    recovery.pending = publication;
-    recovery.replacementGateId = host.getReplacement()?.gateId;
+    // This publication can replace its own owner before commit. Keep only its exact gate alive;
+    // newer replacement epochs remain fenced by the publication queue.
+    recoveryClaim.gateId = host.getReplacement()?.gateId;
+    recovery.replacementGateId = recoveryClaim.gateId;
     await racePromiseWithAbortSignal(publication, abortSignal);
     assertLifetime();
   }

@@ -474,8 +474,9 @@ describe("native authenticated Control UI", () => {
       });
       const first = connect();
       if (failure.startsWith("silent bridge")) {
-        // Stop at the authorization deadline, before the local close's retry fires.
-        await vi.advanceTimersByTimeAsync(DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS / 2);
+        await vi.advanceTimersByTimeAsync(
+          DEFAULT_PREAUTH_HANDSHAKE_TIMEOUT_MS / (failure === "silent bridge stopped" ? 1 : 2),
+        );
       }
       await first.closed.promise;
       first.emitClose(4008, "native authorization unavailable");
@@ -486,7 +487,6 @@ describe("native authenticated Control UI", () => {
       }
       expect(localStorage.getItem("openclaw-device-identity-v1")).toBeNull();
       if (failure === "silent bridge stopped") {
-        expect(wsInstances).toHaveLength(1);
         gateway!.stop();
         expect(vi.getTimerCount()).toBe(0);
         await vi.advanceTimersByTimeAsync(30_000);

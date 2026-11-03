@@ -1,25 +1,14 @@
-import {
-  collectSimpleChannelFieldAssignments,
-  createChannelSecretContract,
-} from "openclaw/plugin-sdk/channel-secret-basic-runtime";
-import { hasConfiguredNextcloudAccount } from "../configured-state.js";
+import { createSimpleChannelSecretContract } from "openclaw/plugin-sdk/channel-secret-basic-runtime";
 
-export const channelSecrets = createChannelSecretContract({
+export const channelSecrets = createSimpleChannelSecretContract({
   channelKey: "nextcloud-talk",
-  account: ["apiPassword", "botSecret"],
-  channel: ["apiPassword", "botSecret"],
-  hasImplicitDefaultAccount: ({ context }) =>
-    hasConfiguredNextcloudAccount(context.sourceConfig.channels?.["nextcloud-talk"], context.env),
-  collect(params) {
+  label: "Nextcloud Talk",
+  accountFields: ["apiPassword", "botSecret"],
+  channelFields: ["apiPassword", "botSecret"],
+  mode: {
+    kind: "surface-inheritance",
     // Runtime collection historically reports botSecret before apiPassword.
-    for (const field of ["botSecret", "apiPassword"]) {
-      collectSimpleChannelFieldAssignments({
-        ...params,
-        field,
-        topInactiveReason: `no enabled Nextcloud Talk surface inherits this top-level ${field}.`,
-        accountInactiveReason: "Nextcloud Talk account is disabled.",
-      });
-    }
+    collectionFields: ["botSecret", "apiPassword"],
   },
 });
 

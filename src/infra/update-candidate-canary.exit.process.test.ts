@@ -5,7 +5,7 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { tryListenOnPort } from "./ports-probe.js";
 import { validateUpdateCandidateCanary } from "./update-candidate-canary.js";
-import { renderSteps } from "./update-candidate-canary.test-support.js";
+import { canaryOutcomeStep, renderSteps } from "./update-candidate-canary.test-support.js";
 import * as rehearsals from "./update-candidate-rehearsal.js";
 import { writeUpdateRunReportArtifact } from "./update-failure-report-artifact.js";
 import { prepareUpdateFailureReport } from "./update-failure-report-prepare.js";
@@ -109,7 +109,6 @@ if (args.includes("--fix")) {
         selection: { kind: "explicit-tmpdir", directory: stateDir },
       },
       cleanupDirectories: [],
-      prepareRuntime: async (assertCurrent) => assertCurrent(),
       cleanup: async () => {},
     });
     const options = { env: { OPENCLAW_STATE_DIR: path.join(root, "ledger") } };
@@ -225,7 +224,10 @@ if (args.includes("--fix")) {
           expect.objectContaining({ checkId: "core/doctor/security", severity: "warning" }),
         );
       }
-      expect(result.steps.at(-1)).toMatchObject({ name: "candidate-gateway-startup", exitCode: 0 });
+      expect(canaryOutcomeStep(result.steps)).toMatchObject({
+        name: "candidate-gateway-startup",
+        exitCode: 0,
+      });
     }
   },
   15_000,

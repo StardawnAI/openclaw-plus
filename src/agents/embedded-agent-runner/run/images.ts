@@ -12,7 +12,6 @@ import { formatErrorMessage } from "../../../infra/errors.js";
 import type { Context, ImageContent, TextContent } from "../../../llm/types.js";
 import { redactSensitiveText } from "../../../logging/redact.js";
 import {
-  applyRunHydrationSuppression,
   attachRuntimePromptMediaFacts,
   isImageMediaFact,
   isVideoMediaFact,
@@ -134,6 +133,28 @@ export function detectImageReferences(prompt: string): MediaFileRef[] {
   return refs;
 }
 
+function applySandboxStagedImagePaths(
+  selected: MediaFact[],
+  attemptMedia: readonly MediaFact[] | undefined,
+): MediaFact[] {
+  const stagedByUrl = new Map<string, string>();
+  for (const fact of attemptMedia ?? []) {
+    if (fact.staged === true && fact.path && fact.url?.startsWith("media://")) {
+      stagedByUrl.set(fact.url, fact.path);
+    }
+  }
+  if (stagedByUrl.size === 0) {
+    return selected;
+  }
+  return selected.map((fact) => {
+    const stagedPath = fact.url ? stagedByUrl.get(fact.url) : undefined;
+    if (!stagedPath || fact.hydrationSuppressed === true) {
+      return fact;
+    }
+    return { ...fact, path: stagedPath, staged: true };
+  });
+}
+
 function refDedupeKey(ref: MediaFileRef, workspaceDir?: string): string {
   const resolved =
     ref.type === "path" && workspaceDir && !path.isAbsolute(ref.resolved)
@@ -251,10 +272,11 @@ export async function detectAndLoadPromptImages(
   }
   // Deferred transcript preparation can carry fresher facts than the recorder's
   // initial message. Resolve without persisting before choosing image ownership.
+  // Sandbox staging is newer than that snapshot and is the only copy the bridge can read.
   const message = await params.userTurnTranscriptRecorder?.resolveMessage();
-  const recordedMedia = message ? readPersistedMediaFacts(message) : undefined;
-  const media = normalizeMediaFacts(
-    recordedMedia ? applyRunHydrationSuppression(recordedMedia, params.media) : params.media,
+  const media = applySandboxStagedImagePaths(
+    normalizeMediaFacts((message ? readPersistedMediaFacts(message) : undefined) ?? params.media),
+    params.sandbox ? params.media : undefined,
   );
   const mediaImageLayout =
     (message ? readPersistedMediaImageLayout(message) : undefined) ?? params.mediaImageLayout;

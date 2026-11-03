@@ -137,7 +137,6 @@ async function fixture(
         selection: { kind: "explicit-tmpdir", directory: root },
       },
       cleanupDirectories: [root],
-      prepareRuntime: async (assertCurrent) => assertCurrent(),
       cleanup,
     });
     const launch = vi.spyOn(commands, "runUtf8CommandWithTimeout").mockResolvedValue({

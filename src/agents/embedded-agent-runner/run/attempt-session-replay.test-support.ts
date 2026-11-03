@@ -31,7 +31,7 @@ import { SettingsManager } from "../../sessions/settings-manager.js";
 import {
   clearEmbeddedSessionPromptStates,
   createToolResultPromptProjectionState,
-  getEmbeddedSessionPromptState,
+  retainEmbeddedSessionPromptState,
   persistToolResultProjections,
 } from "../session-prompt-state.js";
 import { submitEmbeddedAttemptPrompt } from "./attempt-prompt-submit.js";
@@ -110,6 +110,7 @@ export async function withInterruptedTurn(
   }) => Promise<void>,
   options: {
     interruptedTurn?: boolean;
+    partialText?: string;
     toolProgress?: boolean;
     settledPrefix?: boolean;
     oversizedMetadata?: boolean;
@@ -201,9 +202,15 @@ export async function withInterruptedTurn(
       await appendCompletedToolWork(original, runId);
     }
     if (options.interruptedTurn !== false) {
-      await original.appendMessageAsync(
-        createFailureMessage(testModel, createAgentRunRestartAbortError(), true),
-      );
+      await original.appendMessageAsync({
+        ...createFailureMessage(testModel, createAgentRunRestartAbortError(), true),
+        ...(options.partialText
+          ? {
+              content: [{ type: "text" as const, text: options.partialText }],
+              errorCode: "OPENCLAW_RESTART_ABORT",
+            }
+          : {}),
+      });
       await appendInterruptedTurnMessage([], async (event) => {
         if (event.type !== "message_end") {
           return;
@@ -249,7 +256,6 @@ export async function withInterruptedTurn(
       workspaceDir: state.workspaceDir,
       prompt: "Finish this exact turn",
       userTurnTranscriptRecorder: recorder,
-      timeoutMs: 120_000,
     } as EmbeddedRunAttemptParams;
     const lifecycle = createEmbeddedAttemptTranscriptLifecycle(attempt);
     const selected = options.selectedOwner ? await loadSessionEntryForAdmission(target) : undefined;
@@ -261,13 +267,6 @@ export async function withInterruptedTurn(
       throw new Error("Replay fixture requires a selected worker reader");
     }
     let active = true;
-    const runAbortController = new AbortController();
-    const assertCurrent = () => {
-      runAbortController.signal.throwIfAborted();
-      if (!active) {
-        throw new Error("original writer closed");
-      }
-    };
     const withOwnedTranscriptWrite = <T>(operation: () => Promise<T> | T) =>
       withOwnedSessionTranscriptWrites(
         {
@@ -278,7 +277,9 @@ export async function withInterruptedTurn(
           },
           sessionReader,
           assertCommitAllowed: () => {
-            assertCurrent();
+            if (!active) {
+              throw new Error("original writer closed");
+            }
           },
           withTranscriptWrite: (write) => lifecycle.withTranscriptWrite(write),
         },
@@ -295,14 +296,12 @@ export async function withInterruptedTurn(
           prepareEmbeddedAttemptSessionManager({
             ...extra,
             attempt,
-            assertCurrent: extra?.assertCurrent ?? assertCurrent,
             agentDir: state.agentDir("main"),
             effectiveCwd: state.workspaceDir,
             effectiveWorkspace: state.workspaceDir,
             onSessionManagerCreated: onCreated ?? (() => {}),
             replayAllowedToolNames: new Set(["read"]),
             resolveActiveContextEnginePluginId: () => undefined,
-            runAbortSignal: extra?.runAbortSignal ?? runAbortController.signal,
             sessionAgentId: target.agentId,
             withOwnedTranscriptWrite,
           }),
@@ -376,7 +375,8 @@ export async function withReplaySession(
       sessionManager: prepared.sessionManager,
       setActiveSessionSystemPrompt: () => {},
     });
-    const promptState = getEmbeddedSessionPromptState(target.sessionId);
+    using promptStateLease = retainEmbeddedSessionPromptState(target.sessionId);
+    const promptState = promptStateLease.state;
     const submit = () =>
       submitEmbeddedAttemptPrompt({
         attempt,

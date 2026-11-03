@@ -1,4 +1,3 @@
-import { hasConfiguredAccountValue } from "openclaw/plugin-sdk/account-helpers";
 import {
   collectConditionalChannelFieldAssignments,
   createChannelSecretContract,
@@ -10,11 +9,6 @@ export const channelSecrets = createChannelSecretContract({
   channelKey: "zalo",
   account: ["botToken", "webhookSecret"],
   channel: ["botToken", "webhookSecret"],
-  // Match the credential sources used for the implicit default in account listing.
-  hasImplicitDefaultAccount: ({ channel, context }) =>
-    [channel.botToken, channel.tokenFile, context.env.ZALO_BOT_TOKEN].some(
-      hasConfiguredAccountValue,
-    ),
   collect(params) {
     const { channel: zalo } = params;
     collectConditionalChannelFieldAssignments({
@@ -29,10 +23,12 @@ export const channelSecrets = createChannelSecretContract({
       topInactiveReason: "no enabled Zalo surface inherits this top-level botToken.",
       accountInactiveReason: "Zalo account is disabled.",
     });
-    const baseWebhookUrl = normalizeSecretStringValue(zalo.webhookUrl);
+    const baseWebhookUrl = typeof zalo.webhookUrl === "string" ? zalo.webhookUrl.trim() : "";
     const accountWebhookUrl = (account: Record<string, unknown>) =>
       hasOwnProperty(account, "webhookUrl")
-        ? normalizeSecretStringValue(account.webhookUrl)
+        ? typeof account.webhookUrl === "string"
+          ? account.webhookUrl.trim()
+          : ""
         : baseWebhookUrl;
     collectConditionalChannelFieldAssignments({
       ...params,

@@ -11,6 +11,7 @@ import {
   assertCodexSessionRuntimeOwnership,
   requireCodexSupervisionModelSelection,
 } from "./binding-connection.js";
+import { recordCodexTurnForkSettings } from "./client-fork-settings.js";
 import { prepareCodexWorkspaceReferences } from "./client-runtime.js";
 import { isCodexAppServerIndeterminateRequestCancellationError } from "./client.js";
 import { joinPresentSections } from "./developer-instruction-sections.js";
@@ -18,6 +19,7 @@ import { resolveCodexExplicitSkillInputs } from "./explicit-skill-input.js";
 import { CODEX_INFERENCE_GENERATION_KEY } from "./inference-context.js";
 import { getCodexInferenceThread } from "./inference-routing.js";
 import { readCodexRuntimeModelId } from "./model-runtime.js";
+import { assertCodexProtectedContextCarrier } from "./protected-context-carrier.js";
 import { assertCodexTurnStartResponse } from "./protocol-validators.js";
 import type { CodexTurnStartResponse } from "./protocol.js";
 import { prepareCodexProviderReviewContinuation } from "./provider-review-continuation.js";
@@ -28,7 +30,10 @@ import {
 } from "./run-attempt-lifecycle.js";
 import type { CodexAttemptResources } from "./run-attempt-resources.js";
 import type { CodexAttemptTurnState } from "./run-attempt-turn-state.js";
-import { resolveCodexUltrafastServiceTier } from "./service-tier.js";
+import {
+  buildCodexConversationTurnInstructions,
+  splitCodexExtraSystemPrompt,
+} from "./thread-prompt.js";
 import { recordCodexTrajectoryContext } from "./trajectory.js";
 import { buildCodexParentLocalInstructions, buildTurnStartParams } from "./turn-params.js";
 import type { CodexThreadRouteReservation } from "./turn-router.js";
@@ -162,7 +167,13 @@ export async function prepareCodexAttemptTurnRequest(
       resourceState.client,
       resourceState.thread.threadId,
     );
-    const turnStartParams = buildTurnStartParams(runtimeParams, {
+    assertCodexProtectedContextCarrier(
+      turnClient,
+      threadId,
+      Boolean(inferenceRoute),
+      splitCodexExtraSystemPrompt(runtimeParams).turn,
+    );
+    const turnStartParams = await buildTurnStartParams(runtimeParams, {
       threadId: resourceState.thread.threadId,
       cwd: resourceState.codexExecutionCwd,
       appServer: turnAppServer,
@@ -187,18 +198,8 @@ export async function prepareCodexAttemptTurnRequest(
         (tool) => tool.name === "session_status",
       ),
     });
-    const serviceTier = await resolveCodexUltrafastServiceTier({
-      enabled: fastMode === "ultrafast" && turnAppServer.enableUltrafast !== false,
-      serviceTier: turnStartParams.serviceTier,
-      model: turnStartParams.model ?? model,
-      // ChatGPT sign-in and user-home threads omit the native provider after resume.
-      modelProvider: modelProvider ?? effectiveRuntimeProviderId,
-      client: turnClient,
-      timeoutMs: Math.min(params.timeoutMs, 2500),
-      signal: runAbortController.signal,
-      assertCurrent: assertTurnCurrent,
-      config: params.config,
-    });
+    const serviceTier =
+      fastMode === "ultrafast" ? selectedThread.preparedServiceTier : turnStartParams.serviceTier;
     assertTurnCurrent();
     turnStartParams.serviceTier = serviceTier;
     connection.mutable.pluginAppServer = { ...turnAppServer, serviceTier };
@@ -232,15 +233,18 @@ export async function prepareCodexAttemptTurnRequest(
       }
       resourceState.releaseInferenceContext?.();
       const inferenceThread = resourceState.thread;
-      const registration = inferenceRoute.context.register({
+      const registration = await inferenceRoute.context.register({
         threadId: resourceState.thread.threadId,
-        text: usesSupervisionConnection
-          ? ""
-          : (buildCodexParentLocalInstructions(runtimeParams, {
-              personaInstructions: workspaceBootstrapContext.personaInstructions,
-              skillsInstructions: context.skillsInstructions,
-              memoryInstructions: workspaceBootstrapContext.memoryInstructions,
-            }) ?? ""),
+        text: joinPresentSections(
+          usesSupervisionConnection
+            ? ""
+            : (buildCodexParentLocalInstructions(runtimeParams, {
+                personaInstructions: workspaceBootstrapContext.personaInstructions,
+                skillsInstructions: context.skillsInstructions,
+                memoryInstructions: workspaceBootstrapContext.memoryInstructions,
+              }) ?? ""),
+          buildCodexConversationTurnInstructions(runtimeParams, toolBridge.availableSpecs),
+        ),
         signal: runAbortController.signal,
         assertCurrent: () => {
           params.hostCapabilities.assertActive();
@@ -312,11 +316,18 @@ export async function prepareCodexAttemptTurnRequest(
           withCurrent: connection.withCurrent,
           assertCurrent: () => {
             assertTurnCurrent();
+            assertCodexProtectedContextCarrier(
+              turnClient,
+              threadId,
+              Boolean(getCodexInferenceThread(turnClient, threadId)),
+              splitCodexExtraSystemPrompt(runtimeParams).turn,
+            );
             continuation?.dispatch();
           },
         }),
       );
       acceptedTurnId = startedTurn.turn.id;
+      recordCodexTurnForkSettings(turnClient, turnStartParams);
       resources.nativeProcessAuthority?.bindTurn(turnClient, threadId, acceptedTurnId);
       assertTurnCurrent();
       resourceState.nativeSubagentMonitor?.bindTurn(acceptedTurnId, modelMapping);

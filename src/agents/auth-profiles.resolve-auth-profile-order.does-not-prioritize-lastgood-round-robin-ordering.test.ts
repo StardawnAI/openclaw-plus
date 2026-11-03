@@ -127,12 +127,7 @@ describe("resolveAuthProfileOrder", () => {
       other: apiKey("openai"),
     });
     store.usageStats = {
-      expired: {
-        cooldownUntil: now - 1000,
-        errorCount: 4,
-        failureCounts: { timeout: 4 },
-        lastRateLimitAt: now - 2000,
-      },
+      expired: { cooldownUntil: now - 1000, errorCount: 4, failureCounts: { rate_limit: 4 } },
       late: { cooldownUntil: now + 120_000, errorCount: 2 },
       early: { disabledUntil: now + 60_000, disabledReason: "billing" },
       other: { cooldownUntil: now - 1000, errorCount: 3 },
@@ -144,8 +139,7 @@ describe("resolveAuthProfileOrder", () => {
     ]);
     expect(store.usageStats.expired).toMatchObject({
       errorCount: 0,
-      failureCounts: undefined,
-      lastRateLimitAt: now - 2000,
+      failureCounts: { rate_limit: 4 },
     });
     expect(store.usageStats.expired?.cooldownUntil).toBeUndefined();
     expect(store.usageStats.other?.errorCount).toBe(0);

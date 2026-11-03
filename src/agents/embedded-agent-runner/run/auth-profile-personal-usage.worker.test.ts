@@ -184,7 +184,7 @@ it.each(["unchanged", "block", "credential"] as const)(
             blockedReason: "subscription_limit",
             blockedSource: "wham",
             lastFailureAt: now,
-            lastRateLimitAt: now,
+            failureCounts: { rate_limit: 1 },
           };
           return true;
         });

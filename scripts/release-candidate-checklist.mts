@@ -31,26 +31,41 @@ import {
   stripLeadingPackageManagerSeparator,
 } from "./lib/arg-utils.mts";
 import { readBoundedResponseText } from "./lib/bounded-response.mjs";
+import { resolveNpmJsonEntries } from "./lib/npm-json-output.mts";
 import { parsePluginReleaseSelection } from "./lib/plugin-npm-release.ts";
-import { gitIsAncestor, validateCandidateChangelog } from "./lib/release-candidate-changelog.mts";
+import { loadChangelogCollection } from "./lib/release-changelog.mjs";
 import { releaseBranchForTag } from "./lib/release-context.mjs";
 import { ensureReleasePublishToolingTag } from "./lib/release-publish-preflight-evidence.mts";
 import { formatReleasePublishPreflight } from "./lib/release-publish-preflight-interface.mts";
 import { classifyReleaseTrain, parseReleaseVersion } from "./lib/release-version.mjs";
 import { sleep as wait } from "./lib/sleep.mjs";
+import { readUpgradeSurvivorScenarioCatalog } from "./lib/upgrade-survivor-policy.mjs";
 import {
   downloadFullReleaseNpmPreflight,
   verifyNpmPreflightProducer,
   validateReleasePreflightTagIdentity,
 } from "./npm-preflight-tooling-identity.mjs";
-import { validateNpmPreflightDistTag } from "./openclaw-npm-extended-stable-release.mjs";
+import {
+  resolveNpmPreflightSdkSelectors,
+  validateNpmPreflightDistTag,
+} from "./openclaw-npm-extended-stable-release.mjs";
 import {
   PluginSdkApiAcknowledgementError,
   validatePluginSdkApiReleaseEvidence,
 } from "./plugin-sdk-api-release-evidence.mjs";
 import { runReleasePublishPreflight } from "./release-publish-preflight.mts";
 import { runReleaseToolingGh, verifyReleaseToolingIdentity } from "./release-tooling-identity.mjs";
-import { formatShippedBaselineExclusions } from "./render-github-release-notes.mts";
+import {
+  dedicatedSectionVersionForTag,
+  extractChangelogReleaseSections,
+  extractChangelogSection,
+  formatShippedBaselineExclusions,
+  loadReleaseNotesForTag,
+  parseContributionRecordProvenance,
+  parseShippedBaselineExclusions,
+  releaseNotesVersionForTag,
+  renderGithubReleaseNotes,
+} from "./render-github-release-notes.mts";
 import {
   isShaPinnedReleaseValidationBranch,
   authenticateFullReleaseValidationEvidence,
@@ -109,6 +124,7 @@ const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
 const RELEASE_CANDIDATE_STATE_VERSION = 2;
 const RELEASE_CANDIDATE_STATE_FILE = "release-candidate-state.json";
 const TRUSTED_TOOLING_SHA_ENV = "OPENCLAW_RELEASE_CANDIDATE_TRUSTED_TOOLING_SHA";
+const UPGRADE_SURVIVOR_CATALOG_PATH = "scripts/lib/upgrade-survivor-scenarios.json";
 // Release tooling (toolingSha and its publishWorkflowRef tag) is not candidate
 // identity: each run re-verifies the current tooling against trusted main, and
 // saved FRV/npm evidence is authenticated against its own producer run. Tooling
@@ -180,7 +196,7 @@ Options:
   --npm-dist-tag <beta|latest>  Default: ${DEFAULT_NPM_DIST_TAG}
   --plugin-publish-scope <scope>      selected|all-publishable. Default: ${DEFAULT_PLUGIN_SCOPE}
   --plugins <names>                   Required when plugin scope is selected.
-  --output-dir <dir>                  Evidence output dir. Default: .artifacts/release-candidate/<tag>
+  --output-dir <dir>                  Evidence output dir. Default: .artifacts/release-candidate/<tag>/<target-sha>
 `;
 }
 
@@ -368,24 +384,44 @@ export function parseArgs(argv: string[]) {
   return options;
 }
 
+export function resolveReleaseCandidateOutputDir({
+  outputDir,
+  tag,
+  targetSha,
+}: {
+  outputDir: string;
+  tag: string;
+  targetSha: string;
+}) {
+  return outputDir || join(".artifacts", "release-candidate", tag, targetSha);
+}
+
 export function run(
   command: string,
   args: string[],
-  options: { capture?: boolean; cwd?: string; env?: NodeJS.ProcessEnv } = {},
+  options: { capture?: boolean | "echo"; cwd?: string; env?: NodeJS.ProcessEnv } = {},
 ) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     encoding: "utf8",
     env: options.env ? { ...process.env, ...options.env } : process.env,
-    maxBuffer: COMMAND_CAPTURE_MAX_BUFFER_BYTES,
+    ...(options.capture === "echo" ? {} : { maxBuffer: COMMAND_CAPTURE_MAX_BUFFER_BYTES }),
     stdio: options.capture ? ["ignore", "pipe", "pipe"] : "inherit",
   });
+  if (options.capture === "echo") {
+    if (result.stdout) {
+      process.stdout.write(result.stdout);
+    }
+    if (result.stderr) {
+      process.stderr.write(result.stderr);
+    }
+  }
   if (result.status !== 0) {
     throw new Error(
       `${command} ${args.join(" ")} failed with ${result.status ?? result.signal}\n${result.stderr ?? ""}`,
     );
   }
-  return result.stdout ?? "";
+  return `${result.stdout ?? ""}${options.capture === "echo" ? (result.stderr ?? "") : ""}`;
 }
 
 function readJson(path: string, label: string) {
@@ -400,6 +436,162 @@ function readJson(path: string, label: string) {
       `${label} is invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
       { cause: error },
     );
+  }
+}
+
+export function resolveEarlyPluginSdkApiBases({
+  distTags,
+  npmDistTag,
+  packageVersion,
+}: {
+  distTags: unknown;
+  npmDistTag: string;
+  packageVersion: string;
+}): Record<string, string> {
+  const entries = resolveNpmJsonEntries(distTags);
+  if (entries.length !== 1 || !isRecord(entries[0])) {
+    throw new Error("Expected one npm dist-tag selector map for the Plugin SDK API review");
+  }
+  const selectorMap = entries[0];
+  const selectors = resolveNpmPreflightSdkSelectors(packageVersion, npmDistTag);
+  return Object.fromEntries(
+    selectors.map((selector) => {
+      const version = selectorMap[selector];
+      if (typeof version !== "string" || !parseReleaseVersion(version)) {
+        throw new Error(`Invalid npm Plugin SDK API predecessor for ${selector}`);
+      }
+      return [selector, `v${version}`];
+    }),
+  );
+}
+
+function formatPluginSdkApiAcknowledgementFailure(
+  error: PluginSdkApiAcknowledgementError,
+  report: string,
+) {
+  const argv = stripLeadingPackageManagerSeparator(process.argv.slice(2));
+  const end = argv.indexOf("--");
+  const flag = "--plugin-sdk-api-acknowledgement";
+  let replaced = false;
+  for (let index = 0; index < (end === -1 ? argv.length : end); index++) {
+    if (argv[index] === flag) {
+      argv[++index] = error.digest;
+      replaced = true;
+    }
+  }
+  if (!replaced) {
+    argv.unshift(flag, error.digest);
+  }
+  return new Error(
+    [
+      error.message,
+      report || "Review the Plugin SDK API diff artifact before rerunning.",
+      ["pnpm", "release:candidate", "--", ...argv].map(shellQuote).join(" "),
+    ].join("\n\n"),
+    { cause: error },
+  );
+}
+
+export function resolveEarlyPluginSdkApiReviewPaths({
+  outputDir,
+  targetRoot,
+}: {
+  outputDir: string;
+  targetRoot: string;
+}) {
+  const reviewDir = resolvePath(targetRoot, outputDir, "plugin-sdk-api-early-review");
+  return {
+    reviewDir,
+    evidencePath: join(reviewDir, "plugin-sdk-api-release-evidence.json"),
+    reportPath: join(reviewDir, "plugin-sdk-api-release-diff.md"),
+    diffPath: join(reviewDir, "plugin-sdk-api-release-diff.json"),
+  };
+}
+
+function runEarlyPluginSdkApiReview({
+  npmDistTag,
+  outputDir,
+  targetRoot,
+  targetSha,
+  toolingSha,
+}: {
+  npmDistTag: string;
+  outputDir: string;
+  targetRoot: string;
+  targetSha: string;
+  toolingSha: string;
+}) {
+  const packageManifest: unknown = JSON.parse(
+    run("git", ["show", `${targetSha}:package.json`], { capture: true, cwd: targetRoot }),
+  );
+  const packageVersion = requireString(
+    isRecord(packageManifest) ? packageManifest.version : undefined,
+    "release package version",
+  );
+  const bases = resolveEarlyPluginSdkApiBases({
+    distTags: JSON.parse(
+      run("npm", ["view", "openclaw", "dist-tags", "--json"], {
+        capture: true,
+        cwd: targetRoot,
+      }),
+    ),
+    npmDistTag,
+    packageVersion,
+  });
+  for (const tag of new Set(Object.values(bases))) {
+    run(
+      "git",
+      [
+        "fetch",
+        "--no-tags",
+        "--filter=blob:none",
+        "--depth=1",
+        "origin",
+        `+refs/tags/${tag}:refs/tags/${tag}`,
+      ],
+      { cwd: TOOLING_ROOT },
+    );
+  }
+  const { reviewDir, evidencePath, reportPath, diffPath } = resolveEarlyPluginSdkApiReviewPaths({
+    outputDir,
+    targetRoot,
+  });
+  mkdirSync(reviewDir, { recursive: true });
+  const args = [
+    "run",
+    "plugin-sdk:api:diff",
+    "--",
+    "--head",
+    targetSha,
+    "--evidence",
+    evidencePath,
+    "--json",
+    diffPath,
+    "--summary",
+    reportPath,
+  ];
+  if (Object.keys(bases).length === 2) {
+    args.push("--bases-json", JSON.stringify(bases));
+  } else {
+    args.push("--base", requireString(Object.values(bases)[0], "Plugin SDK API predecessor"));
+  }
+  console.log("Reviewing the Plugin SDK API while Full Release Validation runs...");
+  run("pnpm", args, { cwd: TOOLING_ROOT });
+  const evidence = readJson(evidencePath, "early Plugin SDK API evidence");
+  const report = readFileSync(reportPath, "utf8").trim();
+  try {
+    return validatePluginSdkApiReleaseEvidence({
+      acknowledgement: "",
+      evidence,
+      expectedHeadSha: targetSha,
+      expectedWorkflowSha: toolingSha,
+      npmDistTag,
+    });
+  } catch (error) {
+    if (error instanceof PluginSdkApiAcknowledgementError) {
+      throw formatPluginSdkApiAcknowledgementFailure(error, report);
+    }
+    throw error;
   }
 }
 
@@ -504,19 +696,37 @@ export function buildReleaseCandidateState(
   };
 }
 
-export function reconcileReleaseCandidateState(saved: unknown, expected: CandidateState) {
+function canUpdateReleaseCandidateState(saved: JsonRecord, hasRetainedRequest: boolean) {
+  // The canonical helper can retain an accepted or uncertain dispatch before
+  // this coordinator receives its run ID. Empty IDs alone do not mean unbound.
+  return (
+    saved.phase === "validated" &&
+    !saved.fullReleaseRunId &&
+    !saved.npmPreflightRunId &&
+    !hasRetainedRequest
+  );
+}
+
+export function reconcileReleaseCandidateState(
+  saved: unknown,
+  expected: CandidateState,
+  hasRetainedRequest = false,
+) {
   if (!saved) {
     return expected;
   }
   if (!isRecord(saved) || saved.version !== RELEASE_CANDIDATE_STATE_VERSION) {
     throw new Error("release candidate state has an unsupported schema");
   }
-  // Historical state emitted the normal command by default. It did not record
-  // source admission, and cannot silently become a newly selected prepared route.
-  if ((saved.publicationRoute ?? "normal") !== expected.publicationRoute) {
+  const canUpdate = canUpdateReleaseCandidateState(saved, hasRetainedRequest);
+  // Once bound, historical state retains its original normal publication route.
+  if (!canUpdate && (saved.publicationRoute ?? "normal") !== expected.publicationRoute) {
     throw new Error("release candidate state mismatch for publicationRoute");
   }
   for (const key of RELEASE_CANDIDATE_STATE_KEYS) {
+    if (canUpdate && key !== "repo" && key !== "tag" && key !== "targetSha") {
+      continue;
+    }
     if (!isDeepStrictEqual(saved[key], expected[key])) {
       throw new Error(
         `release candidate state mismatch for ${key}: saved=${JSON.stringify(saved[key])} current=${JSON.stringify(expected[key])}`,
@@ -768,23 +978,35 @@ function runFromTrustedTooling(
       );
     }
   } finally {
-    // Remove the installed graph before Git walks the checkout to remove it.
+    // Remove the graph first, but retain checkout/.git until Git removes its
+    // worktree registration. Failed Git cleanup leaves a recoverable checkout.
     try {
-      rmSync(tempRoot, { force: true, recursive: true });
+      rmSync(join(toolingRoot, "node_modules"), { force: true, recursive: true });
     } catch (error) {
       console.warn(
-        `could not remove temporary trusted tooling files at ${tempRoot}: ${String(error)}`,
+        `could not remove temporary trusted tooling dependencies at ${toolingRoot}: ${String(error)}`,
       );
     }
+    let worktreeRemoved = !worktreeAdded;
     if (worktreeAdded) {
       const cleanup = spawnSync("git", ["worktree", "remove", "--force", toolingRoot], {
         cwd: targetRoot,
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       });
-      if (cleanup.status !== 0) {
+      worktreeRemoved = cleanup.status === 0;
+      if (!worktreeRemoved) {
         console.warn(
-          `could not remove temporary trusted tooling worktree: ${cleanup.stderr?.trim() || cleanup.signal || cleanup.status}`,
+          `could not remove temporary trusted tooling worktree at ${toolingRoot}: ${cleanup.stderr?.trim() || cleanup.error?.message || cleanup.signal || cleanup.status}`,
+        );
+      }
+    }
+    if (worktreeRemoved) {
+      try {
+        rmSync(tempRoot, { force: true, recursive: true });
+      } catch (error) {
+        console.warn(
+          `could not remove temporary trusted tooling files at ${tempRoot}: ${String(error)}`,
         );
       }
     }
@@ -880,14 +1102,42 @@ export function assertReleaseCandidateTag(tag: string, targetSha: string, cwd: s
 }
 
 function savedPublishWorkflowRef(statePath: string, toolingSha: string) {
-  const saved = existsSync(statePath)
-    ? readJson(statePath, "release candidate state").publishWorkflowRef
-    : undefined;
-  return typeof saved === "string" &&
-    PUBLISH_TOOLING_TAG_PATTERN.test(saved) &&
-    saved.startsWith(`release-publish/${toolingSha.slice(0, 12)}-`)
-    ? saved
+  if (!existsSync(statePath)) {
+    return "";
+  }
+  const saved = readJson(statePath, "release candidate state");
+  if (saved.version !== RELEASE_CANDIDATE_STATE_VERSION) {
+    throw new Error("release candidate state has an unsupported schema");
+  }
+  const tag = saved.publishWorkflowRef;
+  return typeof tag === "string" &&
+    PUBLISH_TOOLING_TAG_PATTERN.test(tag) &&
+    tag.startsWith(`release-publish/${toolingSha.slice(0, 12)}-`)
+    ? tag
     : "";
+}
+
+function gitIsAncestor(ancestor: string, target: string, cwd = process.cwd()) {
+  const result = spawnSync(
+    "git",
+    ["merge-base", "--is-ancestor", `${ancestor}^{commit}`, `${target}^{commit}`],
+    {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  if (result.status === 0) {
+    return true;
+  }
+  if (result.status === 1) {
+    return false;
+  }
+  throw new Error(
+    `could not check git ancestry ${ancestor}..${target}: ${
+      result.stderr?.trim() || result.signal || result.status
+    }`,
+  );
 }
 
 export function validateTrustedToolingPin({
@@ -918,6 +1168,54 @@ export function validateTrustedToolingPin({
     );
   }
   return pinnedToolingSha;
+}
+
+function releaseScenarioCatalog(source: string, owner: string) {
+  const scenarios = readUpgradeSurvivorScenarioCatalog(source, { includeAssertionOnly: false });
+  if (!scenarios) {
+    throw new Error(`${owner} has an invalid ${UPGRADE_SURVIVOR_CATALOG_PATH}`);
+  }
+  return scenarios;
+}
+
+export function validateReleaseScenarioCatalogCompatibility({
+  candidateCatalog,
+  toolingCatalog,
+  latestTrustedToolingCatalog,
+  toolingSha,
+  latestTrustedToolingSha,
+  workflowRef,
+}: {
+  candidateCatalog: string;
+  toolingCatalog: string;
+  latestTrustedToolingCatalog: string;
+  toolingSha: string;
+  latestTrustedToolingSha: string;
+  workflowRef: string;
+}) {
+  const candidateScenarios = releaseScenarioCatalog(candidateCatalog, "release candidate");
+  const toolingScenarios = new Set(releaseScenarioCatalog(toolingCatalog, `tooling ${toolingSha}`));
+  const unsupported = candidateScenarios
+    .filter((scenario) => !toolingScenarios.has(scenario))
+    .toSorted();
+  if (unsupported.length === 0) {
+    return { status: "passed" as const, unsupported };
+  }
+  const latestScenarios = new Set(
+    releaseScenarioCatalog(
+      latestTrustedToolingCatalog,
+      `trusted ${workflowRef} tooling ${latestTrustedToolingSha}`,
+    ),
+  );
+  const replacementSupportsCandidate = candidateScenarios.every((scenario) =>
+    latestScenarios.has(scenario),
+  );
+  const replacement = replacementSupportsCandidate
+    ? ` Trusted ${workflowRef} tooling ${latestTrustedToolingSha} supports this catalogue; rerun with --workflow-sha ${latestTrustedToolingSha}.`
+    : ` Trusted ${workflowRef} tip ${latestTrustedToolingSha} also lacks support; land the catalogue consumer before qualifying this candidate.`;
+  throw new Error(
+    `Pinned release tooling ${toolingSha} cannot consume candidate upgrade-survivor scenarios: ${unsupported.join(", ")}.${replacement}`,
+  );
 }
 
 export async function validateNpmPreflightRunSource(
@@ -979,11 +1277,213 @@ export async function validateNpmPreflightRunSource(
   return { status: "passed", headSha: workflowRun.headSha, workflowRef: ref };
 }
 
+function candidateContributionRecordPullRequests(
+  section: string,
+  label: string,
+  { requireExactProvenance = true }: { requireExactProvenance?: boolean } = {},
+) {
+  const recordStart = section.search(/\n### Complete contribution record\r?$/m);
+  if (recordStart < 0) {
+    throw new Error(`${label} is missing ### Complete contribution record`);
+  }
+  const record = section.slice(recordStart);
+  const rowNumbers = [...record.matchAll(/^- \*\*PR #(?<number>[0-9]+)\*\*/gmu)].map((match) =>
+    Number(match.groups?.number),
+  );
+  const rows = new Set(rowNumbers);
+  if (rows.size !== rowNumbers.length) {
+    const duplicate = rowNumbers.find((number, index) => rowNumbers.indexOf(number) !== index);
+    throw new Error(`${label} contains duplicate contribution record PR #${duplicate}`);
+  }
+  if (!requireExactProvenance) {
+    return rows;
+  }
+  const provenance = parseContributionRecordProvenance(record);
+  if (!provenance || !/^[0-9a-f]{40}$/u.test(provenance.target)) {
+    throw new Error(`${label} is missing exact complete contribution record provenance`);
+  }
+  return rows;
+}
+
+export function candidateCumulativeShippedPullRequests(changelog: string, label: string) {
+  const pullRequests = new Set<number>();
+  for (const section of extractChangelogReleaseSections(changelog)) {
+    if (
+      section.version === "Unreleased" ||
+      !section.source.includes("\n### Complete contribution record")
+    ) {
+      continue;
+    }
+    for (const number of candidateContributionRecordPullRequests(
+      section.source,
+      `${label} section ${section.version}`,
+      { requireExactProvenance: false },
+    )) {
+      pullRequests.add(number);
+    }
+  }
+  return pullRequests;
+}
+
 function requireString(value: unknown, label: string) {
   if (typeof value !== "string") {
     throw new TypeError(`${label} must be a string`);
   }
   return value;
+}
+
+export function loadCandidateShippedBaseline(ref: string, rootDir = process.cwd()) {
+  const tagRef = `refs/tags/${ref}`;
+  gitRevParse(`${tagRef}^{commit}`, rootDir);
+  const changelog = loadChangelogCollection({ rootDir, ref: tagRef, recordsOnly: true });
+  const version = requireString(releaseNotesVersionForTag(ref), "release notes version");
+  const source = loadReleaseNotesForTag({ rootDir, ref: tagRef, tag: ref, version });
+  candidateContributionRecordPullRequests(
+    source.record ?? source.section,
+    `shipped baseline ${ref}`,
+  );
+  const pullRequests = candidateCumulativeShippedPullRequests(changelog, `shipped baseline ${ref}`);
+  return { ref, pullRequests };
+}
+
+export function validateCandidateReleaseNotes({
+  changelog,
+  repository,
+  tag,
+  contributionRecordPath,
+}: StringFields<"changelog" | "repository" | "tag"> & { contributionRecordPath?: string }) {
+  if (/-beta\.[1-9][0-9]*$/u.test(tag)) {
+    // New candidates cannot silently reuse cumulative or earlier-beta prose.
+    extractChangelogSection(changelog, tag.slice(1));
+  }
+  const rendered = renderGithubReleaseNotes({
+    changelog,
+    version: releaseNotesVersionForTag(tag),
+    tag,
+    repository,
+    contributionRecordPath,
+  });
+  return {
+    status: "passed",
+    mode: rendered.mode,
+    characters: rendered.size.characters,
+    bytes: rendered.size.bytes,
+  };
+}
+
+export function validateCandidateChangelogProvenance({
+  changelog,
+  version,
+  tag,
+  targetSha,
+  isAncestor = gitIsAncestor,
+  loadShippedBaseline = loadCandidateShippedBaseline,
+}: {
+  changelog: string;
+  version: string;
+  tag: string;
+  targetSha: string;
+  isAncestor?: (ancestor: string, target: string) => boolean;
+  loadShippedBaseline?: (ref: string) => { pullRequests: Set<number> };
+}) {
+  // Beta and correction tags may carry their own changelog heading.
+  let section: string | undefined;
+  let sectionVersion = version;
+  const dedicatedVersion = dedicatedSectionVersionForTag(tag);
+  if (typeof dedicatedVersion === "string" && dedicatedVersion !== version) {
+    try {
+      section = requireString(
+        extractChangelogSection(changelog, dedicatedVersion),
+        "changelog section",
+      );
+      sectionVersion = dedicatedVersion;
+    } catch {
+      // No dedicated section; validate the base section.
+    }
+  }
+  if (section === undefined) {
+    section = requireString(extractChangelogSection(changelog, version), "changelog section");
+  }
+  const recordStart = section.search(/\n### Complete contribution record\r?$/m);
+  if (recordStart < 0) {
+    throw new Error(
+      `CHANGELOG.md ## ${sectionVersion} is missing ### Complete contribution record`,
+    );
+  }
+  const record = section.slice(recordStart);
+  const recordedPullRequests = candidateContributionRecordPullRequests(
+    section,
+    `CHANGELOG.md ## ${sectionVersion}`,
+  );
+  const provenance = parseContributionRecordProvenance(record);
+  const base = provenance?.base;
+  const recordedTarget = provenance?.target;
+  if (!base || !recordedTarget || !/^[0-9a-f]{40}$/u.test(recordedTarget)) {
+    throw new Error(
+      `CHANGELOG.md ## ${sectionVersion} is missing exact complete contribution record provenance`,
+    );
+  }
+  const shippedBaselines = parseShippedBaselineExclusions(record);
+  const sectionShippedBaselines = parseShippedBaselineExclusions(section);
+  if (
+    formatShippedBaselineExclusions(sectionShippedBaselines) !==
+    formatShippedBaselineExclusions(shippedBaselines)
+  ) {
+    throw new Error(
+      "shipped baseline exclusions must appear inside the complete contribution record",
+    );
+  }
+  if (!isAncestor(base, recordedTarget)) {
+    throw new Error(
+      `CHANGELOG.md contribution record base ${base} is not an ancestor of recorded target ${recordedTarget}`,
+    );
+  }
+  // The record is generated before its own changelog/finalization commit. Require
+  // reachability so the tag can contain that bounded release-only follow-up.
+  if (!isAncestor(recordedTarget, targetSha)) {
+    throw new Error(
+      `CHANGELOG.md contribution record target ${recordedTarget} is not reachable from release tag ${targetSha}`,
+    );
+  }
+  // The verifier persists associated and text-linked PR exclusions together.
+  // Revalidate that exact inventory here instead of rediscovering a narrower set from git text.
+  const excludedPullRequests = new Set<number>();
+  for (const baseline of shippedBaselines) {
+    const loaded = loadShippedBaseline(baseline.ref);
+    if (!(loaded.pullRequests instanceof Set)) {
+      throw new Error(`shipped baseline ${baseline.ref} did not provide a PR inventory`);
+    }
+    const duplicateExclusions = baseline.pullRequests.filter((number) =>
+      excludedPullRequests.has(number),
+    );
+    if (duplicateExclusions.length > 0) {
+      throw new Error(
+        `release contribution record repeats shipped PR exclusions across baselines: ${duplicateExclusions.map((number) => `#${number}`).join(", ")}`,
+      );
+    }
+    const absent = baseline.pullRequests.filter((number) => !loaded.pullRequests.has(number));
+    if (absent.length > 0) {
+      throw new Error(
+        `release contribution record lists PRs absent from shipped baseline ${baseline.ref}: ${absent.map((number) => `#${number}`).join(", ")}`,
+      );
+    }
+    const retained = [...recordedPullRequests].filter((number) => loaded.pullRequests.has(number));
+    if (retained.length > 0) {
+      throw new Error(
+        `release contribution record still contains shipped PRs from ${baseline.ref}: ${retained.map((number) => `#${number}`).join(", ")}`,
+      );
+    }
+    for (const number of baseline.pullRequests) {
+      excludedPullRequests.add(number);
+    }
+  }
+  return {
+    status: "passed",
+    base,
+    target: recordedTarget,
+    shippedBaselines,
+    reason: undefined,
+  };
 }
 
 async function runArtifacts(repo: string, runId: string) {
@@ -1045,27 +1545,6 @@ async function resolveRunArtifact(
     throw new Error(`resolved artifact ${name} disappeared from run ${runId}`);
   }
   return artifact;
-}
-
-function runAndEcho(command: string, args: string[]) {
-  const result = spawnSync(command, args, {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (result.stdout) {
-    process.stdout.write(result.stdout);
-  }
-  if (result.stderr) {
-    process.stderr.write(result.stderr);
-  }
-  if (result.status !== 0) {
-    throw new Error(
-      `${command} ${args.join(" ")} failed with ${result.status ?? result.signal}\n${
-        result.stderr ?? ""
-      }`,
-    );
-  }
-  return `${result.stdout ?? ""}${result.stderr ?? ""}`;
 }
 
 function runLocalGeneratedCheckIfNeeded(options: ReturnType<typeof parseArgs>): LocalCheckResult {
@@ -1165,7 +1644,7 @@ function dispatchWorkflow(
   for (const [key, value] of Object.entries(fields)) {
     args.push("-f", `${key}=${String(value)}`);
   }
-  return requireRunIdFromDispatchOutput(runAndEcho("gh", args), workflowFile);
+  return requireRunIdFromDispatchOutput(run("gh", args, { capture: "echo" }), workflowFile);
 }
 
 async function runInfo(repo: string, runId: string) {
@@ -1574,14 +2053,14 @@ export function validateFullManifest(manifest: JsonRecord, params: JsonRecord) {
 export function candidateParallelsArgs(
   tarballPath: string,
   dependencyTarballPaths: string[] = [],
-  toolingRoot = TOOLING_ROOT,
+  candidateRoot = process.cwd(),
   registryPackageTarballPaths: string[] = [],
   macosSnapshotHint = "",
 ) {
   return [
     "exec",
     "tsx",
-    join(toolingRoot, "scripts/e2e/parallels/npm-update-smoke.ts"),
+    join(candidateRoot, "scripts/e2e/parallels/npm-update-smoke.ts"),
     "--target-tarball",
     tarballPath,
     ...dependencyTarballPaths.flatMap((dependency) => ["--dependency-tarball", dependency]),
@@ -1600,6 +2079,7 @@ export function candidateParallelsShellCommand(
   dependencyTarballPaths: string[] = [],
   registryPackageTarballPaths: string[] = [],
   macosSnapshotHint = "",
+  candidateRoot = process.cwd(),
 ) {
   // Login shells can replace the candidate's supported Node with ambient host Node.
   // Keep the invoking Node first so pnpm and npm use the validated runtime.
@@ -1615,7 +2095,7 @@ export function candidateParallelsShellCommand(
     ...candidateParallelsArgs(
       tarballPath,
       dependencyTarballPaths,
-      TOOLING_ROOT,
+      candidateRoot,
       registryPackageTarballPaths,
       macosSnapshotHint,
     ).map(shellQuote),
@@ -1627,12 +2107,14 @@ async function runParallelsIfNeeded(
   tarballPath: string,
   dependencyTarballPaths: string[],
   registryPackageTarballPaths: string[],
+  candidateRoot: string,
 ): Promise<LocalCheckResult> {
   if (options.skipParallels) {
     return { status: "skipped", reason: options.parallelsSkipReason };
   }
   const timeoutBin = run("bash", ["-lc", "command -v gtimeout || command -v timeout"], {
     capture: true,
+    cwd: candidateRoot,
   }).trim();
   const command = candidateParallelsShellCommand(
     tarballPath,
@@ -1640,10 +2122,12 @@ async function runParallelsIfNeeded(
     dependencyTarballPaths,
     registryPackageTarballPaths,
     process.env.OPENCLAW_PARALLELS_MACOS_SNAPSHOT_HINT?.trim() ?? "",
+    candidateRoot,
   );
   run("bash", ["-lc", command], {
+    cwd: candidateRoot,
     env: {
-      OPENCLAW_PARALLELS_ARTIFACT_ROOT: join(process.cwd(), ".artifacts", "parallels"),
+      OPENCLAW_PARALLELS_ARTIFACT_ROOT: join(candidateRoot, ".artifacts", "parallels"),
     },
   });
   return {
@@ -1703,15 +2187,61 @@ async function runTelegramIfNeeded(
   manifest: JsonRecord,
   runAttempt: number,
   sourceSha: string,
-  coveragePolicy: string | undefined,
+  fullValidationEvidence: Awaited<ReturnType<typeof authenticateFullReleaseValidationEvidence>>,
+  npmUsesFullRun: boolean,
 ): Promise<TelegramResult> {
   if (options.skipTelegram) {
     return { status: "skipped" };
   }
   // Only the admitted evidence policy defers this wait; legacy beta evidence
   // still requires the separate Telegram qualification.
-  if (coveragePolicy === "npm-beta-v1") {
+  if (fullValidationEvidence.coveragePolicy === "npm-beta-v1") {
     return { status: "deferred-postpublish" };
+  }
+  const qualificationManifest = fullValidationEvidence.evidence.current.manifest;
+  const coversPackageTelegram =
+    fullValidationEvidence.coveragePolicy === "npm-stable-v1" ||
+    (fullValidationEvidence.source === "candidate-owned-admission-v1" &&
+      (qualificationManifest.releaseProfile === "stable" ||
+        qualificationManifest.releaseProfile === "full"));
+  if (
+    npmUsesFullRun &&
+    coversPackageTelegram &&
+    options.telegramProviderMode === "mock-openai" &&
+    !qualificationManifest.validationInputs?.telegramWaiver
+  ) {
+    // Authentication proves package acceptance passed with Q's mock Telegram
+    // harness. Reuse only its exact qualified package, not a separately packed one.
+    return { status: "covered-by-full-release-validation", providerMode: "mock-openai" };
+  }
+  const qualificationRef = fullValidationEvidence.run.headBranch;
+  if (
+    fullValidationEvidence.run.headSha !== sourceSha ||
+    typeof qualificationRef !== "string" ||
+    !isShaPinnedReleaseValidationBranch(qualificationRef) ||
+    !qualificationRef.startsWith(`release-ci/${sourceSha.slice(0, 12)}-`)
+  ) {
+    throw new Error(
+      "Separate Telegram qualification requires candidate-owned Full Release Validation with a retained release-ci ref at the candidate SHA; never use main's harness. Obtain newly bound candidate evidence or use already covered package Telegram proof.",
+    );
+  }
+  const refPath = `repos/${options.repo}/git/ref/heads/${qualificationRef}`;
+  const transport = await githubApi(refPath).catch((cause: unknown) => {
+    throw new Error(
+      `Telegram qualification ref ${qualificationRef} is unavailable; obtain candidate-owned Full Release Validation with a retained qualification ref.`,
+      { cause },
+    );
+  });
+  if (
+    !isRecord(transport) ||
+    transport.ref !== `refs/heads/${qualificationRef}` ||
+    !isRecord(transport.object) ||
+    transport.object.type !== "commit" ||
+    transport.object.sha !== sourceSha
+  ) {
+    throw new Error(
+      `Telegram qualification ref ${qualificationRef} no longer points to candidate ${sourceSha}; obtain newly bound candidate evidence without moving the original ref.`,
+    );
   }
   const workflowFile = "npm-telegram-beta-e2e.yml";
   const artifactInputs = buildTelegramArtifactInputs({
@@ -1721,17 +2251,22 @@ async function runTelegramIfNeeded(
     runId: String(artifact.workflowRunId),
     sourceSha,
   });
-  const runId = dispatchWorkflow(options.repo, workflowFile, options.workflowRef, {
+  const runId = dispatchWorkflow(options.repo, workflowFile, qualificationRef, {
     package_spec: `openclaw@${options.tag.replace(/^v/u, "")}`,
     package_label: options.tag,
     ...artifactInputs,
-    harness_ref: options.workflowRef,
+    harness_ref: sourceSha,
     provider_mode: options.telegramProviderMode,
   });
   const { run: runLocal } = await waitForSuccessfulRun(options.repo, runId, {
     workflowName: "NPM Telegram Beta E2E",
-    workflowRef: options.workflowRef,
+    workflowRef: qualificationRef,
   });
+  if (runLocal.headSha !== sourceSha) {
+    throw new Error(
+      `Telegram qualification SHA mismatch: expected ${sourceSha}, got ${runLocal.headSha}`,
+    );
+  }
   return {
     status: "passed",
     runId,
@@ -1777,8 +2312,12 @@ async function main() {
     });
     return;
   }
-  options.outputDir ||= join(".artifacts", "release-candidate", options.tag);
   const targetSha = gitRevParse(options.targetSha || "HEAD", targetRoot);
+  options.outputDir = resolveReleaseCandidateOutputDir({
+    outputDir: options.outputDir,
+    tag: options.tag,
+    targetSha,
+  });
   assertReleaseCandidateTag(options.tag, targetSha, targetRoot);
   const toolingSha = gitRevParse("HEAD", TOOLING_ROOT);
   const latestTrustedToolingSha = fetchTrustedWorkflowSha(options.workflowRef, TOOLING_ROOT);
@@ -1800,6 +2339,7 @@ async function main() {
   });
   // Publication may use repaired tooling while the prepared tarball retains its original producer.
   const statePath = join(options.outputDir, RELEASE_CANDIDATE_STATE_FILE);
+  const hasRetainedRequest = existsSync(join(options.outputDir, "frv-request.json"));
   if (options.workflowSha && !options.publishWorkflowRef) {
     if (options.workflowSha !== toolingSha) {
       throw new Error(
@@ -1847,6 +2387,7 @@ async function main() {
   let candidateState = reconcileReleaseCandidateState(
     existsSync(statePath) ? readJson(statePath, "release candidate state") : undefined,
     expectedState,
+    hasRetainedRequest,
   );
   options.fullReleaseRunId = candidateState.fullReleaseRunId;
   options.npmPreflightRunId = candidateState.npmPreflightRunId;
@@ -1869,9 +2410,22 @@ async function main() {
   if (androidVersionCheck) {
     console.log(androidVersionCheck.message);
   }
-  const { releaseNotesCheck, releaseNotesProvenance } = validateCandidateChangelog({
+  const releaseNotesVersion = releaseNotesVersionForTag(options.tag);
+  const releaseChangelog = loadReleaseNotesForTag({
     rootDir: targetRoot,
+    ref: targetSha,
+    tag: options.tag,
+    version: releaseNotesVersion,
+  });
+  const releaseNotesCheck = validateCandidateReleaseNotes({
+    changelog: releaseChangelog.section,
     repository: options.repo,
+    tag: options.tag,
+    contributionRecordPath: releaseChangelog.recordPath ?? undefined,
+  });
+  const releaseNotesProvenance = validateCandidateChangelogProvenance({
+    changelog: releaseChangelog.record ?? releaseChangelog.section,
+    version: releaseNotesVersion,
     tag: options.tag,
     targetSha,
   });
@@ -1888,6 +2442,27 @@ async function main() {
   // A new dispatch is gated by the local check; consuming existing evidence
   // defers it until the SDK acknowledgement has been checked.
   const dispatchesValidation = !options.fullReleaseRunId && !options.skipDispatch;
+  const validatesScenarioCatalog = dispatchesValidation && !hasRetainedRequest;
+  if (validatesScenarioCatalog) {
+    validateReleaseScenarioCatalogCompatibility({
+      candidateCatalog: run("git", ["show", `${targetSha}:${UPGRADE_SURVIVOR_CATALOG_PATH}`], {
+        capture: true,
+        cwd: targetRoot,
+      }),
+      toolingCatalog: run("git", ["show", `${toolingSha}:${UPGRADE_SURVIVOR_CATALOG_PATH}`], {
+        capture: true,
+        cwd: targetRoot,
+      }),
+      latestTrustedToolingCatalog: run(
+        "git",
+        ["show", `${latestTrustedToolingSha}:${UPGRADE_SURVIVOR_CATALOG_PATH}`],
+        { capture: true, cwd: targetRoot },
+      ),
+      toolingSha,
+      latestTrustedToolingSha,
+      workflowRef: options.workflowRef,
+    });
+  }
   let localGeneratedCheck = dispatchesValidation
     ? runLocalGeneratedCheckIfNeeded(options)
     : undefined;
@@ -1905,6 +2480,19 @@ async function main() {
     fullReleaseRunId: options.fullReleaseRunId,
     npmPreflightRunId: options.npmPreflightRunId,
   });
+
+  // The validation run continues in GitHub while trusted local tooling computes
+  // the review digest. A missing acknowledgement therefore surfaces near
+  // dispatch instead of after every FRV lane has sealed.
+  if (!options.pluginSdkApiAcknowledgement) {
+    runEarlyPluginSdkApiReview({
+      npmDistTag: options.npmDistTag,
+      outputDir: options.outputDir,
+      targetRoot,
+      targetSha,
+      toolingSha,
+    });
+  }
 
   const { run: fullRun } = await waitForSuccessfulRun(options.repo, options.fullReleaseRunId, {
     workflowName: "Full Release Validation",
@@ -2065,27 +2653,7 @@ async function main() {
           });
         }
       }
-      const argv = stripLeadingPackageManagerSeparator(process.argv.slice(2));
-      const end = argv.indexOf("--");
-      const flag = "--plugin-sdk-api-acknowledgement";
-      let replaced = false;
-      for (let index = 0; index < (end === -1 ? argv.length : end); index++) {
-        if (argv[index] === flag) {
-          argv[++index] = error.digest;
-          replaced = true;
-        }
-      }
-      if (!replaced) {
-        argv.unshift(flag, error.digest);
-      }
-      throw new Error(
-        [
-          error.message,
-          report || "Review the Plugin SDK API diff artifact before rerunning.",
-          ["pnpm", "release:candidate", "--", ...argv].map(shellQuote).join(" "),
-        ].join("\n\n"),
-        { cause: error },
-      );
+      throw formatPluginSdkApiAcknowledgementFailure(error, report);
     }
     throw error;
   }
@@ -2156,6 +2724,7 @@ async function main() {
     tarballPath,
     dependencyTarballPaths,
     revalidatedRegistryArtifacts.map((artifact) => artifact.tarballPath),
+    targetRoot,
   );
   const npmTelegram = await runTelegramIfNeeded(
     options,
@@ -2163,13 +2732,15 @@ async function main() {
     npmManifest,
     npmRun.runAttempt,
     targetSha,
-    fullValidationEvidence.coveragePolicy,
+    fullValidationEvidence,
+    npmUsesFullRun,
   );
   const publicationOptions = {
     ...options,
     fullReleaseRunAttempt: fullRun.runAttempt,
-    npmTelegramRunId: npmTelegram.runId,
   };
+  // FRV owns required publication qualification. Supplemental Q checks stay in
+  // candidate evidence, not the optional main/P publisher diagnostic input.
   const publicationSelection = publicationSelectionForChecklist(options);
   const publishPreflight = await runReleasePublishPreflight(
     {
@@ -2190,7 +2761,6 @@ async function main() {
       pluginSdkApiAcknowledgement: options.pluginSdkApiAcknowledgement,
       windowsNodeTag: options.windowsNodeTag,
       windowsNodeInstallerDigests: options.windowsNodeInstallerDigests,
-      npmTelegramRunId: npmTelegram.runId ?? "",
     },
     {
       manifest: fullManifest,

@@ -346,13 +346,7 @@ class GatewayBootstrapRefreshTest {
                     val id = frame["id"]?.jsonPrimitive?.content ?: return
                     if (interceptRequest(frame, webSocket)) return
                     if (frame["method"]?.jsonPrimitive?.content != "connect") {
-                      val payload =
-                        if (frame["method"]?.jsonPrimitive?.content == "agents.list") {
-                          """{"defaultId":"main","mainKey":"main","agents":[{"id":"main"}]}"""
-                        } else {
-                          "{}"
-                        }
-                      webSocket.send("""{"type":"res","id":"$id","ok":true,"payload":$payload}""")
+                      webSocket.send("""{"type":"res","id":"$id","ok":true,"payload":{}}""")
                       return
                     }
                     val params = frame.getValue("params").jsonObject
@@ -395,7 +389,7 @@ class GatewayBootstrapRefreshTest {
       bootstrap: Boolean = false,
     ): String {
       val handoff = if (bootstrap) ""","deviceTokens":[{"deviceToken":"operator-token","role":"operator","scopes":["operator.read","operator.write"]}]""" else ""
-      return """{"type":"res","id":"$id","ok":true,"payload":{"auth":{"deviceToken":"$role-token","role":"$role","scopes":[]$handoff},"features":{"methods":["agents.list"]},"snapshot":{"sessionDefaults":{"mainSessionKey":"main"}}}}"""
+      return """{"type":"res","id":"$id","ok":true,"payload":{"auth":{"deviceToken":"$role-token","role":"$role","scopes":[]$handoff},"features":{"methods":[]},"snapshot":{"sessionDefaults":{"mainSessionKey":"main"}}}}"""
     }
   }
 }

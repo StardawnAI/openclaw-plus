@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readAssistantThinkingAppend } from "@openclaw/ai/internal/shared";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { InlineCodeState } from "../../packages/markdown-core/src/code-spans.js";
@@ -6,7 +7,6 @@ import {
   createInlineCodeState,
 } from "../../packages/markdown-core/src/code-spans.js";
 import type { FenceScanState } from "../../packages/markdown-core/src/fences.js";
-import { parseReasoningTagAt } from "../../packages/markdown-core/src/reasoning-tag-parser.js";
 import {
   addReplyPayloadMediaFailures,
   appendReplyMediaFailures,
@@ -14,7 +14,10 @@ import {
 } from "../auto-reply/reply-payload.js";
 import type { ReplyDirectiveParseResult } from "../auto-reply/reply/reply-directives.js";
 import { createStreamingDirectiveAccumulator } from "../auto-reply/reply/streaming-directives.js";
-import { emitAgentEvent } from "../infra/agent-events.js";
+import {
+  emitAgentEventWithAssistantSourceIfCurrent,
+  readAgentAssistantSource,
+} from "../infra/agent-events.js";
 import { findFinalTagMatches } from "../shared/text/final-tags.js";
 import { hasOrphanReasoningCloseBoundary } from "../shared/text/reasoning-tags.js";
 import {
@@ -29,7 +32,7 @@ import {
 } from "./embedded-agent-helpers.js";
 import { runBestEffortCallback } from "./embedded-agent-subscribe.callback.js";
 import {
-  hasMessageToolOnlySourceDelivery,
+  shouldSuppressSourceReplyOutput,
   shouldSuppressDeterministicApprovalOutput,
 } from "./embedded-agent-subscribe.handlers.messages.stream.js";
 import type {
@@ -37,9 +40,27 @@ import type {
   StreamBlockState,
 } from "./embedded-agent-subscribe.handlers.types.js";
 import type { SubscribeEmbeddedAgentSessionParams } from "./embedded-agent-subscribe.types.js";
-import { createThinkingTagStreamState } from "./embedded-agent-utils.js";
+import {
+  createAssistantStreamBlockState,
+  createThinkingTagStreamState,
+  THINKING_TAG_SCAN_RE,
+} from "./embedded-agent-utils.js";
 
-function isPotentialTrailingFinalTagFragment(fragment: string): boolean {
+const STREAM_STRIPPED_BLOCK_TAG_NAMES = [
+  "final",
+  "think",
+  "thinking",
+  "thought",
+  "antthinking",
+  "antml:think",
+  "antml:thinking",
+  "antml:thought",
+  "mm:think",
+  "mm:thinking",
+  "mm:thought",
+] as const;
+
+function isPotentialTrailingBlockTagFragment(fragment: string): boolean {
   if (!fragment.startsWith("<") || fragment.includes(">")) {
     return false;
   }
@@ -51,36 +72,19 @@ function isPotentialTrailingFinalTagFragment(fragment: string): boolean {
   if (!namePart) {
     return true;
   }
-  return "final".startsWith(namePart);
+  return STREAM_STRIPPED_BLOCK_TAG_NAMES.some((name) => name.startsWith(namePart));
 }
 
 function splitTrailingBlockTagFragment(
   text: string,
   isInsideCodeSpan: (index: number) => boolean,
 ): { text: string; pendingTagFragment?: string } {
-  for (let cursor = 0; cursor < text.length;) {
-    const start = text.indexOf("<", cursor);
-    if (start === -1) {
-      break;
-    }
-    cursor = start + 1;
-    if (isInsideCodeSpan(start)) {
-      continue;
-    }
-    const parsed = parseReasoningTagAt(text, start, false);
-    if (parsed.kind === "pending") {
-      return { text: text.slice(0, start), pendingTagFragment: text.slice(start) };
-    }
-    if (parsed.kind === "tag") {
-      cursor = start + parsed.tag.text.length;
-    }
-  }
   const fragmentStart = text.lastIndexOf("<");
   if (fragmentStart === -1 || isInsideCodeSpan(fragmentStart)) {
     return { text };
   }
   const fragment = text.slice(fragmentStart);
-  if (!isPotentialTrailingFinalTagFragment(fragment)) {
+  if (!isPotentialTrailingBlockTagFragment(fragment)) {
     return { text };
   }
   return {
@@ -175,9 +179,10 @@ export function createStreamRendering({
         : buildCodeSpanIndex(scanText, inlineStateStart, fenceStateStart);
 
     let processed = "";
+    THINKING_TAG_SCAN_RE.lastIndex = 0;
     let lastIndex = 0;
     let lastCodeIndex = 0;
-    let reasoningDepth = stateLocal.reasoningDepth;
+    let inThinking = stateLocal.thinking;
     // Hidden reasoning has its own code state: malformed hidden fences must not
     // mark later visible text as code, but literal close tags there stay hidden.
     let hiddenInlineState: InlineCodeState = stateLocal.reasoningInlineCode
@@ -211,41 +216,24 @@ export function createStreamRendering({
       hiddenInlineState = next.inlineState;
       hiddenFenceState = next.fenceState;
     };
-    for (let cursor = 0; cursor < scanText.length;) {
-      const idx = scanText.indexOf("<", cursor);
-      if (idx === -1) {
-        break;
-      }
-      cursor = idx + 1;
-      if (reasoningDepth > 0) {
+    for (const match of scanText.matchAll(THINKING_TAG_SCAN_RE)) {
+      const idx = match.index ?? 0;
+      const isClose = match[1] === "/";
+      if (inThinking) {
         advanceHiddenCodeState(scanText.slice(lastCodeIndex, idx));
       }
       const isInsideHiddenCode =
-        reasoningDepth > 0 && (hiddenInlineState.open || Boolean(hiddenFenceState?.open));
-      lastCodeIndex = idx;
-      if ((reasoningDepth === 0 && codeSpans.isInside(idx)) || isInsideHiddenCode) {
-        continue;
-      }
-      // Code ownership comes first: quotes inside literal tags must not consume
-      // later real tags when the canonical parser scans their attributes.
-      const parsed = parseReasoningTagAt(scanText, idx, true);
-      if (parsed.kind !== "tag") {
-        continue;
-      }
-      const match = parsed.tag;
-      const isClose = match.isClose;
-      cursor = idx + match.text.length;
-      lastCodeIndex = cursor;
-      if (match.isSelfClosing) {
-        if (reasoningDepth === 0) {
-          processed += scanText.slice(lastIndex, idx);
+        inThinking && (hiddenInlineState.open || Boolean(hiddenFenceState?.open));
+      lastCodeIndex = idx + match[0].length;
+      if ((!inThinking && codeSpans.isInside(idx)) || isInsideHiddenCode) {
+        if (inThinking) {
+          advanceHiddenCodeState(match[0]);
         }
-        lastIndex = cursor;
         continue;
       }
-      if (reasoningDepth === 0) {
+      if (!inThinking) {
         if (isClose) {
-          const afterIndex = cursor;
+          const afterIndex = idx + match[0].length;
           const before = scanText.slice(lastIndex, idx);
           const after = scanText.slice(afterIndex);
           if (hasOrphanReasoningCloseBoundary({ before, after })) {
@@ -258,26 +246,24 @@ export function createStreamRendering({
         }
         processed += scanText.slice(lastIndex, idx);
       }
-      // Like the canonical reducer, only the outer close releases hidden text.
-      reasoningDepth += isClose ? -1 : 1;
-      if (reasoningDepth === 1 && !isClose) {
+      if (!inThinking || isClose) {
         hiddenInlineState = createInlineCodeState();
         hiddenFenceState = undefined;
         hiddenPendingFenceFragment = undefined;
       }
-      lastIndex = cursor;
+      inThinking = !isClose;
+      lastIndex = idx + match[0].length;
     }
-    if (reasoningDepth > 0) {
+    if (inThinking) {
       advanceHiddenCodeState(scanText.slice(lastCodeIndex));
     }
-    if (reasoningDepth === 0) {
+    if (!inThinking) {
       processed += scanText.slice(lastIndex);
     }
-    stateLocal.reasoningDepth = reasoningDepth;
-    stateLocal.reasoningInlineCode = reasoningDepth > 0 ? hiddenInlineState : undefined;
-    stateLocal.reasoningFence = reasoningDepth > 0 ? hiddenFenceState : undefined;
-    stateLocal.reasoningPendingFenceFragment =
-      reasoningDepth > 0 ? hiddenPendingFenceFragment : undefined;
+    stateLocal.thinking = inThinking;
+    stateLocal.reasoningInlineCode = inThinking ? hiddenInlineState : undefined;
+    stateLocal.reasoningFence = inThinking ? hiddenFenceState : undefined;
+    stateLocal.reasoningPendingFenceFragment = inThinking ? hiddenPendingFenceFragment : undefined;
 
     // Even without enforcement, strip provider-emitted tags from visible text.
     const finalCodeSpans =
@@ -378,7 +364,7 @@ export function createStreamRendering({
       }
       state.toolExecutionSinceLastBlockReply = false;
     };
-    if (hasMessageToolOnlySourceDelivery({ params, state })) {
+    if (shouldSuppressSourceReplyOutput({ params, state })) {
       markBlockReplyTextHandled();
       return;
     }
@@ -664,6 +650,9 @@ export function createStreamRendering({
     if (!trimmed || trimmed === state.lastStreamedReasoning) {
       return;
     }
+    // Transcript persistence completes this same occurrence receipt after message_end.
+    const source = readAgentAssistantSource(state.lastAssistant);
+    const itemId = source ? (source.itemId ??= randomUUID()) : undefined;
     flushAssistantStream();
     // Partial callbacks can advance reasoning while the assistant scope flushes.
     const prior = state.lastStreamedReasoning ?? "";
@@ -676,20 +665,20 @@ export function createStreamRendering({
     state.lastStreamedReasoning = trimmed;
 
     // Archive thinking regardless of /reasoning; that setting gates the rendering hook.
-    emitAgentEvent({
-      runId: params.runId,
-      stream: "thinking",
-      data: {
-        text: trimmed,
-        delta,
+    emitAgentEventWithAssistantSourceIfCurrent(
+      {
+        runId: params.runId,
+        stream: "thinking",
+        data: { text: trimmed, delta, ...(itemId ? { itemId } : {}) },
       },
-    });
+      source,
+    );
 
-    // A message-tool-only reply suppresses later reasoning from channel rendering,
+    // A completed source reply suppresses later reasoning from channel rendering,
     // including reasoning attached to tool calls. The archive above still receives it.
     if (
       state.streamReasoning &&
-      !hasMessageToolOnlySourceDelivery({ params, state }) &&
+      !shouldSuppressSourceReplyOutput({ params, state }) &&
       params.onReasoningStream
     ) {
       runBestEffortCallback({
@@ -715,11 +704,7 @@ export function createStreamRendering({
     state.hasFlushedPartialText = false;
     blockChunker.reset();
     resetPartialReplyDirectives();
-    state.partialBlockState = {
-      reasoningDepth: 0,
-      final: false,
-      inlineCode: createInlineCodeState(),
-    };
+    state.partialBlockState = createAssistantStreamBlockState();
     state.assistantStream = undefined;
     state.currentSourceMessagingToolHeldPartial = undefined;
     state.lastBlockReplyText = undefined;

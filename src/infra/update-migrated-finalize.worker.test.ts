@@ -10,6 +10,7 @@ import { createDeferredCore } from "../shared/deferred.js";
 
 const fixture = vi.hoisted(() => ({
   close: vi.fn<() => Promise<void>>(),
+  closeNative: vi.fn<() => Promise<void>>(),
   budget: vi.fn(),
   activation: vi.fn(),
   finish: vi.fn(),
@@ -18,6 +19,8 @@ const fixture = vi.hoisted(() => ({
   stopService: vi.fn(),
   ownerLease: vi.fn(),
   recordStep: vi.fn(),
+  recordLedgerStep: vi.fn(),
+  adopt: vi.fn(),
   fence: { assertCurrent: vi.fn() },
 }));
 
@@ -70,6 +73,10 @@ vi.mock("../cli/update-cli/update-command-windows-task.js", () => ({
 vi.mock("../state/openclaw-state-db.js", () => ({
   closeOpenClawStateDatabaseAsync: fixture.close,
 }));
+// mock-isolation: Finalizer fixtures observe cleanup without closing the test process's native workers.
+vi.mock("./worker-native-lifecycle.js", () => ({
+  closeDefaultRetainedNativeWorkerSource: fixture.closeNative,
+}));
 vi.mock("./update-finalization-budget.js", () => ({
   resolveUpdateFinalizationTimeoutMs: fixture.budget,
 }));
@@ -82,9 +89,11 @@ vi.mock("./update-requester-authority.js", () => ({
   createManagedUpdateRequesterAuthority: vi.fn(),
   UpdateRequesterRevokedError: class extends Error {},
 }));
+// mock-isolation: Worker lifecycle tests replace ledger access without opening a real state database.
 vi.mock("./update-run-ledger.js", () => ({
-  adoptUpdateRun: vi.fn(),
+  adoptUpdateRun: fixture.adopt,
   getUpdateRun: fixture.terminal,
+  recordUpdateRunStep: fixture.recordLedgerStep,
 }));
 vi.mock("./update-run-write.async.js", () => ({ recordUpdateRunStepAsync: fixture.recordStep }));
 
@@ -136,6 +145,8 @@ async function runWorker(
   const settled = createDeferredCore();
   fixture.close.mockImplementation(async () => {
     await cleanup?.();
+  });
+  fixture.closeNative.mockImplementation(async () => {
     settled.resolve();
   });
   process.argv = [process.execPath, "update-migrated-finalize.worker.js", ...(mode ? [mode] : [])];
@@ -265,7 +276,11 @@ it.each([false, true])(
           run: { ...input.params.opts.run, executorFence: fixture.fence },
         },
       },
-      { candidateRuntime: true, onGatewayStartAttempted: expect.any(Function) },
+      {
+        candidateRuntime: true,
+        adoptedFinalization: true,
+        onGatewayStartAttempted: expect.any(Function),
+      },
     );
     expect(fixture.fence.assertCurrent).toHaveBeenCalled();
     expect(fixture.writeFile).toHaveBeenCalledExactlyOnceWith(
@@ -283,6 +298,87 @@ it.each([false, true])(
     );
   },
 );
+
+it("times the fresh-driver handoff from the previous driver's last receipt", async () => {
+  const handoffStartedAtMs = 1_791_594_640_455;
+  const readyAtMs = handoffStartedAtMs + 23_400;
+  vi.spyOn(Date, "now").mockReturnValue(readyAtMs);
+  fixture.adopt.mockReturnValueOnce({
+    runId: "handoff-run",
+    steps: [
+      { step: "validating", status: "completed", endedAtMs: handoffStartedAtMs - 10_000 },
+      { step: "driver:adopted", status: "completed", endedAtMs: handoffStartedAtMs + 15_494 },
+    ],
+  });
+  const steps: unknown[] = [];
+  const input = {
+    params: {
+      root: "/fixture/candidate",
+      result: { status: "ok", mode: "git", root: "/fixture/candidate", steps, durationMs: 0 },
+      opts: { json: true, run: { runId: "handoff-run", env: {}, activationTimeoutMs: 1_000 } },
+      preUpdatePluginInstallRecords: {},
+      updateStepTimeoutMs: 1_000,
+      rollbackBlockedReason: "state-migrated-no-rollback",
+    },
+    bufferedSteps: [
+      {
+        step: "git-verify-head",
+        status: "completed",
+        startedAtMs: handoffStartedAtMs - 36,
+        endedAtMs: handoffStartedAtMs,
+        exitCode: 0,
+      },
+    ],
+    resultPath: "/fixture/result.json",
+  };
+  let stepsAtFinish: unknown[] = [];
+  fixture.finish.mockImplementation(async (params) => {
+    stepsAtFinish = [...params.result.steps];
+    return input.params.result;
+  });
+  fixture.terminal.mockReturnValue({ runId: "handoff-run", status: "succeeded" });
+
+  await runWorker(input);
+
+  const handoff = {
+    name: "update-driver-handoff",
+    command: "openclaw update",
+    cwd: "/fixture/candidate",
+    durationMs: 23_400,
+    exitCode: 0,
+    diagnostics: [
+      'Handoff began after "git-verify-head"; the fresh driver adopted the run after 15494ms.',
+    ],
+  };
+  expect(stepsAtFinish).toEqual([handoff]);
+  expect(fixture.recordStep).toHaveBeenCalledWith(
+    "handoff-run",
+    input.bufferedSteps[0],
+    expect.anything(),
+  );
+  expect(fixture.recordLedgerStep.mock.calls).toEqual([
+    [
+      "handoff-run",
+      expect.objectContaining({
+        step: "update-driver-handoff",
+        status: "completed",
+        startedAtMs: handoffStartedAtMs,
+        endedAtMs: readyAtMs,
+      }),
+      { env: {} },
+    ],
+    [
+      "handoff-run",
+      expect.objectContaining({
+        step: "diagnostic:update-driver-handoff",
+        detail: handoff.diagnostics[0],
+        startedAtMs: handoffStartedAtMs,
+        endedAtMs: readyAtMs,
+      }),
+      { env: {} },
+    ],
+  ]);
+});
 
 it.each([
   {
@@ -409,7 +505,11 @@ it.each([
       expect.objectContaining({
         opts: expect.objectContaining({ timeout: undefined }),
       }),
-      { candidateRuntime: true, onGatewayStartAttempted: expect.any(Function) },
+      {
+        candidateRuntime: true,
+        adoptedFinalization: true,
+        onGatewayStartAttempted: expect.any(Function),
+      },
     );
     expect(fixture.writeFile).toHaveBeenCalledWith(
       input.resultPath,
@@ -471,12 +571,115 @@ it.each(["inspected", "legacy-unavailable", "windows-suspended"] as const)(
         shouldRestart: false,
         preManagedServiceStop: { ...transferred, windowsTaskAutoStartRecovery: undefined },
       }),
-      { candidateRuntime: true, onGatewayStartAttempted: expect.any(Function) },
+      {
+        candidateRuntime: true,
+        adoptedFinalization: true,
+        onGatewayStartAttempted: expect.any(Function),
+      },
     );
     expect(fixture.stopService).not.toHaveBeenCalled();
     expect(process.exitCode).toBe(originalExitCode);
   },
 );
+
+it("does not stop a supervised predecessor when the delegated Doctor deadline expires during startup", async () => {
+  const doctor = vi.fn();
+  let wallNow = 1_000;
+  let elapsedMs = 0;
+  vi.spyOn(performance, "now").mockImplementation(() => elapsedMs);
+  const deadlineAtMs = wallNow + 500;
+  const errorReported = createDeferredCore();
+  vi.spyOn(process.stderr, "write").mockImplementation((value) => {
+    stderr.push(String(value));
+    errorReported.resolve();
+    return true;
+  });
+  vi.spyOn(Date, "now").mockImplementation(() => wallNow);
+  // mock-isolation: Keep real Doctor repair, service and database effects outside this worker fixture.
+  vi.doMock("../flows/doctor-health.js", () => {
+    wallNow -= 90_000;
+    elapsedMs = 501;
+    return { runDoctorHealthFlow: doctor };
+  });
+  fixture.ownerLease.mockReturnValue({ state: "live", mode: "supervised" });
+  process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
+  try {
+    await runWorker(
+      {
+        executor: {},
+        runId: "synthetic-run",
+        root: "/synthetic",
+        configInputHash: "hash",
+        repair: true,
+        serviceInspectionDeadlineAtMs: deadlineAtMs,
+      },
+      "--doctor",
+    );
+    // Database cleanup settles before the executable reports its terminal error.
+    await errorReported.promise;
+  } finally {
+    delete process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH;
+    vi.doUnmock("../flows/doctor-health.js");
+  }
+
+  expect(fixture.stopService).not.toHaveBeenCalled();
+  expect(doctor).not.toHaveBeenCalled();
+  expect(stderr.join("")).toContain("Doctor service-inspection deadline has expired.");
+  expect(process.exitCode).toBe(1);
+});
+
+it("bounds a supervised predecessor stop by the remaining Doctor deadline", async () => {
+  const doctor = vi.fn();
+  const deadlineAtMs = 1_500;
+  vi.spyOn(Date, "now").mockReturnValue(1_000);
+  vi.spyOn(performance, "now").mockReturnValue(0);
+  // mock-isolation: Keep real Doctor repair, service and database effects outside this worker fixture.
+  vi.doMock("../flows/doctor-health.js", () => ({ runDoctorHealthFlow: doctor }));
+  fixture.ownerLease.mockReturnValue({ state: "live", mode: "supervised" });
+  fixture.recordStep.mockImplementation(async (runId: string, step: unknown) => ({
+    runId,
+    status: "running",
+    steps: [step],
+  }));
+  const stoppedState = {
+    stopped: true,
+    stoppedAtMs: 7,
+    inspected: true,
+    runtimeInspected: true,
+    running: true,
+    servicePid: 631,
+    serviceManagerUid: 1000,
+    serviceUpdateVerdict: { kind: "owned", root: "/synthetic", fingerprint: "f" },
+  };
+  fixture.stopService.mockImplementation(
+    async (params: { timeoutMs?: number; onStopped?: (s: unknown) => void }) => {
+      params.onStopped?.(stoppedState);
+      return stoppedState;
+    },
+  );
+  process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH = "/synthetic/doctor.json";
+  try {
+    await runWorker(
+      {
+        executor: {},
+        runId: "synthetic-run",
+        root: "/synthetic",
+        configInputHash: "hash",
+        repair: true,
+        serviceInspectionDeadlineAtMs: deadlineAtMs,
+      },
+      "--doctor",
+    );
+  } finally {
+    delete process.env.OPENCLAW_UPDATE_POST_INSTALL_DOCTOR_RESULT_PATH;
+    vi.doUnmock("../flows/doctor-health.js");
+  }
+
+  expect(fixture.stopService).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ phase: "prepare", timeoutMs: deadlineAtMs - 1_000 }),
+  );
+  expect(doctor).toHaveBeenCalledOnce();
+});
 
 it.each([
   {

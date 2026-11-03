@@ -114,11 +114,13 @@ let cleanupLogCapture: (() => void) | undefined;
 let resetLoggerFn: typeof import("../logging/logger.js").resetLogger;
 let setLoggerOverrideFn: typeof import("../logging/logger.js").setLoggerOverride;
 let registerAgentHarnessFn: typeof import("./harness/registry.js").registerAgentHarness;
+let setRuntimeConfigSnapshot: typeof import("../config/config.js").setRuntimeConfigSnapshot;
 const originalFetch = globalThis.fetch;
 
 beforeAll(async () => {
   vi.resetModules();
   installRunEmbeddedMocks();
+  ({ setRuntimeConfigSnapshot } = await import("../config/config.js"));
   runEmbeddedAgent = wrapRunWithTestPreparedAdmission(
     (await import("./embedded-agent-runner/run.js")).runEmbeddedAgent,
   );
@@ -153,6 +155,7 @@ async function runEmbeddedAgentInline(
 }
 
 beforeEach(() => {
+  setRuntimeConfigSnapshot({});
   vi.useRealTimers();
   runEmbeddedAttemptMock.mockReset();
   runEmbeddedAttemptMock.mockImplementation(async () => {
@@ -1014,7 +1017,7 @@ describe("runEmbeddedAgent auth profile rotation", () => {
 
       expect(runEmbeddedAttemptMock).toHaveBeenCalledTimes(2);
       const usageStats = await readUsageStats(agentDir);
-      expect(usageStats["openai:p1"]?.cooldownUntil).toBeUndefined();
+      expect(typeof usageStats["openai:p1"]?.cooldownUntil).toBe("number");
       expect(usageStats["openai:p2"]?.lastUsed).not.toBe(2);
     });
   });
@@ -1129,7 +1132,7 @@ describe("runEmbeddedAgent auth profile rotation", () => {
             },
             "openai:backup": {
               cooldownUntil: now + 60 * 60 * 1000,
-              lastRateLimitAt: now,
+              failureCounts: { rate_limit: 1 },
             },
           },
         },
