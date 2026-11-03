@@ -26,11 +26,16 @@ WORKDIR /openclaw
 ARG OPENCLAW_GIT_REF=main
 RUN git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
 
-# Patch: relax version requirements for packages using workspace protocol.
+# Patch: relax the openclaw peerDependency version floor so extensions install
+# cleanly against whatever commit OPENCLAW_GIT_REF checks out. Leave the
+# "openclaw": "workspace:*" devDependency untouched: pnpm only auto-links a
+# workspace sibling when the "workspace:" protocol is present (link-workspace-packages
+# defaults to false), so rewriting it to a plain "*" range makes pnpm fetch the
+# published npm package instead of the freshly cloned/built source -- which can be
+# stale relative to main and missing plugin-sdk exports the extensions require.
 RUN set -eux; \
   find ./extensions -name 'package.json' -type f | while read -r f; do \
     sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*">=[^"]+"/"openclaw": "*"/g' "$f"; \
-    sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
   done
 
 RUN pnpm install --no-frozen-lockfile
