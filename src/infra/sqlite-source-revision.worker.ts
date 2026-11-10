@@ -1,4 +1,4 @@
-// Keep this child independent of SQLite and the shared runtime import graph.
+// Keep ordinary content/file observations independent of the SQLite import graph.
 import { SQLITE_READONLY_CHILD_ARG } from "./runtime-process-entrypoints.js";
 import {
   readStableSqliteFileGeneration,

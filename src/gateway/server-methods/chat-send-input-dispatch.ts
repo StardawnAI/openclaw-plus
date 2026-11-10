@@ -7,6 +7,8 @@ import { withoutGatewayToolCallerIdentity } from "../../agents/tools/gateway-cal
 import { reserveReplyAdmissionTicket } from "../../auto-reply/reply/reply-admission-ticket.js";
 import { lookupSessionGoalOperation } from "../../config/sessions/goals-operations-read.js";
 import type { SessionGoalOperationResult } from "../../config/sessions/goals-operations.js";
+import { withSessionInputActor } from "../../config/sessions/session-input-actor.js";
+import { preparePendingInputStore } from "../../config/sessions/session-pending-input-store.js";
 import { composeSessionSourceAssertion } from "../../config/sessions/session-source-authority.js";
 import { logVerbose } from "../../globals.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
@@ -314,15 +316,35 @@ export async function handleChatSendWithStorage(
       inputAdmissionAttempted = true;
       const input = await admission.acquireInputActor();
       if (input) {
-        const authority = {
-          assertCurrent: assertCustodyLifetimeCurrent,
-          authorize: assertCustodyLifetimeCurrent,
-        };
-        const state = input.actor.snapshot(authority) ?? (await input.actor.read(authority));
-        // Older Gateways can leave custody behind before committing the recovery
-        // claim. Recover that input; fresh idle sends commit transcript custody directly.
-        stageInput = state.pendingInputs.some(
-          (pending) => pending.idempotency_key === userTurn.baseInput.idempotencyKey,
+        stageInput = await withSessionInputActor(
+          { phase: "acceptInput", acquire: async () => input },
+          async () => {
+            // Use the admitted input owner, not the unrelated history lane: this
+            // lookup is part of custody transfer and must complete before ACK.
+            const store = await preparePendingInputStore(
+              { agentId: session.agentId, sessionKey, sessionId: admittedSessionId, storePath },
+              assertCustodyLifetimeCurrent,
+            );
+            try {
+              const source = await store.read({
+                kind: "source",
+                sessionKey: store.sessionKey,
+                sessionId: admittedSessionId,
+                idempotencyKey: userTurn.baseInput.idempotencyKey!,
+                pendingOnly: true,
+              });
+              assertCustodyLifetimeCurrent();
+              store.assertCurrent();
+              if (source.kind !== "source") {
+                throw new Error("Submitted input returned a different operation");
+              }
+              // Consumed receipts stay durable, not resident. Staging performs
+              // the full replay comparison; fresh idle sends commit directly.
+              return Boolean(source.current && source.pending);
+            } finally {
+              await store.release();
+            }
+          },
         );
       }
     }

@@ -10,6 +10,8 @@ import type { RetainedWorkerTransactionAdmission } from "../../infra/sqlite-work
 import { createSqliteWorkerTransferCollector } from "../../infra/sqlite-worker-transfer.js";
 import { publishRetainedSessionEntryChange } from "./session-accessor.sqlite-entry-cache-publication-state.js";
 import { projectSessionSharingEntry } from "./session-accessor.sqlite-entry-cache.types.js";
+import { retainSessionEntryWorkerPublication } from "./session-accessor.sqlite-entry-worker-publication.js";
+import { publishCommittedSessionIdentity } from "./session-accessor.sqlite-identity.js";
 import {
   captureSessionEntryMaintenanceAgeChange,
   publishSessionEntryMaintenanceAgeChanges,
@@ -25,11 +27,13 @@ import type {
   SessionActorPhase,
   SessionActorPhaseInputs,
   SessionActorPhaseResults,
+  SessionActorReceipt,
   SessionActorTarget,
 } from "./session-actor-contract.js";
 import type { SessionActorExecutor, SessionActorExecutorGuards } from "./session-actor-executor.js";
 import { SessionActorReadInvalidatedError } from "./session-actor-read-error.js";
 import type { createSessionActorReplica } from "./session-actor-replica.js";
+import { parseSessionEntryMetadataReceipts } from "./session-entry-metadata-receipt.js";
 import { publishCommittedSessionTranscriptReceipts } from "./session-transcript-authority.js";
 
 type NativeAdmission = {
@@ -47,7 +51,7 @@ export type SessionActorTransport = {
     authorize: (
       request: SqliteWorkerAdmissionRequest,
       native: NativeAdmission,
-      grant: () => boolean,
+      grant: (beforeRelease?: () => void) => boolean,
     ) => void,
   ): Promise<T>;
   /** Read-only committed evidence; follow-up work runs after releasing the command FIFO. */
@@ -105,16 +109,18 @@ export function createSqliteSessionActorExecutor(
       publication: unknown,
       stage: "transaction" | "commit",
       snapshot: SessionActorAuthorityFacts,
-    ) => void,
+      entryPublication: unknown,
+    ) => (() => void) | undefined,
   ) => {
     let actorAdmissionSeen = false;
     return (
       request: SqliteWorkerAdmissionRequest,
       native: NativeAdmission,
-      grant: () => boolean,
+      grant: (beforeRelease?: () => void) => boolean,
     ) => {
       params.assertAccepted();
       authority.assertCurrent();
+      let beforeRelease: (() => void) | undefined;
       const facts =
         isRecord(request.facts) &&
         request.facts.kind !== "session-actor-admission" &&
@@ -133,7 +139,13 @@ export function createSqliteSessionActorExecutor(
         // SAFETY: The private MessagePort already detached this snapshot from the paired kernel.
         const snapshot = facts.snapshot as SessionActorAuthorityFacts;
         const publication = facts.publication;
-        observe?.(native, publication, request.stage, snapshot);
+        beforeRelease = observe?.(
+          native,
+          publication,
+          request.stage,
+          snapshot,
+          facts.entryPublication,
+        );
         authority.authorize(
           request.stage,
           snapshot,
@@ -149,7 +161,7 @@ export function createSqliteSessionActorExecutor(
       }
       authority.assertCurrent();
       params.assertAccepted();
-      if (!grant()) {
+      if (!grant(beforeRelease)) {
         throw new Error("Session actor authority expired");
       }
     };
@@ -204,6 +216,13 @@ export function createSqliteSessionActorExecutor(
     let running: Promise<Outcome> | undefined;
     let committed: Extract<Outcome, { kind: "committed" }> | undefined;
     let candidate: unknown;
+    let entryPublicationSettled = false;
+    let entryPublication:
+      | {
+          facts: NonNullable<SessionActorReceipt["entryPublication"]>;
+          owner: ReturnType<typeof retainSessionEntryWorkerPublication>;
+        }
+      | undefined;
     const transfer = createSqliteWorkerTransferCollector("outcome", (value) => {
       if (candidate !== undefined) {
         throw new Error("Session actor transferred more than one outcome");
@@ -211,7 +230,7 @@ export function createSqliteSessionActorExecutor(
       candidate = value;
     });
     const unknown = (error: unknown): Outcome => {
-      if (target.database.kind === "file") {
+      if (target.database.kind === "file" && !entryPublication) {
         publishRetainedSessionEntryChange(
           target.database.physicalIdentity,
           target.sessionKey,
@@ -290,15 +309,17 @@ export function createSqliteSessionActorExecutor(
                   // Retained effect predicates must observe this commit before its callbacks.
                   if (target.database.kind === "file") {
                     const entry = committed.receipt.postimage.entry;
-                    publishRetainedSessionEntryChange(
-                      target.database.physicalIdentity,
-                      target.sessionKey,
-                      entry ? projectSessionSharingEntry(entry) : undefined,
-                      previousEntry,
-                      true,
-                      entry,
-                    );
-                    if (entry) {
+                    if (!entryPublication) {
+                      publishRetainedSessionEntryChange(
+                        target.database.physicalIdentity,
+                        target.sessionKey,
+                        entry ? projectSessionSharingEntry(entry) : undefined,
+                        previousEntry,
+                        true,
+                        entry,
+                      );
+                    }
+                    if (entry && (previousEntry || !entryPublication)) {
                       // Actor delivery settlement can release the last durable recovery claim.
                       const change = captureSessionEntryMaintenanceAgeChange({
                         sessionKey: target.sessionKey,
@@ -311,6 +332,20 @@ export function createSqliteSessionActorExecutor(
                         ]);
                       }
                     }
+                  }
+                  // The native writer's final entry deltas refresh resident list rows before callbacks.
+                  if (entryPublication && target.database.kind === "file") {
+                    const databaseIdentity = target.database.physicalIdentity;
+                    const { facts, owner } = entryPublication;
+                    owner.settleMetadata(facts.receipts, [], (previous, current) =>
+                      publishCommittedSessionIdentity(
+                        facts.agentId,
+                        databaseIdentity,
+                        previous,
+                        current,
+                      ),
+                    );
+                    entryPublicationSettled = true;
                   }
                   // Partial transcript publication precedes installation of the full actor replica.
                   publishCommittedSessionTranscriptReceipts(
@@ -347,6 +382,13 @@ export function createSqliteSessionActorExecutor(
                 reply.ok ? new Error("Actor command omitted native settlement") : reply.error,
               );
             }
+            if (entryPublication && !entryPublicationSettled) {
+              entryPublication.owner.settle(
+                undefined,
+                result.kind === "unknown" || result.kind === "committed",
+              );
+              entryPublicationSettled = true;
+            }
             if (result.kind === "unknown") {
               // Fence before returning the physical FIFO permit to a queued command.
               fenced = true;
@@ -378,7 +420,7 @@ export function createSqliteSessionActorExecutor(
           })();
           return running;
         },
-        authorize(authority, (admission, publication, stage, snapshot) => {
+        authorize(authority, (admission, publication, stage, snapshot, entryFacts) => {
           native = admission;
           // Compound phases and transfer frames carry later snapshots of the same transaction.
           if (stage === "transaction" && !capturedPreviousEntry) {
@@ -388,6 +430,66 @@ export function createSqliteSessionActorExecutor(
           if (isRecord(publication) && publication.kind === "session-actor-outcome") {
             transfer.accept(publication.transfer);
           }
+          if (stage === "commit" && entryFacts !== undefined) {
+            const databaseIdentity =
+              target.database.kind === "file" ? target.database.physicalIdentity : undefined;
+            const receipts = isRecord(entryFacts)
+              ? parseSessionEntryMetadataReceipts(entryFacts.receipts)
+              : undefined;
+            if (
+              !isRecord(entryFacts) ||
+              typeof entryFacts.agentId !== "string" ||
+              typeof entryFacts.storePath !== "string" ||
+              !receipts ||
+              databaseIdentity === undefined ||
+              receipts.some((receipt) => receipt.source.identity !== databaseIdentity)
+            ) {
+              throw new Error("Session actor omitted its entry publication receipt");
+            }
+            const facts = {
+              agentId: entryFacts.agentId,
+              storePath: entryFacts.storePath,
+              receipts,
+            };
+            // Pending custody must not hide the facts used by this command
+            // to authorize its own commit. Start it under the final native grant.
+            return () => {
+              const owner = retainSessionEntryWorkerPublication({
+                ...facts,
+                databaseIdentity,
+              });
+              entryPublication = { facts, owner };
+              owner.begin(
+                receipts.flatMap((receipt) => [...receipt.facts.keys()]),
+                receipts.flatMap((receipt) =>
+                  [...receipt.facts].flatMap(([key, fact]) =>
+                    fact.kind === "postimage" && fact.value.facts.clearMembers ? [key] : [],
+                  ),
+                ),
+                receipts.flatMap((receipt) =>
+                  [...receipt.facts].flatMap(([key, fact]) =>
+                    fact.kind === "postimage" && fact.value.sharingChange === "unchanged"
+                      ? [key]
+                      : [],
+                  ),
+                ),
+                receipts.flatMap((receipt) =>
+                  [...receipt.facts].flatMap(([key, fact]) =>
+                    fact.kind === "postimage" && !fact.value.facts.lifecycleChanged ? [key] : [],
+                  ),
+                ),
+                undefined,
+                new Map(
+                  receipts.flatMap((receipt) =>
+                    [...receipt.facts].flatMap(([key, fact]) =>
+                      fact.kind === "postimage" ? [[key, fact.value.entry] as const] : [],
+                    ),
+                  ),
+                ),
+              );
+            };
+          }
+          return undefined;
         }),
       );
     } catch (error) {
@@ -414,6 +516,12 @@ export function createSqliteSessionActorExecutor(
             };
       }
       params.replica.invalidate();
+    }
+    if (entryPublication && !entryPublicationSettled) {
+      entryPublication.owner.settle(
+        undefined,
+        outcome.kind === "unknown" || outcome.kind === "committed",
+      );
     }
     if (outcome.kind === "committed" && params.transport.afterCommitted) {
       try {

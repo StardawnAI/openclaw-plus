@@ -38,6 +38,7 @@ import {
   OLLAMA_CLOUD_PROVIDER_ID,
   OLLAMA_DEFAULT_BASE_URL,
   OLLAMA_GLM52_CLOUD_MODEL_ID,
+  isHostedOllamaCloud,
   resolveOllamaSetupDefaultBaseUrl,
 } from "./src/defaults.js";
 import {
@@ -67,6 +68,7 @@ import {
   fetchOllamaModels,
   fetchLoadedOllamaModelNames,
   isOllamaCloudModel,
+  isOllamaRemoteModel,
   queryOllamaModelShowInfo,
   resolveOllamaApiBase,
   toDynamicOllamaModel,
@@ -251,10 +253,18 @@ async function discoverAppGuidedOllamaModel(
     }
     const definition =
       configuredCloudModel ??
-      buildOllamaModelDefinition(candidateId, contextWindow, showInfo.capabilities, showInfo);
+      buildOllamaModelDefinition(candidateId, contextWindow, showInfo.capabilities, {
+        ...showInfo,
+        remote:
+          isHostedOllamaCloud(connection.baseUrl) ||
+          installedModels.some(
+            (candidate) => candidate.name === candidateId && isOllamaRemoteModel(candidate),
+          ),
+      });
     model = capLocalOllamaModelContext(
       {
         ...definition,
+        maxTokens: requestedConfiguredModel?.maxTokens ?? definition.maxTokens,
         thinkingLevelMap: definition.thinkingLevelMap ?? showInfo.thinkingLevelMap,
         contextWindow,
         compat: { ...definition.compat, supportsTools: true },
@@ -501,7 +511,7 @@ async function buildOllamaCloudProvider(apiKey?: string): Promise<ModelProviderC
         defaultModel.id,
         showInfo.contextWindow ?? defaultModel.contextWindow,
         showInfo.capabilities ?? [...defaultModel.capabilities],
-        showInfo,
+        { ...showInfo, remote: true },
       ),
     ],
   };
@@ -529,7 +539,7 @@ async function resolveRequestedDynamicOllamaModel(params: {
     params.modelId,
     showInfo.contextWindow,
     showInfo.capabilities,
-    showInfo,
+    { ...showInfo, remote: isHostedOllamaCloud(showBaseUrl) },
   );
   const model = params.capContextTokens
     ? capLocalOllamaModelContext(definition, showBaseUrl)

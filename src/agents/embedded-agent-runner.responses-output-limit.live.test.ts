@@ -78,6 +78,7 @@ describeLive("embedded Responses output-limit recovery live", () => {
       const modelId = process.env.OPENCLAW_LIVE_RESPONSES_MODEL || "gpt-5.6-luna";
       const receiptPath = path.join(state.workspaceDir, "receipts.txt");
       const unfinishedPath = path.join(state.workspaceDir, "unfinished.txt");
+      const unfinishedContent = "0123456789".repeat(4000);
       const scriptPath = path.join(state.workspaceDir, "record-receipt.cjs");
       await fs.writeFile(
         scriptPath,
@@ -158,6 +159,25 @@ describeLive("embedded Responses output-limit recovery live", () => {
             request.parallel_tool_calls = false;
             request.max_output_tokens = requestNumber === 2 ? 256 : 1024;
             if (requestNumber === 2) {
+              // Constrain the real provider to the requested literal. Prompt-only
+              // repetition can produce a short, valid write instead of truncating.
+              request.tools = request.tools?.map((tool) =>
+                tool.type === "function" && tool.name === "write"
+                  ? {
+                      ...tool,
+                      strict: true,
+                      parameters: {
+                        type: "object",
+                        properties: {
+                          path: { type: "string", enum: [unfinishedPath] },
+                          content: { type: "string", enum: [unfinishedContent] },
+                        },
+                        required: ["path", "content"],
+                        additionalProperties: false,
+                      },
+                    }
+                  : tool,
+              );
               // Spend the small cap on function arguments, not a reasoning-only turn.
               request.reasoning = { effort: "none" };
             }
@@ -215,12 +235,6 @@ describeLive("embedded Responses output-limit recovery live", () => {
           },
         });
 
-        const receipts = (await fs.readFile(receiptPath, "utf8")).trim().split("\n");
-        expect(receipts).toHaveLength(1);
-        const receipt = receipts[0];
-        expect(receipt).toMatch(/^RECEIPT_[0-9a-f-]{36}$/);
-        await expect(fs.stat(unfinishedPath)).rejects.toMatchObject({ code: "ENOENT" });
-        expect(requests).toHaveLength(3);
         const terminalFacts = responses.map((response) => ({
           status: response.status,
           incompleteReason: response.incomplete_details?.reason,
@@ -230,6 +244,13 @@ describeLive("embedded Responses output-limit recovery live", () => {
           })),
         }));
         logLiveProgress(`Responses terminal facts: ${JSON.stringify(terminalFacts)}`);
+
+        const receipts = (await fs.readFile(receiptPath, "utf8")).trim().split("\n");
+        expect(receipts).toHaveLength(1);
+        const receipt = receipts[0];
+        expect(receipt).toMatch(/^RECEIPT_[0-9a-f-]{36}$/);
+        await expect(fs.stat(unfinishedPath)).rejects.toMatchObject({ code: "ENOENT" });
+        expect(requests).toHaveLength(3);
         expect(terminalFacts).toHaveLength(3);
         expect(terminalFacts[1]).toMatchObject({
           status: "incomplete",

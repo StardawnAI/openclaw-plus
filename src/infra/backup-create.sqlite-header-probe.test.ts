@@ -15,14 +15,13 @@ it("probes a batch through a declared worker using the current runtime without e
     await fs.writeFile(sqlitePath, "SQLite format 3\0");
     await fs.writeFile(plainPath, "plain bytes");
     const spawn = vi.spyOn(childProcess, "spawnSync");
-
-    expect(probeSqliteDatabaseHeaders([sqlitePath, plainPath, sqlitePath])).toEqual(
-      new Map([
-        [sqlitePath, true],
-        [plainPath, false],
-      ]),
-    );
-    expect(spawn).toHaveBeenCalledOnce();
+    const missing = Array.from({ length: 8192 }, (_, index) => state.path(String(index)));
+    const answers = probeSqliteDatabaseHeaders([...missing, sqlitePath, plainPath, sqlitePath]);
+    expect(answers.get(sqlitePath)).toBe(true);
+    expect(answers.get(plainPath)).toBe(false);
+    expect(answers.get(missing[0]!)).toBe(false);
+    expect(answers.size).toBe(missing.length + 2);
+    expect(spawn.mock.calls.length).toBeGreaterThan(1);
     const [executable, argv] = spawn.mock.calls[0]!;
     expect(executable).toBe(process.execPath);
     expect(argv).not.toContain("-e");
@@ -116,7 +115,7 @@ it("bounds worker time/output and fails closed on timeout", () => {
     error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }),
   });
   expect(() => probeSqliteDatabaseHeaders(["candidate.db"])).toThrow(
-    "Could not determine whether backup files are SQLite databases",
+    "SQLite header probe timed out after 10000 ms while checking 1 backup paths",
   );
   expect(spawn.mock.calls[0]?.[2]).toMatchObject({ timeout: 10_000, maxBuffer: 64 * 1024 * 1024 });
 });

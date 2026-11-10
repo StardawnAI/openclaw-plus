@@ -79,77 +79,69 @@ function readWalIndexHeader(pathname: string): Buffer | null {
 /** Run only in an isolated process, after all source handles drain, or under a
  * schema-maintenance owner before live reads are admitted: raw close
  * can release this process's SQLite locks. Inspect only the supplied inventory. */
-export function readUpdateDatabaseGenerations(paths: readonly string[]): UpdateDatabaseGenerations {
-  return Object.fromEntries(
-    paths.map((pathname) => {
-      const entry = fs.lstatSync(pathname, { bigint: true, throwIfNoEntry: false });
-      if (!entry) {
-        if (
-          ["-wal", "-journal"].some((suffix) =>
-            fs.lstatSync(`${pathname}${suffix}`, { throwIfNoEntry: false }),
-          )
-        ) {
-          throw new Error(`Database is absent but retained journal data exists: ${pathname}`);
+export function readUpdateDatabaseGenerationObservation(pathname: string): {
+  generation: string | null;
+  emptyReaderAlternate?: string;
+} {
+  const entry = fs.lstatSync(pathname, { bigint: true, throwIfNoEntry: false });
+  if (!entry) {
+    if (
+      ["-wal", "-journal"].some((suffix) =>
+        fs.lstatSync(`${pathname}${suffix}`, { throwIfNoEntry: false }),
+      )
+    ) {
+      throw new Error(`Database is absent but retained journal data exists: ${pathname}`);
+    }
+    return { generation: null };
+  }
+  if (!entry.isFile()) {
+    throw new Error(`Database generation requires a regular file: ${pathname}`);
+  }
+  const before = readWalIndexHeader(pathname);
+  const readGeneration = createSqliteFileGenerationReader();
+  const generation = readStableSqliteFileGeneration(pathname, readGeneration);
+  const content = readCommittedContent(pathname);
+  const current = readStableSqliteFileGeneration(pathname, readGeneration);
+  const after = readWalIndexHeader(pathname);
+  if (
+    !sameSqliteFileGeneration(generation, current) ||
+    (before === null ? after !== null : !after?.equals(before)) ||
+    (generation.wal && generation.wal.size > 0n && after?.[12] !== 1)
+  ) {
+    throw new Error(`SQLite WAL commit publication could not be verified: ${pathname}`);
+  }
+  const identity = [
+    generation.database.dev.toString(),
+    generation.database.ino.toString(),
+    readDatabaseIdentityBirthtime(entry),
+    content,
+  ];
+  const change = after?.subarray(8, 12).toString("hex") ?? null;
+  const checksum = after?.subarray(24, 32).toString("hex") ?? null;
+  const fingerprint = (writeChange: string | null, writeChecksum: string | null) =>
+    sha256Hex(JSON.stringify([...identity, writeChange, writeChecksum]));
+  // Native read-only opens may create/remove a zero-write WAL index. Preserve
+  // all real commit evidence, including changed-back rows and replacements.
+  const emptyReader =
+    !generation.journal &&
+    (generation.wal?.size ?? 0n) === 0n &&
+    (after === null || (change === "00000000" && checksum === "0000000000000000"));
+  return {
+    generation: fingerprint(change, checksum),
+    ...(emptyReader
+      ? {
+          emptyReaderAlternate:
+            after === null ? fingerprint("00000000", "0000000000000000") : fingerprint(null, null),
         }
-        return [pathname, null];
-      }
-      if (!entry.isFile()) {
-        throw new Error(`Database generation requires a regular file: ${pathname}`);
-      }
-      const before = readWalIndexHeader(pathname);
-      const readGeneration = createSqliteFileGenerationReader();
-      const generation = readStableSqliteFileGeneration(pathname, readGeneration);
-      const content = readCommittedContent(pathname);
-      const current = readStableSqliteFileGeneration(pathname, readGeneration);
-      const after = readWalIndexHeader(pathname);
-      if (
-        !sameSqliteFileGeneration(generation, current) ||
-        (before === null ? after !== null : !after?.equals(before)) ||
-        (generation.wal && generation.wal.size > 0n && after?.[12] !== 1)
-      ) {
-        throw new Error(`SQLite WAL commit publication could not be verified: ${pathname}`);
-      }
-      // Checkpoints preserve iChange and the last committed frame checksum,
-      // including TRUNCATE, which resets frame count and salts. Rebuilding the
-      // WAL index does not: the first native open of a family with no holder
-      // recovers -shm and resets iChange. Callers that must compare generations
-      // across a capture acquire sources without opening them natively.
-      // A reversed write leaving identical bytes and write evidence is
-      // indistinguishable from no write; restoring loses no later data.
-      return [
-        pathname,
-        sha256Hex(
-          JSON.stringify([
-            generation.database.dev.toString(),
-            generation.database.ino.toString(),
-            readDatabaseIdentityBirthtime(entry),
-            content,
-            after?.subarray(8, 12).toString("hex") ?? null,
-            after?.subarray(24, 32).toString("hex") ?? null,
-          ]),
-        ),
-      ];
-    }),
-  );
+      : {}),
+  };
 }
 
-export async function readUpdatePhysicalDatabaseGenerations(paths: readonly string[]) {
-  const result = readUpdateDatabaseGenerations(paths);
-  const { readBackupEngine, fingerprintPostgresBackup } =
-    await import("../snapshot/database-backup.js");
-  const postgres = paths.filter(
-    (pathname) => result[pathname] !== null && readBackupEngine(pathname).engine === "postgres",
+export function readUpdateDatabaseGenerations(paths: readonly string[]): UpdateDatabaseGenerations {
+  return Object.fromEntries(
+    paths.map((pathname) => [
+      pathname,
+      readUpdateDatabaseGenerationObservation(pathname).generation,
+    ]),
   );
-  if (postgres.length) {
-    const { createConfigIO } = await import("../config/io.js");
-    const { config } = await createConfigIO({
-      observe: false,
-      pluginValidation: "core-only",
-      shellEnvFallback: "defer",
-    }).readConfigFileSnapshot();
-    for (const pathname of postgres) {
-      result[pathname] = await fingerprintPostgresBackup(pathname, config);
-    }
-  }
-  return result;
 }
