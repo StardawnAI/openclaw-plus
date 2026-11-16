@@ -198,6 +198,11 @@ vi.mock("commander", () => {
   return { Command: MockCommand, CommanderError: MockCommanderError };
 });
 
+// mock-isolation: Dispatch tests must not inspect native host services; service discovery has dedicated coverage.
+vi.mock("./run-main-service-installation.js", () => ({
+  inspectCliGatewayServiceInstallation: async () => undefined,
+}));
+
 vi.mock("./route.js", () => ({ tryRouteCli: tryRouteCliMock }));
 
 vi.mock("./gateway-cli/run-command.js", async (importOriginal) => ({

@@ -21,6 +21,7 @@ import {
 } from "../../sessions/agent-harness-session-key.js";
 import type { InputProvenance } from "../../sessions/input-provenance.js";
 import { resolveCronSkillsSnapshot } from "../../skills/runtime/cron-snapshot.js";
+import { waitForAgentDatabaseWriteAdmission } from "../../state/agent-database-preparation-context.js";
 import { resolveCronJobEffectiveAgentId } from "../agent-id.js";
 import { createCronRunDiagnosticsFromError } from "../run-diagnostics.js";
 import { resolveCronScheduledToolPolicy } from "../scheduled-tool-policy.js";
@@ -102,6 +103,9 @@ export async function prepareCronRunContext(params: {
     { agentId: requiredAgentId },
     tryResolveAmbientOwnerAgentId(requestedRuntimeCfg),
   );
+  await waitForAgentDatabaseWriteAdmission(initialAgentId, {
+    signal: input.abortSignal ?? input.signal,
+  });
   await using runtimeResources = new AsyncDisposableStack();
   let runtimeLease: ReturnType<typeof scopePreparedModelRuntimeLease> | undefined;
   const publishedRuntime = await loadPublishedGatewayReplyDispatchRuntime({
@@ -193,7 +197,10 @@ export async function prepareCronRunContext(params: {
       hookExternalContentSource,
     });
     const sourceEntry = sourceSessionKey ? cronSession.store[sourceSessionKey] : undefined;
-    const completionSource = input.job.sourceConversation ?? sourceEntry;
+    // Stored creator links follow edits and resets; current-run targets retain their revision.
+    const completionSource = input.job.sourceConversation
+      ? { sessionId: input.job.sourceConversation.sessionId, lifecycleRevision: undefined }
+      : sourceEntry;
     const sourceSessionGeneration = completionSource
       ? {
           sessionId: completionSource.sessionId,

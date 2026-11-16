@@ -395,12 +395,13 @@ export async function prepareGatewayLifecycle(params: {
     talkClose.beginClose();
     void stopModelAccountsForClose();
     void closeAuthProfileUsage(params.sdkResourceHost);
-    runtime.scheduler.beginClose();
+    runtime.scheduler.fence();
     void runtimeState.maintenance?.stopPeriodicTasks();
     // Fence new entry now; the run-shutdown owner records recovery before
     // canceling admitted work or withdrawing its runtime capabilities.
     requestEntryLifetime.beginClose();
     void mentionInbox.dispose();
+    runtime.resolvePluginGatewayContext()?.scopeUpgradeCoordinator?.beginClose();
     healthWork.beginClose();
     broadcast("shutdown", notice);
     connectionDependentSidecarStopOwner.beginClose();
@@ -504,46 +505,58 @@ export async function prepareGatewayLifecycle(params: {
     exitAfterClose = optsValue?.exitAfterClose === true;
     // Recovery and reply cancellation must precede services that join those replies.
     await markClosePreludeStarted(optsValue);
-    const preparation = await shutdownRuntime.prepareGatewayClose(
-      {
-        resolveGatewayContext: runtime.resolvePluginGatewayContext,
-        preparePluginRegistryClose: () => pluginRuntime.prepareClose(),
-        chatRunState,
-        chatAbortControllers,
-        chatQueuedTurns,
-        restartRecoveryCandidates,
-        removeChatRun,
-        agentRunSeq,
-        broadcast,
-        nodeSendToSession: (
-          sessionKey,
-          event,
-          payload,
-          opts?: Parameters<typeof nodeSendToSession>[3],
-        ) => {
-          void nodeSendToSession(sessionKey, event, payload, opts);
+    const preparation = await shutdownRuntime
+      .prepareGatewayClose(
+        {
+          resolveGatewayContext: runtime.resolvePluginGatewayContext,
+          preparePluginRegistryClose: () => pluginRuntime.prepareClose(),
+          chatRunState,
+          chatAbortControllers,
+          chatQueuedTurns,
+          restartRecoveryCandidates,
+          removeChatRun,
+          agentRunSeq,
+          broadcast,
+          nodeSendToSession: (
+            sessionKey,
+            event,
+            payload,
+            opts?: Parameters<typeof nodeSendToSession>[3],
+          ) => {
+            void nodeSendToSession(sessionKey, event, payload, opts);
+          },
+          resolveActiveSessionIdForKey: resolveActiveEmbeddedRunSessionId,
+          markMainSessionsAbortedForRestart: async (restart) => {
+            await shutdownRuntime.markRestartAbortedMainSessions({
+              cfg: getRuntimeConfig(),
+              ...restart,
+            });
+          },
+          cancelReceivedWork: (reason) => {
+            // Recovery capture precedes retirement of accepted ingress authority.
+            requestEntryLifetime.retire(reason);
+            runtime.scheduler.beginClose();
+            runtime.connectionWork.beginClose(reason);
+            kernel.setDispatchReady(false);
+            gatewayInstanceRuntimeRef.current?.close();
+          },
+          getPendingReplyCount: getTotalPendingReplies,
+          disposeAllCodeModeRuns: shutdownRuntime.disposeAllCodeModeRuns,
+          updateCheckStop: runtimeState.stopGatewayUpdateCheck,
+          configReloader: { stop: stopConfigReloaderForClose },
         },
-        resolveActiveSessionIdForKey: resolveActiveEmbeddedRunSessionId,
-        markMainSessionsAbortedForRestart: async (restart) => {
-          await shutdownRuntime.markRestartAbortedMainSessions({
-            cfg: getRuntimeConfig(),
-            ...restart,
-          });
-        },
-        cancelReceivedWork: (reason) => {
-          // Publish cancellation before retained principals lose their authority,
-          // so interrupted preparation observes the exact restart reason.
-          runtime.connectionWork.beginClose(reason);
-          kernel.setDispatchReady(false);
-          gatewayInstanceRuntimeRef.current?.close();
-        },
-        getPendingReplyCount: getTotalPendingReplies,
-        disposeAllCodeModeRuns: shutdownRuntime.disposeAllCodeModeRuns,
-        updateCheckStop: runtimeState.stopGatewayUpdateCheck,
-        configReloader: { stop: stopConfigReloaderForClose },
-      },
-      optsValue,
-    );
+        optsValue,
+      )
+      .catch((error: unknown) => {
+        // A failed capture/preparation must still retire retained execution before joins.
+        const reason = error instanceof Error ? error : new Error(String(error));
+        requestEntryLifetime.retire(reason);
+        runtime.scheduler.beginClose();
+        runtime.connectionWork.beginClose(reason);
+        kernel.setDispatchReady(false);
+        gatewayInstanceRuntimeRef.current?.close();
+        throw error;
+      });
     await beginClosePrelude(optsValue);
     // Startup may still publish cleanup owners while received work settles.
     // Resolve their handles only when the caller reaches final teardown.

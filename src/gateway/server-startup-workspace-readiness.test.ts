@@ -5,7 +5,12 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveAgentWorkspaceDir } from "../agents/agent-scope.js";
 import { resolveSandboxWorkspaceLayoutPaths } from "../agents/sandbox/shared.js";
+import {
+  LEGACY_WORKSPACE_ATTESTATION_HEADER,
+  resolveLegacyWorkspaceSourcePaths,
+} from "../agents/workspace-legacy-state.js";
 import { ensureAgentWorkspace } from "../agents/workspace.js";
+import { runStartupConfigPreflight } from "../commands/startup-config-preflight.js";
 import { getRuntimeConfig, writeConfigFile, type OpenClawConfig } from "../config/config.js";
 import { readConfigFileSnapshotWithPluginMetadata } from "../config/io.js";
 import {
@@ -13,6 +18,9 @@ import {
   createRuntimeConfigWriteApplication,
 } from "../config/runtime-write-application.js";
 import { replaceSessionEntrySync } from "../config/sessions/session-accessor.js";
+import { writeExecApprovalsConfigRow } from "../infra/exec-approvals-sqlite.js";
+import { loadExecApprovalsReadOnlyAsync } from "../infra/exec-approvals-store.js";
+import { readStartupMigrationWarning } from "../infra/state-migrations.messages.js";
 import {
   detectLegacyWorkspaceState,
   migrateLegacyWorkspaceState,
@@ -20,6 +28,7 @@ import {
 import { resetLogger } from "../logging/logger.js";
 import { clearPluginMetadataLifecycleCaches } from "../plugins/plugin-metadata-lifecycle.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { getFreePort } from "../test-utils/ports.js";
 import { gatewayKernelLogs } from "./server-kernel.js";
@@ -79,6 +88,59 @@ describe("Gateway workspace migration readiness", () => {
       startupConfigSnapshotRead,
     });
 
+  it.each([false, true])(
+    "preserves retained approvals through real preflight and startup (canonical=%s)",
+    async (canonical) => {
+      await state.writeConfig({
+        gateway: { mode: "local", bind: "loopback", auth: { mode: "none" } },
+        plugins: { enabled: false },
+      });
+      const { db } = openOpenClawStateDatabase({ env: state.env });
+      if (canonical) {
+        writeExecApprovalsConfigRow({
+          db,
+          file: { version: 1, defaults: { security: "deny" }, agents: {} },
+        });
+      }
+      const legacyPath = state.statePath("exec-approvals.json");
+      const legacy = JSON.stringify({
+        version: 1,
+        defaults: { security: "full" },
+        socket: { token: "synthetic-retained-private-marker" },
+      });
+      await fs.writeFile(legacyPath, legacy);
+      const before = await fs.stat(legacyPath);
+      const preflight = await runStartupConfigPreflight({ gateway: true });
+      expect(readStartupMigrationWarning()).toContain(
+        "Canonical SQLite approvals remain authoritative",
+      );
+      expect(readStartupMigrationWarning(false)).not.toContain(legacyPath);
+      expect(readStartupMigrationWarning()).not.toContain("synthetic-retained-private-marker");
+      const port = await getFreePort();
+      server = await start(port, {
+        snapshot: preflight.snapshot,
+        pluginMetadataSnapshot: preflight.pluginMetadataSnapshot,
+      });
+      await server.startupSettled;
+      expect((await fetch(`http://127.0.0.1:${port}/readyz`)).status).toBe(200);
+      if (canonical) {
+        expect((await loadExecApprovalsReadOnlyAsync({ env: state.env })).defaults?.security).toBe(
+          "deny",
+        );
+      } else {
+        await expect(loadExecApprovalsReadOnlyAsync({ env: state.env })).rejects.toThrow(
+          /Legacy exec approvals/,
+        );
+      }
+      expect(await fs.readFile(legacyPath, "utf8")).toBe(legacy);
+      expect(await fs.stat(legacyPath)).toMatchObject({
+        ino: before.ino,
+        size: before.size,
+        mtimeMs: before.mtimeMs,
+      });
+    },
+  );
+
   it("refuses every owned session workspace without reading its store on the main thread", async () => {
     const storePath = state.statePath("shared.sqlite");
     const sandbox = {
@@ -112,6 +174,10 @@ describe("Gateway workspace migration readiness", () => {
         path.join(sandboxWorkspaceDir, "openclaw-workspace-state.json"),
         JSON.stringify({ version: 1 }),
       );
+      const attestation = resolveLegacyWorkspaceSourcePaths(sandboxWorkspaceDir, { env: state.env })
+        .stateDirAttestationPaths[0]!;
+      await fs.mkdir(path.dirname(attestation), { recursive: true });
+      await fs.writeFile(attestation, "");
       return sandboxWorkspaceDir;
     };
     const workspaces: string[] = [];
@@ -153,6 +219,28 @@ describe("Gateway workspace migration readiness", () => {
     await expect(fetch(`http://127.0.0.1:${port}/readyz`)).rejects.toThrow();
 
     expect(prepare.mock.calls.filter(([sql]) => sql.includes('"retained_window"'))).toEqual([]);
+  });
+
+  it("starts ready with sandbox-written setup and sibling markers in a shared root", async () => {
+    const workspaceRoot = state.path("shared-sandbox");
+    await state.writeConfig({
+      gateway: { mode: "local", bind: "loopback", auth: { mode: "none" } },
+      agents: {
+        defaults: {
+          workspace: state.workspaceDir,
+          sandbox: { mode: "all", scope: "shared", workspaceAccess: "ro", workspaceRoot },
+        },
+      },
+    } satisfies OpenClawConfig);
+    await fs.mkdir(workspaceRoot, { recursive: true });
+    const sourcePath = path.join(workspaceRoot, "openclaw-workspace-state.json");
+    const legacyBytes = JSON.stringify({ version: 1 });
+    await fs.writeFile(sourcePath, legacyBytes);
+    await fs.writeFile(`${workspaceRoot}.attested`, `${LEGACY_WORKSPACE_ATTESTATION_HEADER}\n`);
+    const port = await getFreePort();
+    server = await start(port);
+    expect((await fetch(`http://127.0.0.1:${port}/readyz`)).status).toBe(200);
+    expect(await fs.readFile(sourcePath, "utf8")).toBe(legacyBytes);
   });
 
   it.each(["disk", "supplied snapshot"])(

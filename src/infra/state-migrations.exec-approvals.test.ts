@@ -185,7 +185,12 @@ describe("legacy exec approvals migration", () => {
     await writeLegacy(claimed ? `${sourcePath}.doctor-importing` : sourcePath, stub);
     const original = await fsp.readFile(claimed ? `${sourcePath}.doctor-importing` : sourcePath);
     setTestEnvValue("OPENCLAW_STATE_DIR", stateDir);
-    expect(() => loadExecApprovals()).toThrow(ExecApprovalsMigrationRequiredError);
+    if (canonical === "missing") {
+      expect(() => loadExecApprovals()).toThrow(ExecApprovalsMigrationRequiredError);
+    } else {
+      // Retained legacy bytes never override canonical policy, including fail-closed policy.
+      expect(loadExecApprovals().defaults?.security).toBe("deny");
+    }
 
     const result = await migrate();
 
@@ -447,6 +452,7 @@ describe("legacy exec approvals migration", () => {
     const result = await migrate();
 
     expect(result.changes).toEqual([]);
+    expect(result.warningDisposition).toBe("recoverable");
     expect(result.warnings[0]).toContain("Conflicting legacy exec approvals remain");
     expect(result.warnings[0]).toContain(sourcePath);
     expect(result.warnings[0]).toContain("reconcile this file");
@@ -456,6 +462,24 @@ describe("legacy exec approvals migration", () => {
     );
     expect(receipt()).toMatchObject({ removed_source: 0 });
   });
+
+  it.each([false, true])(
+    "retains malformed input with only valid canonical policy recoverable (%s)",
+    async (valid) => {
+      const file = { version: 1 as const, defaults: { security: "deny" as const }, agents: {} };
+      const raw = valid ? serializeExecApprovals(file) : "{invalid-canonical";
+      writeExecApprovalsConfigRow({ db: database(), file, raw });
+      const source = Buffer.from("{private-marker");
+      await fsp.writeFile(sourcePath, source);
+      const result = await migrate();
+      expect(result.warningDisposition).toBe(valid ? "recoverable" : undefined);
+      expect(result.warnings).toHaveLength(1);
+      expect(JSON.stringify(result)).not.toContain("private-marker");
+      expect(fs.readFileSync(sourcePath)).toEqual(source);
+      expect(readExecApprovalsConfigRow(database())?.raw_json).toBe(raw);
+      expect(receipt()).toMatchObject({ removed_source: 0 });
+    },
+  );
 
   it("repairs an invalid canonical row from validated legacy policy", async () => {
     const db = database();
@@ -474,6 +498,10 @@ describe("legacy exec approvals migration", () => {
   });
 
   it("preserves changed source bytes before claim and writes no receipt", async () => {
+    writeExecApprovalsConfigRow({
+      db: database(),
+      file: { version: 1, defaults: { security: "deny" } },
+    });
     await writeLegacy(sourcePath, { version: 1, agents: {} });
 
     const result = await migrate({
@@ -485,6 +513,7 @@ describe("legacy exec approvals migration", () => {
       },
     });
 
+    expect(result.warningDisposition).toBeUndefined();
     expect(result.warnings[0]).toContain("changed after migration loaded");
     expect(fs.existsSync(sourcePath)).toBe(true);
     expect(receipt()).toBeUndefined();

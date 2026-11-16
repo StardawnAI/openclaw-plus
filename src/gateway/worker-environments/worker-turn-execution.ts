@@ -13,6 +13,7 @@ import { applyEmbeddedAttemptToolsAllow } from "../../agents/embedded-agent-runn
 import { admitEmbeddedContextEngine } from "../../agents/embedded-agent-runner/run/context-engine-admission.js";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
 import { createModelVisibilityPolicy } from "../../agents/model-visibility-policy.js";
+import { runInPreparedModelRuntimeLease } from "../../agents/prepared-model-runtime-generation-scope.js";
 import { acquireAgentRunPreparedModelRuntime } from "../../agents/prepared-model-runtime.js";
 import {
   ackPendingAgentSteeringItems,
@@ -88,6 +89,10 @@ export async function executeWorkerTurn(
     },
     { pluginGeneration: input.pluginGeneration, abortSignal: input.abortSignal },
   );
+  const withRuntimeScope = <T>(run: () => T): T =>
+    runInPreparedModelRuntimeLease(preparedRuntime, () =>
+      withPluginRuntimeGenerationScope(preparedRuntime.snapshot, run),
+    );
   params.assertRunCurrent();
   input.abortSignal?.throwIfAborted();
   const turn = { ...input, config: preparedRuntime.snapshot.config };
@@ -162,51 +167,43 @@ export async function executeWorkerTurn(
       blocked = true;
     },
   };
-  const blockedResult = await withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
-    gateWorkerTurnInput(inputContext),
-  );
-  if (blockedResult) {
-    await releaseClaimIfOwned(params.placements, params.turnClaim);
-    return blockedResult;
-  }
-  await using contextEngineAdmission = await withPluginRuntimeGenerationScope(
-    preparedRuntime.snapshot,
-    () =>
-      admitEmbeddedContextEngine(
-        {
-          runParams: turn,
-          agentDir: preparedRuntime.snapshot.agentDir,
-          workspaceDir: turn.workspaceDir,
-        },
-        {
-          id: WORKER_CONTEXT_ENGINE_HOST.id,
-          contextEngineHostCapabilities: WORKER_CONTEXT_ENGINE_HOST.capabilities,
-        },
-      ),
+  await using contextEngineAdmission = await withRuntimeScope(() =>
+    admitEmbeddedContextEngine(
+      {
+        runParams: turn,
+        agentDir: preparedRuntime.snapshot.agentDir,
+        workspaceDir: turn.workspaceDir,
+      },
+      {
+        id: WORKER_CONTEXT_ENGINE_HOST.id,
+        contextEngineHostCapabilities: WORKER_CONTEXT_ENGINE_HOST.capabilities,
+      },
+    ),
   );
   assertContextCurrent();
-  if (recorder && turn.suppressNextUserMessagePersistence !== true && !recorder.hasPersisted()) {
-    const persisted = await recorder.persistApproved({
-      storageTarget: transcriptTarget,
-      cwd: params.workspace.kind === "local" ? params.workspace.path : placement.remoteWorkspaceDir,
-    });
-    if (persisted) {
-      turn.onUserMessagePersisted?.(persisted.message);
-    }
-    assertContextCurrent();
-  }
   const context = await readWorkerTurnInputContext(inputContext);
   const { manager, history, userMessageAlreadyPersisted } = context;
   let baseLeafId = context.baseLeafId;
 
-  const { model, reasoning, transcriptPolicy, inference } = await prepareWorkerTurnModel({
-    target: transcriptTarget,
-    modelRef,
-    runtimeSnapshot: preparedRuntime.snapshot,
-    inferencePlacement,
-    turn,
-    assertCurrent: assertContextCurrent,
-  });
+  const {
+    model,
+    reasoning,
+    transcriptPolicy,
+    inference: preparedInference,
+  } = await runInPreparedModelRuntimeLease(preparedRuntime, () =>
+    prepareWorkerTurnModel({
+      target: transcriptTarget,
+      modelRef,
+      runtimeSnapshot: preparedRuntime.snapshot,
+      inferencePlacement,
+      turn,
+      assertCurrent: assertContextCurrent,
+    }),
+  );
+  const inference = preparedInference
+    ? (...args: Parameters<typeof preparedInference>) =>
+        withRuntimeScope(() => preparedInference(...args))
+    : undefined;
 
   assertContextCurrent();
   const credential = await waitForTurnOperation({
@@ -351,7 +348,7 @@ export async function executeWorkerTurn(
         });
         placementTools.push(...desktop.tools);
         const availablePlacementTools = new Set(placementTools.map((tool) => tool.name));
-        const tools = await withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
+        const tools = await withRuntimeScope(() =>
           params.environments.createGatewayTools?.({
             identity,
             inheritedToolPolicySource: capabilityProfile.policy.inheritedToolPolicySource,
@@ -428,10 +425,7 @@ export async function executeWorkerTurn(
           tools: tools.map((tool) =>
             copyAgentToolMetadata(tool, {
               ...tool,
-              execute: (...args) =>
-                withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
-                  tool.execute(...args),
-                ),
+              execute: (...args) => withRuntimeScope(() => tool.execute(...args)),
             }),
           ),
         };
@@ -478,9 +472,7 @@ export async function executeWorkerTurn(
       },
       assertCurrent: assertActive,
     };
-    const promptContext = await withPluginRuntimeGenerationScope(preparedRuntime.snapshot, () =>
-      prepareWorkerTurnPrompt(promptPreparation),
-    );
+    const promptContext = await withRuntimeScope(() => prepareWorkerTurnPrompt(promptPreparation));
     const allowedToolNames = surface.tools.map((tool) => tool.definition.name);
     await params.placements.authorizeWorkerTurnTools(
       params.turnClaim,
@@ -502,6 +494,26 @@ export async function executeWorkerTurn(
       isAuthorized,
       signal,
     });
+    assertActive();
+    const blockedResult = await withRuntimeScope(() =>
+      gateWorkerTurnInput(inputContext, { ...media, prompt: turn.prompt, history }),
+    );
+    if (blockedResult) {
+      await releaseClaimIfOwned(params.placements, params.turnClaim);
+      return blockedResult;
+    }
+    if (recorder && turn.suppressNextUserMessagePersistence !== true && !recorder.hasPersisted()) {
+      const persisted = await recorder.persistApproved({
+        storageTarget: transcriptTarget,
+        cwd:
+          params.workspace.kind === "local" ? params.workspace.path : placement.remoteWorkspaceDir,
+      });
+      if (persisted) {
+        turn.onUserMessagePersisted?.(persisted.message);
+      }
+      assertContextCurrent();
+      baseLeafId = recorder.getAdmissionReceipt()?.entryId ?? baseLeafId;
+    }
     const skillResources = await prepareSkillResourceDelivery(
       turn.skillsSnapshot,
       () => {

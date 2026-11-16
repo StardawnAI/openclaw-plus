@@ -201,7 +201,7 @@ type GatewayKernelContext = {
     readonly hasPendingAgents: boolean;
     waitForAgentPreparation: (
       agentId: string,
-      options?: { signal?: AbortSignal },
+      options?: { signal?: AbortSignal; forWrite?: boolean },
     ) => Promise<void> | undefined;
   };
   channelAdmissionAudit?: import("../../channels/message-access/admission-evidence.js").ChannelAdmissionAudit;
@@ -472,7 +472,7 @@ export type GatewayRequestContext = GatewayKernelContext &
     /** Entry-only access; the kernel owns closure. Absent in embedded-only contexts. */
     requestEntryLifetime?: Pick<
       import("../server-request-entry.js").GatewayRequestEntryLifetime,
-      "enter" | "signal"
+      "enter" | "signal" | "retainedSignal"
     >;
   };
 

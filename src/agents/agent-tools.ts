@@ -48,6 +48,7 @@ import { isConversationToolAllowed } from "./conversation-tool-policy-pipeline.j
 import { createCoreCodingTools } from "./core-coding-tools.js";
 import { applyDelegationCapability } from "./delegation-capability.js";
 import { pinExecToolTarget } from "./exec-tool-target-pinning.js";
+import { resolveGatewayExecAuthority } from "./execution-authority.js";
 import { prepareGitHubToolEnvironment } from "./github-tool-identity.js";
 import { resolveExecToolConfig } from "./lazy-exec-tool.js";
 import { resolveLocalModelLeanPreserveToolNames } from "./local-model-lean.js";
@@ -427,6 +428,8 @@ function* assembleOpenClawCodingTools(
             sessionPortalTarget,
             sandboxSessionRenameOnly: capabilityProfile.policy.sandboxSessionRenameOnly,
             sessionPermissionPolicy,
+            delegationExecAuthority: () =>
+              resolveGatewayExecAuthority(options, scheduledCoreTools, callableTools),
             execSession: sessionPermissionPolicy
               ? { permissionMode: sessionPermissionPolicy.mode }
               : undefined,
@@ -483,9 +486,10 @@ function* assembleOpenClawCodingTools(
             inheritedToolDenylist,
             delegatedToolDenyFloor,
             requesterToolDenylist,
-            readDelegationConfig: options?.config
-              ? createRuntimeConfigReader(options.config)
-              : undefined,
+            // The admitted reader keeps its owner even when model config stays pinned.
+            readDelegationConfig:
+              options?.readDelegationConfig ??
+              (options?.config ? createRuntimeConfigReader(options.config) : undefined),
             inheritedToolPolicySource: capabilityProfile.policy.inheritedToolPolicySource,
             processScopeKey: scopeKey,
           },
@@ -721,12 +725,20 @@ export function createOpenClawCodingTools(options?: PluginCodingToolsOptions): A
     method: "createOpenClawCodingTools",
     replacement: "await createOpenClawCodingToolsAsync()",
   });
-  return createOpenClawCodingToolsInternal(options);
+  return createOpenClawCodingToolsInternal({
+    ...options,
+    unverifiedExecutionPolicy: true,
+    readDelegationConfig: undefined,
+  });
 }
 
 /** Build the SDK tool list with a fresh, source-bound exec policy. */
 export function createOpenClawCodingToolsAsync(
   options?: PluginCodingToolsOptions,
 ): Promise<AnyAgentTool[]> {
-  return createOpenClawCodingToolsInternalAsync(options);
+  return createOpenClawCodingToolsInternalAsync({
+    ...options,
+    unverifiedExecutionPolicy: true,
+    readDelegationConfig: undefined,
+  });
 }

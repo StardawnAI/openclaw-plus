@@ -269,11 +269,15 @@ describe("runtime snapshot state", () => {
     ).toBe(foreignConfig);
     setRuntimeConfigSnapshot(runtimeConfig, sourceConfig);
     const readRuntime = createRuntimeConfigReader(cloneConfigWithResolutionFacts(sourceConfig));
+    const readRuntimeCopy = createRuntimeConfigReader(
+      cloneConfigWithResolutionFacts(runtimeConfig),
+    );
     const readScoped = createRuntimeConfigReader(scopedResolvedConfig);
     const readForeign = createRuntimeConfigReader(foreignConfig);
     const nextConfig = { ...runtimeConfig, messages: { ackReactionScope: "all" as const } };
     setRuntimeConfigSnapshot(nextConfig, nextConfig);
     expect(readRuntime()).toBe(nextConfig);
+    expect(readRuntimeCopy()).toBe(nextConfig);
     expect(readScoped()).toBe(scopedResolvedConfig);
     expect(readForeign()).toBe(foreignConfig);
     expect(readUnbound()).toBe(scopedResolvedConfig);
@@ -689,7 +693,7 @@ describe("prepared runtime snapshots", () => {
       emits: true,
     },
     {
-      name: "invalidates a distinct object matching values edited in place on the published one",
+      name: "invalidates in-place value edits",
       next: (published: OpenClawConfig) => {
         published.gateway = { ...published.gateway, port: 19001 };
         return withTokenFacts({ gateway: { ...tokenConfig().gateway, port: 19001 } }, [
@@ -699,7 +703,7 @@ describe("prepared runtime snapshots", () => {
       emits: true,
     },
     {
-      name: "invalidates a distinct object matching provenance changed in place on the published one",
+      name: "invalidates in-place provenance edits",
       next: (published: OpenClawConfig) => {
         setConfigResolutionFacts(published, createConfigResolutionFacts([]));
         return withTokenFacts(tokenConfig(), []);

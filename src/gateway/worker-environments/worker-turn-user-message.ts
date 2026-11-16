@@ -13,6 +13,7 @@ import { SessionManager } from "../../agents/sessions/session-manager.js";
 import { withSessionTranscriptWriteAssertion } from "../../config/sessions/transcript-write-context.js";
 import { buildAgentHookContextChannelFields } from "../../plugins/hook-agent-context.js";
 import { getGlobalHookRunner } from "../../plugins/hook-runner-global.js";
+import type { PluginHookBeforeAgentRunEvent } from "../../plugins/hook-types.js";
 import { buildPersistedUserTurnMessage } from "../../sessions/user-turn-transcript.js";
 import type { prepareWorkerTurnMedia } from "./worker-turn-media.js";
 import { resolveWorkerTurnTranscriptTarget } from "./worker-turn-transcript-target.js";
@@ -82,31 +83,41 @@ type WorkerTurnInputParams = {
   onBlocked: () => void;
 };
 
-export async function gateWorkerTurnInput({
-  turn,
-  transcriptTarget,
-  identity,
-  modelRef,
-  startedAt,
-  assertCurrent,
-  onBlocked,
-}: WorkerTurnInputParams) {
+type WorkerTurnPreparedInput = Pick<
+  Awaited<ReturnType<typeof prepareWorkerTurnMedia>>,
+  "prompt" | "history" | "images"
+> &
+  Pick<PluginHookBeforeAgentRunEvent, "systemPrompt">;
+
+export async function gateWorkerTurnInput(
+  {
+    turn,
+    transcriptTarget,
+    identity,
+    modelRef,
+    startedAt,
+    assertCurrent,
+    onBlocked,
+  }: WorkerTurnInputParams,
+  event: WorkerTurnPreparedInput,
+) {
   const recorder = turn.userTurnTranscriptRecorder;
   const runner = getGlobalHookRunner();
   if (!runner?.hasHooks("before_agent_run")) {
     return undefined;
   }
-  const history = await SessionManager.openModelContextAsync(transcriptTarget, {
-    admission: recorder?.getAdmissionReceipt(),
-    signal: turn.abortSignal,
-  });
   assertCurrent();
   const channel = buildAgentHookContextChannelFields(turn);
   const block = await runBeforeAgentRunGate(
     runner,
     {
-      prompt: turn.prompt,
-      messages: convertToLlm(history.buildSessionContext().messages),
+      prompt:
+        typeof event.prompt === "string"
+          ? event.prompt
+          : event.prompt.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n"),
+      messages: convertToLlm(event.history),
+      images: event.images,
+      ...(event.systemPrompt === undefined ? {} : { systemPrompt: event.systemPrompt }),
       channelId: channel.channelId,
       accountId: turn.agentAccountId,
       senderId: turn.senderId ?? undefined,
@@ -165,7 +176,7 @@ export async function readWorkerTurnInputContext(params: WorkerTurnInputParams) 
   const recorder = turn.userTurnTranscriptRecorder;
   const receipt = recorder?.getAdmissionReceipt();
   const admission = receipt ? { ...receipt } : undefined;
-  if (recorder && !admission) {
+  if (recorder?.hasPersisted() && !admission) {
     throw new Error("Cloud worker turn has no readable canonical user admission");
   }
   const userMessageAlreadyPersisted =
@@ -177,12 +188,13 @@ export async function readWorkerTurnInputContext(params: WorkerTurnInputParams) 
     provider: modelRef.provider,
     model: modelRef.model,
   });
-  const manager = userMessageAlreadyPersisted
-    ? await SessionManager.openModelContextAsync(transcriptTarget, {
-        admission,
-        signal: turn.abortSignal,
-      })
-    : await SessionManager.openAsync(transcriptTarget, undefined, undefined, turn.abortSignal);
+  const manager =
+    recorder || userMessageAlreadyPersisted
+      ? await SessionManager.openModelContextAsync(transcriptTarget, {
+          admission,
+          signal: turn.abortSignal,
+        })
+      : await SessionManager.openAsync(transcriptTarget, undefined, undefined, turn.abortSignal);
   assertCurrent();
   const contextMessages = manager.buildSessionContext().messages;
   const leaf = manager.getLeafEntry();

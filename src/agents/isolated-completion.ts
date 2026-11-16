@@ -55,6 +55,7 @@ import {
   listModelCatalogObservedRoutes,
 } from "./model-catalog-view.js";
 import type { ModelRef } from "./model-ref-shared.js";
+import { runInPreparedModelRuntimeLease } from "./prepared-model-runtime-generation-scope.js";
 import { readAdmittedPublishedModelCatalog } from "./prepared-model-runtime.capture.js";
 import {
   acquireAgentRunPreparedModelRuntime,
@@ -731,7 +732,9 @@ async function runIsolatedCompletionOwned(
         usage: result.assistant.usage,
       };
     };
-    const result = await withPluginRuntimeGenerationScope(lease.snapshot, run);
+    const result = await runInPreparedModelRuntimeLease(lease, () =>
+      withPluginRuntimeGenerationScope(lease.snapshot, run),
+    );
     assertCurrent();
     if (!result.text && input.outputTextPolicy !== "strict-visible") {
       throw new IsolatedCompletionError(

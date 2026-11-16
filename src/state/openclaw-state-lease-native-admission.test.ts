@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { createOpenClawStateLeaseLostError } from "./openclaw-state-lease-error.js";
 import { withOpenClawStateLeaseWorkerAdmission } from "./openclaw-state-lease-worker-owner.js";
 import { OpenClawStateLeaseError, withOpenClawStateLease } from "./openclaw-state-lease.js";
 
@@ -16,7 +17,13 @@ vi.mock("./openclaw-state-lease-worker-storage.js", () => ({
   acquireLease: async () => ({ kind: "acquired", expiresAt: fixture.expiresAt }),
   createOpenClawStateLeaseWorkerStorage: fixture.forbiddenSqlite,
 }));
+// mock-isolation: Keep SQLite/storage outside this synthetic native-admission fixture.
 vi.mock("./openclaw-state-lease-storage.js", () => ({
+  createOpenClawStateLeaseLostErrorFromDatabase: (
+    identity: Parameters<typeof createOpenClawStateLeaseLostError>[0],
+    _database: unknown,
+    cause?: unknown,
+  ) => createOpenClawStateLeaseLostError(identity, cause),
   prepareLeaseDatabase: fixture.forbiddenSqlite,
   resolveLeaseDatabasePath: () => "/synthetic-state/lease.sqlite",
   verifyOpenClawStateLeaseOwnership: () => {

@@ -69,6 +69,7 @@ type DoctorManagedRepairOutcome =
   | "config-refused"
   | "workspace-cleanup-failed"
   | "approvals-malformed"
+  | "approvals-malformed-canonical"
   | "approvals-conflicting"
   | "approvals-migrated"
   | "restart-unhealthy"
@@ -113,20 +114,20 @@ export function registerDoctorManagedRepairTests(outcomes: readonly DoctorManage
         mocks.config.mockReturnValue(cfg);
         const configBefore = fs.readFileSync(state.configPath);
         const approvalsCase = outcome.startsWith("approvals-");
-        const approvalsBlocked = approvalsCase && outcome !== "approvals-migrated";
+        const approvalsBlocked = outcome === "approvals-malformed";
+        const approvalsRetained = approvalsCase && outcome !== "approvals-migrated";
         const approvalsPath = state.statePath("exec-approvals.json");
         const canonicalApprovals = {
           version: 1 as const,
           defaults: { security: "deny" as const },
           agents: {},
         };
-        const approvalsBefore =
-          outcome === "approvals-malformed"
-            ? '{"version":1,"agents":'
-            : serializeExecApprovals({ version: 1, defaults: { security: "full" }, agents: {} });
+        const approvalsBefore = outcome.startsWith("approvals-malformed")
+          ? '{"version":1,"agents":'
+          : serializeExecApprovals({ version: 1, defaults: { security: "full" }, agents: {} });
         if (approvalsCase) {
           fs.writeFileSync(approvalsPath, approvalsBefore);
-          if (outcome === "approvals-conflicting") {
+          if (outcome === "approvals-conflicting" || outcome === "approvals-malformed-canonical") {
             writeExecApprovalsConfigRow({
               db: openOpenClawStateDatabase({ env: state.env }).db,
               file: canonicalApprovals,
@@ -305,7 +306,10 @@ export function registerDoctorManagedRepairTests(outcomes: readonly DoctorManage
                 doctorOnlyStateMigrations: true,
               }),
             });
-            expect(approvals.warnings.length > 0).toBe(approvalsBlocked);
+            expect(approvals.warnings.length > 0).toBe(approvalsRetained);
+            expect(approvals.warningDisposition).toBe(
+              approvalsRetained && !approvalsBlocked ? "recoverable" : undefined,
+            );
             await collectSecurityWarnings(ctx.cfg, state.env);
           }
           if (
@@ -499,7 +503,7 @@ export function registerDoctorManagedRepairTests(outcomes: readonly DoctorManage
             outcome === "restart-unhealthy" ||
             outcome === "clean-stopped-repair" ||
             outcome === "clean-force-repair" ||
-            approvalsBlocked ||
+            approvalsRetained ||
             outcome === "approvals-migrated" ||
             outcome === "update-legacy";
           expect(events).toEqual(
@@ -528,16 +532,23 @@ export function registerDoctorManagedRepairTests(outcomes: readonly DoctorManage
             );
           }
           if (approvalsCase) {
-            if (approvalsBlocked) {
+            if (approvalsRetained) {
               expect(fs.readFileSync(approvalsPath, "utf8")).toBe(approvalsBefore);
-              expect(() => loadExecApprovalsReadOnly()).toThrow(
-                ExecApprovalsMigrationRequiredError,
-              );
+              if (approvalsBlocked) {
+                expect(() => loadExecApprovalsReadOnly()).toThrow(
+                  ExecApprovalsMigrationRequiredError,
+                );
+              } else {
+                expect(loadExecApprovalsReadOnly().defaults?.security).toBe("deny");
+              }
             } else {
               expect(fs.existsSync(approvalsPath)).toBe(false);
               expect(loadExecApprovalsReadOnly().defaults?.security).toBe("full");
             }
-            if (outcome === "approvals-conflicting") {
+            if (
+              outcome === "approvals-conflicting" ||
+              outcome === "approvals-malformed-canonical"
+            ) {
               expect(
                 readExecApprovalsConfigRow(openOpenClawStateDatabase({ env: state.env }).db)
                   ?.raw_json,
@@ -549,7 +560,7 @@ export function registerDoctorManagedRepairTests(outcomes: readonly DoctorManage
             outcome === "interactive-ready" ||
             clean ||
             archiveVerification ||
-            outcome === "approvals-migrated"
+            (approvalsCase && !approvalsBlocked)
           ) {
             expect(mocks.outro).toHaveBeenCalledWith("Doctor complete.");
           } else {

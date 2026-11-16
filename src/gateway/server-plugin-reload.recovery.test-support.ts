@@ -12,7 +12,7 @@ import {
   createPluginCommandRuntime,
   type PluginCommandCatalogDecision,
 } from "../plugins/plugin-command-runtime.js";
-import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
+import { getPluginInstance, pluginInvocationContext } from "../plugins/plugin-instance-scope.js";
 import { retainGatewayPluginMetadata } from "../plugins/plugin-metadata-lifecycle.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
@@ -61,6 +61,7 @@ export async function createPluginReloadRecoveryFixture(
       record: ReturnType<typeof createPluginRecord>,
     ) => void;
     abortOnCandidateStart?: boolean;
+    automatic?: boolean;
     waitForDrain?: boolean;
     drainSignal?: AbortSignal;
     checkpoint?: Parameters<typeof reloadGatewayPlugins>[1]["checkpoint"];
@@ -149,67 +150,70 @@ export async function createPluginReloadRecoveryFixture(
     loadModules?: boolean;
     moduleRecoveries?: ReadonlyMap<string, unknown>;
   }) => {
-    const candidate = createBuilder();
-    if (loadModules) {
-      (moduleRecoveries ? recoveries : candidates).push(candidate);
-    }
-    const register = (
-      pluginOwner: "first" | "sibling",
-      record: ReturnType<typeof createPluginRecord>,
-    ) => {
-      const api = candidate.createApi(record, { config: cfg });
-      try {
-        options.register?.(api, pluginOwner, record);
-      } catch (error) {
-        record.status = "error";
-        record.error = error instanceof Error ? error.message : String(error);
-        throw new PluginLoadFailureError(candidate.registry, [record]);
-      }
-      return api;
-    };
-    if (!replacePluginIds.has("first")) {
-      const retained = registryOwner.registry.plugins.find((record) => record.id === "first");
-      assert(retained);
-      candidate.registry.plugins.push(retained);
-      projectPluginContributions(registryOwner.registry, retained, candidate.registry);
-    } else if (cfg.plugins?.entries?.first?.enabled !== false) {
-      const record = createPluginRecord({ id: "first" });
-      candidate.registry.plugins.push(record);
+    // Match the real loader: construction never borrows a caller turn's execution scope.
+    return pluginInvocationContext.exit(() => {
+      const candidate = createBuilder();
       if (loadModules) {
-        const api = register("first", record);
-        api.registerService(
-          moduleRecoveries
-            ? { id: "first", start: firstStart, stop: firstStop }
-            : {
-                id: "first",
-                start: () => {
-                  aborted = options.abortOnCandidateStart !== false;
-                  options.candidateStart?.();
+        (moduleRecoveries ? recoveries : candidates).push(candidate);
+      }
+      const register = (
+        pluginOwner: "first" | "sibling",
+        record: ReturnType<typeof createPluginRecord>,
+      ) => {
+        const api = candidate.createApi(record, { config: cfg });
+        try {
+          options.register?.(api, pluginOwner, record);
+        } catch (error) {
+          record.status = "error";
+          record.error = error instanceof Error ? error.message : String(error);
+          throw new PluginLoadFailureError(candidate.registry, [record]);
+        }
+        return api;
+      };
+      if (!replacePluginIds.has("first")) {
+        const retained = registryOwner.registry.plugins.find((record) => record.id === "first");
+        assert(retained);
+        candidate.registry.plugins.push(retained);
+        projectPluginContributions(registryOwner.registry, retained, candidate.registry);
+      } else if (cfg.plugins?.entries?.first?.enabled !== false) {
+        const record = createPluginRecord({ id: "first" });
+        candidate.registry.plugins.push(record);
+        if (loadModules) {
+          const api = register("first", record);
+          api.registerService(
+            moduleRecoveries
+              ? { id: "first", start: firstStart, stop: firstStop }
+              : {
+                  id: "first",
+                  start: () => {
+                    aborted = options.abortOnCandidateStart !== false;
+                    options.candidateStart?.();
+                  },
+                  stop: async () => await candidateStop(),
                 },
-                stop: async () => await candidateStop(),
-              },
-        );
+          );
+        }
       }
-    }
-    if (replacePluginIds.has("sibling")) {
-      const record = createPluginRecord({ id: "sibling" });
-      candidate.registry.plugins.push(record);
-      if (loadModules) {
-        const api = register("sibling", record);
-        api.registerService({ id: "sibling", start: siblingStart, stop: siblingStop });
+      if (replacePluginIds.has("sibling")) {
+        const record = createPluginRecord({ id: "sibling" });
+        candidate.registry.plugins.push(record);
+        if (loadModules) {
+          const api = register("sibling", record);
+          api.registerService({ id: "sibling", start: siblingStart, stop: siblingStop });
+        }
+      } else {
+        const retained = registryOwner.registry.plugins.find((record) => record.id === "sibling");
+        assert(retained);
+        candidate.registry.plugins.push(retained);
+        projectPluginContributions(registryOwner.registry, retained, candidate.registry);
       }
-    } else {
-      const retained = registryOwner.registry.plugins.find((record) => record.id === "sibling");
-      assert(retained);
-      candidate.registry.plugins.push(retained);
-      projectPluginContributions(registryOwner.registry, retained, candidate.registry);
-    }
-    return {
-      pluginRegistry: candidate.registry,
-      resolvedConfig: cfg,
-      gatewayMethods: [],
-      retireGatewayRuntimeBindings: vi.fn(),
-    };
+      return {
+        pluginRegistry: candidate.registry,
+        resolvedConfig: cfg,
+        gatewayMethods: [],
+        retireGatewayRuntimeBindings: vi.fn(),
+      };
+    });
   };
   const lifetime = createGatewaySidecarStopOwner();
   const scheduler = createTestGatewayScheduler();
@@ -327,13 +331,15 @@ export async function createPluginReloadRecoveryFixture(
           prepareConfigEffects:
             options.prepareConfigEffects ??
             (() => ({ retire: () => {}, rollback: rollbackConfigEffects })),
-          pluginLifecycle: {
-            reason: "reload",
-            waitForDrain: options.waitForDrain,
-            drainSignal: options.drainSignal,
-            operationId: "service-recovery",
-            pluginIds,
-          },
+          pluginLifecycle: options.automatic
+            ? undefined
+            : {
+                reason: "reload",
+                waitForDrain: options.waitForDrain,
+                drainSignal: options.drainSignal,
+                operationId: "service-recovery",
+                pluginIds,
+              },
           commitRuntime: async (publication) => {
             await options.beforePublish?.();
             publication?.publish();

@@ -1,11 +1,16 @@
 import type { SessionTreeEntry } from "@openclaw/agent-core";
-import { sql } from "kysely";
-import { jsonArrayFrom, jsonObjectFrom } from "../../infra/database-engine/json-values.js";
+import { sql, type SqlBool } from "kysely";
+import {
+  jsonArrayFrom,
+  jsonObjectFrom,
+  jsonNativeFieldsValid,
+} from "../../infra/database-engine/json-values.js";
 import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
   sqliteStringSet,
 } from "../../infra/kysely-sync.js";
+import { isPostgresSqlConnection } from "../../infra/sql-connection.js";
 import { getAdmittedSqliteSchemaFacts } from "../../infra/sqlite-schema-facts.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db-contract.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
@@ -33,6 +38,7 @@ import { canonicalSessionValidationQuery } from "./session-canonical-key.js";
 import { sessionColdArchiveMetadataColumns } from "./session-cold-storage-state.js";
 import { sessionEntrySnapshotColumnsForKeys } from "./session-entry-snapshots.js";
 import { sessionEntryWindowColumns } from "./session-entry-window.types.js";
+import { projectSessionModelContextNavigation } from "./session-model-context-navigation.js";
 import { projectSessionTranscriptFacts } from "./session-transcript-projection-facts.js";
 import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
 import { collectSessionEntryLookupKeys } from "./store-entry.js";
@@ -288,6 +294,10 @@ export function hydrateSessionActorState(
               "seq",
               "navigation_type",
               "navigation_valid",
+              (isPostgresSqlConnection(database.db)
+                ? jsonNativeFieldsValid(database.db, sql`event_json`)
+                : sql.lit<SqlBool>(1)
+              ).as("native"),
               transcriptEventModelNavigationSql(database.db).as("navigation_json"),
               /* kysely-allow-raw: retain exact stored JSONL sizes without loading payloads. */
               sql<number>`${transcriptEventReadBytesSql()} + 1`.as("serialized_bytes"),
@@ -375,13 +385,16 @@ export function hydrateSessionActorState(
   const storedNavigation = selected
     ? decodeJsonProjection(selected.actor_navigation).toSorted((a, b) => a.seq - b.seq)
     : [];
-  const navigation = storedNavigation.map((row) =>
-    Object.assign(
-      // SAFETY: The canonical model codec preserves discriminants with readable empty payloads.
-      JSON.parse(row.navigation_json) as SessionTreeEntry,
-      { seq: row.seq },
-    ),
-  );
+  const navigation = storedNavigation.map((row) => {
+    // SAFETY: The canonical model codec preserves discriminants with readable empty payloads.
+    const navigationEntry = JSON.parse(row.navigation_json) as SessionTreeEntry;
+    return Object.assign(
+      row.native ? navigationEntry : projectSessionModelContextNavigation(navigationEntry),
+      {
+        seq: row.seq,
+      },
+    );
+  });
   const contextVersion = {
     generation: rewrite?.generation ?? null,
     rawSeq: coldArchive?.last_seq ?? navigation.at(-1)?.seq ?? null,

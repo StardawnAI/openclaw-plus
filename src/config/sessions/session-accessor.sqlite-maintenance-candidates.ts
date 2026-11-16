@@ -1,5 +1,7 @@
 import { toUSVString } from "node:util";
 import { sql } from "kysely";
+import { engineIndexHint } from "../../infra/database-engine/index-hint.js";
+import { jsonNativeFieldsValid, jsonPickObject } from "../../infra/database-engine/json-values.js";
 import { iterateSqliteQuerySync, sqliteStringSet } from "../../infra/kysely-sync.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
@@ -33,19 +35,18 @@ const maintenanceFields = [
 function maintenanceCandidates(database: Pick<OpenClawAgentDatabase, "db">) {
   // json_each preserves absent/null fields and JSON subtypes. Uncertified rows
   // keep the full parser contract, including malformed and overdepth payloads.
+  const entry =
+    /* kysely-allow-raw: fixed canonical metadata column. */ sql.ref<string>("entry_json");
   const projection =
-    /* kysely-allow-raw: maintenance reads only phase facts from certified rows. */ sql<string>`CASE WHEN entry_valid = 1 AND json_valid(entry_json)
-    THEN (SELECT json_group_object(key, CASE type
-      WHEN 'object' THEN json(value) WHEN 'array' THEN json(value)
-      WHEN 'true' THEN json('true') WHEN 'false' THEN json('false')
-      ELSE value END) FROM json_each(entry_json) WHERE key IN (${sql.join(maintenanceFields)}))
-    ELSE entry_json END`.as("entry_json");
+    /* kysely-allow-raw: exceptional metadata remains canonical text for the existing parser. */ sql<string>`CASE WHEN entry_valid = 1 AND ${jsonNativeFieldsValid(database.db, entry)} THEN ${jsonPickObject(database.db, entry, maintenanceFields)} ELSE entry_json END`.as(
+      "entry_json",
+    );
   return getSessionKysely(database.db)
     .selectFrom("session_nodes")
     .select([projection, "current_session_id", "session_key", "updated_at", "archived_at"])
     .modifyEnd(
       /* kysely-allow-raw: stream age bounds without sorting the entire active store. */
-      sql`INDEXED BY idx_agent_session_nodes_updated_at`,
+      engineIndexHint(database.db, "idx_agent_session_nodes_updated_at"),
     );
 }
 
@@ -135,6 +136,7 @@ export function readSessionMaintenanceCapCandidates(params: {
   overflow: number;
   readPreserveKeys: () => ReadonlySet<string> | undefined;
   preserveRecentMs?: number | null;
+  deferArchiving?: boolean;
 }): { store: Record<string, SessionEntry>; durableNoCandidates: boolean } {
   if (params.overflow <= 0) {
     return { store: {}, durableNoCandidates: false };
@@ -201,6 +203,7 @@ export function readSessionMaintenanceCapCandidates(params: {
         entry,
         preserveKeys: params.readPreserveKeys(),
         preserveRecentMs: params.preserveRecentMs,
+        deferArchiving: params.deferArchiving,
       })
     ) {
       continue;

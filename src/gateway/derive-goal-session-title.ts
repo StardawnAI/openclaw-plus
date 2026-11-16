@@ -5,6 +5,7 @@
  */
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { stripInboundMetadata } from "../auto-reply/reply/strip-inbound-meta.js";
+import { isInternalWakeSessionTitleSource } from "../sessions/session-title-source.js";
 
 const DERIVED_GOAL_TITLE_MAX_LEN = 60;
 
@@ -101,7 +102,7 @@ export function deriveGoalSessionTitle(
   firstUserMessage?: string | null,
   maxLen = DERIVED_GOAL_TITLE_MAX_LEN,
 ): string | undefined {
-  if (!firstUserMessage) {
+  if (!firstUserMessage || isInternalWakeSessionTitleSource(firstUserMessage)) {
     return undefined;
   }
   const stripped = stripInboundMetadata(firstUserMessage).replace(/\s+/g, " ").trim();

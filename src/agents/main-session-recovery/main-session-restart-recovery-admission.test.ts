@@ -203,13 +203,14 @@ describe("startup recovery admission", () => {
         .mockImplementation((bootId, recoveryEnv, _now, assertCurrent) =>
           recordRecovery(bootId, recoveryEnv, Date.now(), assertCurrent),
         );
+      const cfg = {};
       const startupCheckedStorePaths = new Set<string>();
       const notice = vi.spyOn(runtime, "sendRecoveryNotice");
       if (action === "resume") {
         await withEnvAsync({ OPENCLAW_STATE_DIR: tmpDir }, () =>
           markGatewayStartupMainSessionOrphans(
             {
-              gatewayPluginConfigAtStart: {},
+              getConfig: () => cfg,
               isRestartRecoverySuppressed: () => suppression !== null,
               scheduler: lifetime,
               log: { warn: vi.fn() },

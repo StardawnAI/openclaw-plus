@@ -1,4 +1,6 @@
+import { once } from "node:events";
 import fs from "node:fs";
+import { createConnection } from "node:net";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Worker } from "node:worker_threads";
@@ -305,6 +307,7 @@ it.for([
     const preparationRelease = createDeferredCore();
     const preparationEntered = createDeferredCore();
     const maintenanceCompleted = createDeferredCore();
+    const dispatched = createDeferredCore();
     let sessionPrepared = false;
     let preparationParent: number | undefined;
     let brokerPid: number | undefined;
@@ -461,7 +464,14 @@ it.for([
           refusal: { agentId, code: "agent-database-inspection-failed", paths: [agentPath] },
         });
         expect(fs.readFileSync(agentPath)).toEqual(agentBytes);
-        await expect(fetch(`http://127.0.0.1:${port}/readyz`)).rejects.toThrow();
+        // A proxy can turn a refused HTTP connection into a 502 response. Check
+        // the local listener directly, without changing the process proxy policy.
+        const socket = createConnection({ host: "127.0.0.1", port });
+        try {
+          await expect(once(socket, "connect")).rejects.toMatchObject({ code: "ECONNREFUSED" });
+        } finally {
+          socket.destroy();
+        }
         return;
       }
       server = await startup;
@@ -508,16 +518,6 @@ it.for([
         message: "Synthetic startup dispatch",
         idempotencyKey: `startup-dispatch-${agentId}`,
       };
-      if (outcome === "recover") {
-        chatClient = await connectWebchatClient({ port });
-        expect(await rpcReq(chatClient, "chat.send", chatParams)).toMatchObject({
-          ok: false,
-          error: {
-            code: "UNAVAILABLE",
-            details: { code: "agent-database-inspection-pending", agentId },
-          },
-        });
-      }
       if (paused) {
         expect(readAgentDatabaseAdmissionRefusal(agentId, { env })).toMatchObject({
           code: "agent-database-inspection-pending",
@@ -610,6 +610,20 @@ it.for([
           code: "agent-database-inspection-pending",
         });
         if (outcome === "recover") {
+          chatClient = await connectWebchatClient({ port });
+          gatewayReplyMock.mockImplementationOnce(async () => {
+            dispatched.resolve();
+            return { text: "Synthetic startup reply" };
+          });
+          expect(await rpcReq(chatClient, "chat.send", chatParams)).toMatchObject({
+            ok: false,
+            error: {
+              code: "UNAVAILABLE",
+              retryable: true,
+              details: { reason: "startup-sidecars", method: "chat.send" },
+            },
+          });
+          expect(gatewayReplyMock).not.toHaveBeenCalled();
           const active = getActiveSecretsRuntimeSnapshot()!;
           const source = structuredClone(active.sourceConfig);
           source.models = {
@@ -687,11 +701,6 @@ it.for([
           false,
         );
         expect((await fetch(`http://127.0.0.1:${port}/readyz`)).status).toBe(200);
-        const dispatched = createDeferredCore();
-        gatewayReplyMock.mockImplementationOnce(async () => {
-          dispatched.resolve();
-          return { text: "Synthetic startup reply" };
-        });
         expect(await rpcReq(chatClient!, "chat.send", chatParams)).toMatchObject({ ok: true });
         await withinTest(dispatched.promise, signal);
         if (checkHostJournalReads) {

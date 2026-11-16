@@ -27,7 +27,11 @@ import type {
 import type { ApplicationGatewayPhase, ApplicationGatewaySnapshot } from "../../app/gateway.ts";
 import type { AuthenticatedUser } from "../../app/user-profile.ts";
 import type { GatewayConnectionScope } from "../gateway-connection-lifecycle.ts";
-import type { SessionCreateOutcome, SessionCreateParams } from "./create.ts";
+import type {
+  SessionCreateOutcome,
+  SessionCreateParams,
+  SessionCreateRequestOptions,
+} from "./create.ts";
 import type { SessionGroupSettings } from "./custom-groups.ts";
 import type {
   GitHubPublicationController,
@@ -303,9 +307,12 @@ export type SessionCapability = {
   capturePermissionObservation: (key: string, agentId?: string | null) => () => boolean;
   createResult: (
     params?: SessionCreateParams,
-    options?: { reconciliation?: SessionCreateReconciliation },
+    options?: SessionCreateRequestOptions & { reconciliation?: SessionCreateReconciliation },
   ) => Promise<SessionCreateOutcome | null>;
-  create: (params?: SessionCreateParams) => Promise<string | null>;
+  create: (
+    params?: SessionCreateParams,
+    options?: SessionCreateRequestOptions,
+  ) => Promise<string | null>;
   recover: (params: { key: string; agentId?: string }) => Promise<SessionsRecoverResult | null>;
   patch: SessionPatchRoute;
   patchMany: (
@@ -365,7 +372,11 @@ export type SessionCapability = {
     key: string,
     path: string,
     content: string,
-    options: { agentId?: string | null; expectedHash: string },
+    options: {
+      agentId?: string | null;
+      expectedHash: string;
+      expectedSource?: SessionWorkspaceGetResult["source"];
+    },
   ) => Promise<SessionWorkspaceSetResult | null>;
   subscribeMessages: (
     key: string,

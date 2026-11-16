@@ -49,9 +49,11 @@ import { resolveLegacyInheritedAuthDir } from "../legacy-inherited-auth-dir.js";
 import { resolveModelCandidateChain } from "../model-fallback-candidates.js";
 import {
   getPreparedModelRuntimePluginGeneration,
+  runInPreparedModelRuntimeLease,
   runOutsidePreparedModelRuntimePluginGenerationScope,
   withPreparedModelRuntimePluginGenerationScope,
 } from "../prepared-model-runtime-generation-scope.js";
+import { copyPreparedModelRuntimeSnapshotBindings } from "../prepared-model-runtime.capture.js";
 import {
   PreparedModelRuntimeInitialRunAdmissionError,
   PreparedModelRuntimeOwnerNotPublishedError,
@@ -422,6 +424,10 @@ async function runEmbeddedAgentForSession(
               ...preparedModelRuntimeOwnerSnapshot,
               ...projects,
             });
+            copyPreparedModelRuntimeSnapshotBindings(
+              preparedModelRuntimeOwnerSnapshot,
+              preparedModelRuntime,
+            );
             const runPrepared = async () => {
               params = refresh.withDeliveryCallbacks(params);
               const preparedAgentId = workspaceResolution.agentId;
@@ -599,10 +605,12 @@ async function runEmbeddedAgentForSession(
               });
             };
             const runWithPreparedRuntime = () =>
-              withPluginRuntimeGenerationScope(preparedModelRuntime, () => {
-                context = AsyncLocalStorage.snapshot();
-                return runPrepared();
-              });
+              runInPreparedModelRuntimeLease(preparedModelRuntimeLease, () =>
+                withPluginRuntimeGenerationScope(preparedModelRuntime, () => {
+                  context = AsyncLocalStorage.snapshot();
+                  return runPrepared();
+                }),
+              );
             return params.pluginGeneration
               ? await withPreparedModelRuntimePluginGenerationScope(
                   preparedModelRuntimeLease.pluginGeneration,

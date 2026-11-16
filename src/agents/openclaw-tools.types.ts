@@ -114,6 +114,8 @@ export type OpenClawSharedToolsOptions = {
 };
 
 export type OpenClawToolsOptions = {
+  /** Host-owned policy binding; used only by the delegation authority reader. */
+  readDelegationConfig?: () => OpenClawConfig;
   /** Host-projected default sandbox surface; cannot execute other session actions. */
   sandboxSessionRenameOnly?: boolean;
   /** Host-issued source for session-control schema projection; execution rechecks the caller. */
@@ -124,6 +126,7 @@ export type OpenClawToolsOptions = {
   allowHostBrowserControl?: boolean;
   agentSessionKey?: string;
   agentChannel?: string;
+  abortSignal?: AbortSignal;
   /** Host-bound standalone request/grant authority, never supplied by tool arguments. */
   assertInvocationCurrent?: () => void;
   assertInputCommitAllowed?: () => void;
@@ -131,6 +134,8 @@ export type OpenClawToolsOptions = {
   execSession?: ExecSessionDefaults;
   /** Effective run-local exec overrides, including prepared permission mode. */
   execOverrides?: ExecPolicyOverrides & { mode?: ExecMode };
+  /** Host-owned proof of the final surviving core execution surface. */
+  delegationExecAuthority?: () => "gateway-host" | undefined;
   /** Trusted operator devices allowed to review this run's terminal input. */
   approvalReviewerDeviceIds?: string[];
   /** Trusted account used for authorization; delivery keeps agentAccountId. */

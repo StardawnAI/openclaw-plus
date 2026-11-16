@@ -81,6 +81,7 @@ function emptyResult(): CronSchedulerResult {
     accepted: [],
     rejected: [],
     launches: [],
+    preparing: [],
     skipped: [],
     notifications: [],
     logs: [],
@@ -268,7 +269,8 @@ function boundedCatchup(
   snapshot: CronSchedulerSnapshot,
   nowMs: number,
   result: CronSchedulerResult,
-  options?: { skipJobIds?: string[]; deferAgentWork?: boolean; liveSinceMs?: number },
+  options: { skipJobIds?: string[]; deferAgentWork?: boolean; liveSinceMs?: number } | undefined,
+  lateWake: boolean,
 ): { immediate: CronJob[]; overflow: Map<string, StartupOverflow> } {
   const { config } = snapshot;
   const maxImmediate = Math.max(
@@ -333,7 +335,10 @@ function boundedCatchup(
             }
             if (
               config.cronConfig?.skipMissedJobs &&
-              (job.schedule.kind === "cron" || job.schedule.kind === "every")
+              (job.schedule.kind === "cron" || job.schedule.kind === "every") &&
+              // A wake that is only late, with no restart or clock jump, still runs the slot
+              // that came due while this Gateway was up.
+              !(lateWake && job.state.nextRunAtMs !== undefined && job.state.nextRunAtMs <= nowMs)
             ) {
               if (
                 recomputeJobNextRunAtMs({ state, job, nowMs, deferredNotifications: notifications })
@@ -456,9 +461,10 @@ export function runCronSchedulerInWorker(
   const elapsedWallMs = actor.lastWallMs === undefined ? 0 : nowMs - actor.lastWallMs;
   const elapsedMonotonicMs =
     actor.lastMonotonicMs === undefined ? 0 : monotonicMs - actor.lastMonotonicMs;
+  const clockJumped = elapsedWallMs - elapsedMonotonicMs > MIN_REFIRE_GAP_MS;
+  // Refreshes keep the last tick's baselines, so a later tick still sees this jump.
   actor.catchupNeeded ||=
-    elapsedWallMs - elapsedMonotonicMs > MIN_REFIRE_GAP_MS ||
-    (actor.wakeAtMs !== undefined && nowMs > actor.wakeAtMs + MIN_REFIRE_GAP_MS);
+    clockJumped || (actor.wakeAtMs !== undefined && nowMs > actor.wakeAtMs + MIN_REFIRE_GAP_MS);
   const forwardJump = actor.catchupNeeded;
   const result = emptyResult();
   collectChanges(result, settleCronStartupBatchInWorker(database, input.storeKey, nowMs));
@@ -487,6 +493,7 @@ export function runCronSchedulerInWorker(
         nowMs,
         result,
         command.type === "cron.schedulerStart" ? command.input : undefined,
+        !starting && !clockJumped,
       );
       candidates = catchup.immediate;
       overflow = catchup.overflow;
@@ -569,12 +576,14 @@ export function runCronSchedulerInWorker(
           requests: input.requests ?? [],
           maxConcurrentRuns: DEFAULT_CRON_MAX_CONCURRENT_RUNS,
           schedulingPaused: input.paused,
+          preparingAgentIds: snapshot.config.preparingAgentIds,
         },
         jobs,
       );
       result.accepted.push(...requested.accepted);
       result.rejected.push(...requested.rejected);
       result.launches.push(...requested.launches);
+      result.preparing.push(...requested.preparing);
       result.skipped.push(...requested.skipped);
       result.jobs.push(...requested.accepted.map((entry) => entry.job));
       result.jobs.push(...requested.launches.map((entry) => entry.job));

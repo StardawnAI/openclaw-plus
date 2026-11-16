@@ -185,9 +185,24 @@ export async function assertDoctorMaintenanceReady(
   }
   const { assertConfiguredWorkspaceStateReady } = await import("../agents/workspace-state-dirs.js");
   await assertConfiguredWorkspaceStateReady({ cfg, operation: "doctor" });
-  const { assertNoPendingLegacyExecApprovals } =
-    await import("../infra/exec-approvals-migration-gate.js");
-  assertNoPendingLegacyExecApprovals({ operation: "doctor", env });
+  const { readExecApprovalsPolicyReadOnlyAsync } = await import("../infra/exec-approvals-store.js");
+  try {
+    const policy = await readExecApprovalsPolicyReadOnlyAsync({ env });
+    if (!policy.revision) {
+      throw new Error("Exec approvals policy could not be verified for Doctor completion.");
+    }
+  } catch (error) {
+    if (!(error instanceof ExecApprovalsMigrationRequiredError)) {
+      throw error;
+    }
+    const { resolveExecApprovalsDisplayPath } = await import("../infra/exec-approvals-config.js");
+    throw new ExecApprovalsMigrationRequiredError(
+      resolveExecApprovalsDisplayPath(env),
+      "doctor",
+      "Exec approvals require reconciliation",
+      env,
+    );
+  }
   if (!schemaPublicationDeferred && databaseTargets) {
     const { completeDoctorMigrationBackups } =
       await import("./doctor-migration-backup-artifacts.js");
@@ -231,7 +246,7 @@ export function assertDoctorMaintenanceInspection(
     `Gateway service ownership or shutdown could not be verified. Run ${formatCliCommand("openclaw gateway status --deep", env)} and stop it through its service owner before retrying.`;
   const guidance =
     kind === "foreign"
-      ? `Run ${formatCliCommand("openclaw gateway status --deep", env)} to locate the Gateway's installation, then run ${formatCliCommand("openclaw doctor --fix", env)} from that installation. The service was left unchanged.`
+      ? `Run ${formatCliCommand("openclaw gateway status --deep", env)} to find the Gateway installation. If an operator-owned launcher override points there, update or remove that override; reinstalling alone will not fix it. Inspect systemd overrides with systemctl cat (--user for user services). The service was left unchanged.`
       : `Stop the Gateway service and other OpenClaw processes using this state, then run ${formatCliCommand("openclaw doctor --fix", env)} from an independent shell.`;
   throw new DoctorMaintenanceRefusalError(
     `Doctor could not enter maintenance. Error: ${detail} ${guidance}`,

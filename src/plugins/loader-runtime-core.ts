@@ -35,6 +35,7 @@ import {
 import type { PluginLoadOptions } from "./loader-types.js";
 import { loadPluginManifestRegistryCore } from "./manifest-registry.js";
 import { getPluginCache } from "./plugin-cache.js";
+import { pluginInvocationContext } from "./plugin-instance-scope.js";
 import { normalizePluginPolicyId } from "./plugin-policy-id.js";
 import { createPluginIdScopeSet, normalizePluginIdScope } from "./plugin-scope.js";
 import { projectPluginContributions } from "./registry-contributions.js";
@@ -166,8 +167,21 @@ export function loadOpenClawPluginsCore(
   return step.value;
 }
 
-/** One registration sequence, consumed synchronously by CLI/SDK callers or incrementally by hosts. */
+/** Incremental registry construction has finite custody, never inherited turn execution work. */
 export function* loadOpenClawPluginsSteps(
+  ...args: Parameters<typeof loadOpenClawPluginsStepsUnscoped>
+): Generator<void, PluginRegistry> {
+  const steps = loadOpenClawPluginsStepsUnscoped(...args);
+  for (;;) {
+    const step = pluginInvocationContext.exit(() => steps.next());
+    if (step.done) {
+      return step.value;
+    }
+    yield;
+  }
+}
+
+function* loadOpenClawPluginsStepsUnscoped(
   options: PluginLoadOptions,
   nativeBindings: NativePluginLoadBindings,
   overrides?: InternalPluginLoadOverrides,
