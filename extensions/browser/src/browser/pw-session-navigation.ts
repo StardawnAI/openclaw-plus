@@ -1,7 +1,7 @@
 import { toErrorObject } from "openclaw/plugin-sdk/error-runtime";
 import { SsrFBlockedError } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
-import type { Page, Request, Response, Route } from "playwright-core";
+import type { Page, Response } from "playwright-core";
 import {
   assertBrowserNavigationAllowed,
   assertBrowserNavigationRedirectChainAllowed,
@@ -16,34 +16,12 @@ import {
   markTargetBlocked,
   pageTargetInfo,
 } from "./pw-session-connection.js";
-import { claimPageDocumentPolicy, ensurePageDocumentPolicy } from "./pw-session-document-policy.js";
+import {
+  installNavigationAuthorityFence,
+  type NavigationDocumentRoute as Route,
+  type NavigationDocumentRequest as Request,
+} from "./pw-session-navigation-fence.js";
 import { isConnectionScopedPage } from "./pw-session-page-target.js";
-
-type BrowserDocumentNavigationRequestKind = "top-level" | "subframe";
-
-/** Classify requests that can navigate the selected page or one of its frames. */
-function classifyBrowserDocumentNavigationRequest(
-  page: Page,
-  request: Request,
-): BrowserDocumentNavigationRequestKind | null {
-  let kind: BrowserDocumentNavigationRequestKind;
-  let frameResolutionFailed = false;
-  try {
-    kind = request.frame() === page.mainFrame() ? "top-level" : "subframe";
-  } catch {
-    // Preserve the navigate-owner fail-closed contract during renderer churn:
-    // an unresolved document request may be the selected main frame.
-    kind = "top-level";
-    frameResolutionFailed = true;
-  }
-
-  if (request.isNavigationRequest() || request.resourceType() === "document") {
-    return kind;
-  }
-  // Match the previous two-step classifier: known non-doc requests fall
-  // through, while an unresolved frame remains guarded as a subframe.
-  return frameResolutionFailed ? "subframe" : null;
-}
 
 /** Return true when an error is a browser navigation policy denial. */
 export function isPolicyDenyNavigationError(err: unknown): boolean {
@@ -105,11 +83,8 @@ export async function assertPageNavigationCompletedSafely(
 ): Promise<void> {
   const navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, {
     browserProxyMode: opts.browserProxyMode,
-    standingSsrfPolicy: opts.standingSsrfPolicy,
+    assertNavigationCurrent: opts.assertNavigationCurrent,
   });
-  if (navigationPolicy.ssrfPolicy || navigationPolicy.browserProxyMode) {
-    await ensurePageDocumentPolicy(opts.page, navigationPolicy);
-  }
   const policySignal = opts.signal ? { signal: opts.signal } : {};
   try {
     await assertBrowserNavigationRedirectChainAllowed({
@@ -134,6 +109,16 @@ export async function assertPageNavigationCompletedSafely(
   }
 }
 
+async function resumeRouteSafely(route: Route, method: "continue" | "fallback"): Promise<void> {
+  try {
+    await route[method]();
+  } catch (err) {
+    if (!(err instanceof Error && err.message.includes("Route is already handled"))) {
+      throw err;
+    }
+  }
+}
+
 const sourcePreservedPolicyDenials = new WeakSet<object>();
 
 /** Return true when policy denial left the selected page on its source document. */
@@ -145,7 +130,6 @@ export function wasBrowserNavigationSourcePreservedAfterPolicyDenial(err: unknow
 export async function withPageNavigationRequestGuard<T>(
   opts: {
     action: (baselineUrl: string) => Promise<T>;
-    assertCurrent?: () => void | Promise<void>;
     onPolicyCheckStarted?: (check: Promise<void>) => void;
     onPolicyDenied?: (
       event:
@@ -158,9 +142,13 @@ export async function withPageNavigationRequestGuard<T>(
 ): Promise<T> {
   const navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, {
     browserProxyMode: opts.browserProxyMode,
-    standingSsrfPolicy: opts.standingSsrfPolicy,
+    assertNavigationCurrent: opts.assertNavigationCurrent,
   });
-  if (!navigationPolicy.ssrfPolicy && !navigationPolicy.browserProxyMode) {
+  if (
+    !navigationPolicy.ssrfPolicy &&
+    !navigationPolicy.browserProxyMode &&
+    !navigationPolicy.assertNavigationCurrent
+  ) {
     return await opts.action(opts.page.url());
   }
 
@@ -238,9 +226,9 @@ export async function withPageNavigationRequestGuard<T>(
       deniedDocumentCount += 1;
       pendingDeniedDocumentCount += 1;
       try {
-        // A synthetic 204 stops the document load while Chromium keeps the
-        // selected page's current document. route.abort() commits an error page.
-        await route.fulfill({ status: 204, body: "" });
+        // CDP cancellation with the operation-owned preservation reason stops
+        // the navigation while Chromium keeps the selected source document.
+        await route.preserve();
         pendingDeniedDocumentCount -= 1;
         updateSourcePreservation();
         return;
@@ -256,7 +244,7 @@ export async function withPageNavigationRequestGuard<T>(
     await route.abort().catch(() => {});
   };
   const handleRoute = async (route: Route, request: Request) => {
-    const preserveDocument = Boolean(classifyBrowserDocumentNavigationRequest(opts.page, request));
+    const preserveDocument = true;
     if (preserveDocument) {
       const policyCheck = assertBrowserNavigationAllowed({
         url: request.url(),
@@ -274,36 +262,43 @@ export async function withPageNavigationRequestGuard<T>(
         recordGuardError(err);
         notifyPolicyDeniedDetected();
         await stopGuardedRoute(route, true, err);
-        return false;
+        return;
       }
     }
-    return true;
-  };
-  const release = await claimPageDocumentPolicy(opts.page, navigationPolicy, {
-    handle: handleRoute,
-    inFlight,
-    assertCurrent: () => {
-      const assertion = opts.assertCurrent?.();
-      if (assertion) {
-        return assertion.then(() => opts.signal?.throwIfAborted());
-      }
-      return opts.signal?.throwIfAborted();
-    },
-    failed: async (route, request, err) => {
+    try {
+      navigationPolicy.assertNavigationCurrent?.();
+      await resumeRouteSafely(route, "fallback");
+    } catch (err) {
       recordGuardError(err);
-      notifyPolicyDeniedDetected();
-      await stopGuardedRoute(
-        route,
-        Boolean(classifyBrowserDocumentNavigationRequest(opts.page, request)),
-        err,
-      );
-    },
-  });
+      await stopGuardedRoute(route, preserveDocument, err);
+    }
+  };
+  const handler = (route: Route, request: Request) => {
+    const operation = handleRoute(route, request).catch(async (err: unknown) => {
+      recordGuardError(err);
+      await stopGuardedRoute(route, true, err);
+    });
+    inFlight.add(operation);
+    void operation.finally(() => inFlight.delete(operation));
+    return operation;
+  };
 
+  let removeAuthorityFence: Awaited<ReturnType<typeof installNavigationAuthorityFence>> | undefined;
   let result: T | undefined;
   let actionFailed = false;
   let actionError: unknown;
   try {
+    removeAuthorityFence = await installNavigationAuthorityFence(
+      opts.page,
+      navigationPolicy,
+      (error) => {
+        recordGuardError(error);
+        notifyPolicyDeniedDetected();
+        unpreservedDocumentCount += 1;
+        updateSourcePreservation();
+      },
+      handler,
+    );
     let baselineUrl = opts.page.url();
     await assertBrowserNavigationResultAllowed({
       url: baselineUrl,
@@ -312,7 +307,7 @@ export async function withPageNavigationRequestGuard<T>(
     });
     const latestUrl = opts.page.url();
     if (latestUrl !== baselineUrl) {
-      // The route is already installed, so any later document request remains
+      // Document interception is already installed, so any later document request remains
       // intercepted. Revalidate the one URL that could commit during preflight.
       await assertBrowserNavigationResultAllowed({
         url: latestUrl,
@@ -321,6 +316,7 @@ export async function withPageNavigationRequestGuard<T>(
       });
       baselineUrl = latestUrl;
     }
+    navigationPolicy.assertNavigationCurrent?.();
     result = await opts.action(baselineUrl);
   } catch (err) {
     actionFailed = true;
@@ -335,12 +331,20 @@ export async function withPageNavigationRequestGuard<T>(
     }
   }
 
-  // Release invocation-only admission, but retain the configured tab policy.
-  // Captured requests drain under the original invocation's authority.
-  await release();
+  // Drain callbacks before releasing the single document interception owner.
+  while (inFlight.size > 0) {
+    await Promise.allSettled(inFlight);
+  }
+  // Successful committed responses may keep loading after ownership retires.
+  // Only failed/cancelled actions need page-wide cancellation; uncommitted
+  // redirect chains still drain under the fence before successful cleanup.
+  const authorityCleanupError = await removeAuthorityFence?.({
+    stopLoading: actionFailed || hasGuardError || opts.signal?.aborted,
+  });
+  const cleanupError = authorityCleanupError;
 
-  // Request-policy denial wins over locator/action/cleanup errors. Only 204
-  // responses prove that every denied document was intercepted and source-preserved.
+  // Request-policy denial wins over locator/action/cleanup errors. Only successful
+  // preservation cancellations prove every denied document kept its source.
   if (hasGuardError) {
     // Failed fulfillments and action-policy failures already mark the source unpreserved.
     updateSourcePreservation(false);
@@ -348,6 +352,9 @@ export async function withPageNavigationRequestGuard<T>(
   }
   if (actionFailed) {
     throw toErrorObject(actionError, "Non-Error thrown");
+  }
+  if (cleanupError !== undefined) {
+    throw toErrorObject(cleanupError, "Non-Error thrown");
   }
   return result as T;
 }
@@ -366,86 +373,86 @@ export async function gotoPageWithNavigationGuard(
 ): Promise<Response | null> {
   const navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy, {
     browserProxyMode: opts.browserProxyMode,
-    standingSsrfPolicy: opts.standingSsrfPolicy,
+    assertNavigationCurrent: opts.assertNavigationCurrent,
   });
   let blockedError: unknown = null;
-  let requestPolicyError: unknown;
-  let routeError: unknown;
 
-  const release = await claimPageDocumentPolicy(opts.page, navigationPolicy, {
-    inFlight: new Set(),
-    assertCurrent: () => {
-      const assertion = opts.assertPageCurrent?.();
-      if (assertion) {
-        return assertion.then(() => opts.signal?.throwIfAborted());
-      }
-      return opts.signal?.throwIfAborted();
-    },
-    handle: async (route, request) => {
-      if (blockedError) {
-        await route.abort().catch(() => {});
-        return false;
-      }
-      const kind = classifyBrowserDocumentNavigationRequest(opts.page, request);
-      if (!kind) {
-        return true;
-      }
-      try {
+  const handler = async (route: Route, request: Request) => {
+    if (blockedError) {
+      await route.abort().catch(() => {});
+      return;
+    }
+    const requestKind = request.isTopLevel() ? "top-level" : "subframe";
+    try {
+      if (requestKind) {
         await assertBrowserNavigationAllowed({
           url: request.url(),
           ...navigationPolicy,
           ...(opts.signal ? { signal: opts.signal } : {}),
         });
-        return true;
-      } catch (err) {
-        if (isPolicyDenyNavigationError(err) && kind === "top-level") {
+      }
+      navigationPolicy.assertNavigationCurrent?.();
+    } catch (err) {
+      if (opts.signal?.aborted) {
+        await route.abort().catch(() => {});
+        return;
+      }
+      if (isPolicyDenyNavigationError(err) || navigationPolicy.assertNavigationCurrent) {
+        if (!isPolicyDenyNavigationError(err) || requestKind === "top-level") {
           blockedError = err;
-        } else if (!isPolicyDenyNavigationError(err) && !opts.signal?.aborted) {
-          requestPolicyError ??= err;
         }
         await route.abort().catch(() => {});
-        return false;
+        return;
       }
-    },
-    failed: async (route, _request, err) => {
-      routeError ??= err;
-      await route.abort().catch(() => {});
-    },
-  });
+      throw err;
+    }
+    await resumeRouteSafely(route, "continue");
+  };
+
+  let removeAuthorityFence: Awaited<ReturnType<typeof installNavigationAuthorityFence>> | undefined;
   let response: Response | null = null;
   let navigationFailed = false;
   let navigationError: unknown;
   try {
+    removeAuthorityFence = await installNavigationAuthorityFence(
+      opts.page,
+      navigationPolicy,
+      (error) => {
+        blockedError ??= error;
+      },
+      handler,
+    );
     // Synchronous authority must not yield between its final fence and navigation.
     const assertion = opts.assertPageCurrent?.();
     if (assertion) {
       await assertion;
     }
+    navigationPolicy.assertNavigationCurrent?.();
     response = await opts.page.goto(opts.url, { timeout: opts.timeoutMs });
   } catch (err) {
     navigationFailed = true;
     navigationError = err;
   }
 
-  await release();
+  const authorityCleanupError = await removeAuthorityFence?.({ stopLoading: navigationFailed });
+  const cleanupError = authorityCleanupError;
   if (blockedError) {
-    await closeBlockedNavigationTarget({
-      cdpUrl: opts.cdpUrl,
-      page: opts.page,
-      targetId: opts.targetId,
-    });
+    if (isPolicyDenyNavigationError(blockedError)) {
+      await closeBlockedNavigationTarget({
+        cdpUrl: opts.cdpUrl,
+        page: opts.page,
+        targetId: opts.targetId,
+      });
+    }
     throw toErrorObject(blockedError, "Non-Error thrown");
   }
-  // Preserve the policy-check failure that caused the browser to abort navigation.
-  if (requestPolicyError !== undefined) {
-    throw toErrorObject(requestPolicyError, "Non-Error thrown");
-  }
-  // The original navigation error retains precedence over route transport errors.
+  // A live-page cleanup failure is observable, but the original navigation
+  // error owns the result and must not lose its precedence.
   if (navigationFailed) {
     throw navigationError;
   }
-  if (routeError !== undefined) {
-    throw toErrorObject(routeError, "Non-Error thrown");
+  if (cleanupError !== undefined) {
+    throw toErrorObject(cleanupError, "Non-Error thrown");
   }
   return response;
 }

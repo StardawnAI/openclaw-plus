@@ -1,4 +1,5 @@
 import type { Result } from "@openclaw/normalization-core/result";
+import { throwSettledAggregate } from "../infra/error-graph-internal.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import { getOrCreatePromise } from "../shared/lazy-promise.js";
 import { acquireBundledCapabilityRuntimeRegistry } from "./bundled-capability-runtime.js";
@@ -13,7 +14,10 @@ import {
   resolvePluginRegistryLoadCacheKey,
 } from "./loader.js";
 import { getPluginValueInstance } from "./plugin-instance-scope.js";
-import { PluginInvocationScope } from "./plugin-invocation-scope.js";
+import {
+  collectRegistryInvocationInstances,
+  PluginInvocationScope,
+} from "./plugin-invocation-scope.js";
 import { getPluginRegistryInspectionResources } from "./registry-inspection-resources.js";
 import {
   capturePluginLifecycleAuthority,
@@ -32,7 +36,7 @@ export async function acquirePluginCapabilityProviders<
   const work = new AsyncWorkScope();
   const releases: Array<() => void | Promise<void>> = [];
   const loads = new Map<string, Promise<PluginRegistry>>();
-  const retained = new Map<PluginRegistry, Map<object, PluginInvocationScope>>();
+  const retained = new Map<PluginRegistry, Map<object, PluginInvocationScope> | undefined>();
   const authorities = new Map<PluginRegistry, (() => boolean) | undefined>();
   const captureAuthority = (registry: PluginRegistry) => {
     if (!authorities.has(registry)) {
@@ -49,16 +53,11 @@ export async function acquirePluginCapabilityProviders<
     }
     return Promise.allSettled(releases.map(async (releaseClaim) => await releaseClaim())).then(
       (results) => {
-        const errors = results.flatMap((result) =>
-          result.status === "rejected" ? [result.reason] : [],
-        );
-        if (errors.length > 0) {
-          throw new AggregateError(errors, "Capability registration cleanup failed");
-        }
+        throwSettledAggregate(results, "Capability registration cleanup failed");
       },
     );
   };
-  const retain = (registry: PluginRegistry | undefined) => {
+  const retain = (registry: PluginRegistry | undefined, providerId?: string) => {
     if (!registry) {
       return undefined;
     }
@@ -69,24 +68,28 @@ export async function acquirePluginCapabilityProviders<
       if (release) {
         releases.push(release);
       }
-      // External hosts own physical disposal, not the selected provider's execution custody.
-      retained.set(registry, new Map());
+      retained.set(registry, release ? new Map() : undefined);
     }
     const invocations = retained.get(registry);
     if (!invocations) {
       return undefined;
     }
     return (provider: CapabilityProviderFor<K>) => {
-      const instance = getPluginValueInstance(provider);
-      if (!instance) {
+      const instance = providerId === undefined ? undefined : getPluginValueInstance(provider);
+      if (providerId !== undefined && !instance) {
         return provider;
       }
-      let invocation = invocations.get(instance);
+      const key = instance ?? registry;
+      let invocation = invocations.get(key);
       if (!invocation) {
         invocation = resources
-          ? resources.createInvocationScope(registry, [instance])
-          : new PluginInvocationScope(registry, [instance], { retained: true });
-        invocations.set(instance, invocation);
+          ? resources.createInvocationScope(registry, instance && [instance])
+          : new PluginInvocationScope(
+              registry,
+              instance ? [instance] : collectRegistryInvocationInstances(registry),
+              { retained: true },
+            );
+        invocations.set(key, invocation);
       }
       return invocation.wrap(provider);
     };
@@ -160,7 +163,9 @@ export async function acquirePluginCapabilityProviders<
   ) =>
     run(() =>
       execute<CapabilityProviderFor<K> | undefined>(
-        preparePluginCapabilityProviderLookup({ ...query, key: params.key }, retain),
+        preparePluginCapabilityProviderLookup({ ...query, key: params.key }, (registry) =>
+          retain(registry, query.providerId),
+        ),
       ),
     );
   try {

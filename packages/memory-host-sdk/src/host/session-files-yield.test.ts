@@ -10,7 +10,7 @@ import { buildSessionEntry, streamSessionEntry } from "./session-files.js";
 const sessionDirs = useSessionStoreTempDirs(afterAll, "session-entry-yield-");
 
 describe("buildSessionEntry responsiveness", () => {
-  // SQLite exports render in the transcript worker and observe messages one page at a time.
+  // SQLite exports render in the transcript worker and settle legacy observers after success.
   it.each(["archive", "sqlite"])(
     "yields at raw ordinals even for excluded %s records",
     async (source) => {

@@ -1,3 +1,4 @@
+import { markToolExecutionRefused } from "./tool-effect-receipt.js";
 import { createToolExecutionMatcher } from "./tool-policy-shared.js";
 import type { AnyAgentTool } from "./tools/common.js";
 import { textResult } from "./tools/tool-results.js";
@@ -40,14 +41,15 @@ export function getAgentToolAvailabilityBinding(
   return availabilityBindings.get(tool)?.binding;
 }
 
+/** Offered definitions can remain present even when this turn cannot execute them. */
+export function isAgentToolExecutionAvailable(tool: object): boolean {
+  return availabilityBindings.get(tool)?.executionDenied !== true;
+}
+
 export function copyAgentToolAvailability<T extends object>(source: object, target: T): T {
   const metadata = availabilityBindings.get(source);
   if (metadata) {
     availabilityBindings.set(target, metadata);
-  }
-  const executionSchema = executionSchemas.get(source);
-  if (executionSchema !== undefined) {
-    executionSchemas.set(target, executionSchema);
   }
   return target;
 }
@@ -75,7 +77,11 @@ export function gateAgentToolExecution<T extends AnyAgentTool>(tool: T, message:
       finalizeBeforeToolCallParams: undefined,
       // A denial is guidance for the model, not a tool failure that fails the run;
       // a failure-like `status` detail would reclassify it as an error.
-      execute: async () => textResult(message, { gated: true }),
+      execute: async () =>
+        markToolExecutionRefused(textResult(message, { gated: true }), {
+          kind: "gated",
+          reason: message,
+        }),
     }),
   );
 }
@@ -112,16 +118,6 @@ export function finalizeAgentToolAvailability<T extends ToolDefinition>(
   return [...tools];
 }
 
-/** Provider-neutral input contract behind a projected model-facing schema. */
-const executionSchemas = new WeakMap<object, unknown>();
-
-/** Preserve the canonical contract without replacing tool-owned availability policy. */
-export function bindAgentToolExecutionSchema<T extends object>(tool: T, schema: unknown): T {
-  executionSchemas.set(tool, schema);
-  return tool;
-}
-
 export function resolveAgentToolExecutionSchema(tool: object, schema: unknown): unknown {
-  const declared = availabilityBindings.get(tool)?.binding.executionSchema?.(schema);
-  return declared !== undefined ? declared : (executionSchemas.get(tool) ?? schema);
+  return availabilityBindings.get(tool)?.binding.executionSchema?.(schema) ?? schema;
 }

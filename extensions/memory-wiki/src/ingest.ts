@@ -1,3 +1,4 @@
+import { isUtf8 } from "node:buffer";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathExists, readRegularFile } from "openclaw/plugin-sdk/security-runtime";
@@ -5,7 +6,12 @@ import { asNullableRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { compileMemoryWikiVault } from "./compile.js";
 import type { ResolvedMemoryWikiConfig } from "./config.js";
 import { appendMemoryWikiLog } from "./log.js";
-import { preserveHumanNotesBlock, slugifyWikiPageStem, slugifyWikiSegment } from "./markdown.js";
+import {
+  decodeWikiPageUtf8,
+  preserveHumanNotesBlock,
+  slugifyWikiPageStem,
+  slugifyWikiSegment,
+} from "./markdown.js";
 import { withMemoryWikiVaultMutation } from "./mutation-coordinator.js";
 import { renderImportedSourcePage } from "./source-page-shared.js";
 import { resolveMemoryWikiTimestamp } from "./time.js";
@@ -23,7 +29,7 @@ async function readIngestFile(filePath: string): Promise<Buffer> {
       throw cause;
     }
     throw new Error(
-      `Cannot read wiki ingest file ${filePath}. Choose a readable regular file and retry.`,
+      `Cannot read wiki ingest file ${filePath}. Choose a readable regular UTF-8 file and retry.`,
       { cause },
     );
   }
@@ -48,6 +54,11 @@ export async function ingestMemoryWikiSource(params: {
     params.signal?.throwIfAborted();
     if (buffer.subarray(0, 4096).includes(0)) {
       throw new Error(`Cannot ingest binary file as markdown source: ${sourcePath}`);
+    }
+    if (!isUtf8(buffer)) {
+      throw new Error(
+        `Source file must be valid UTF-8: ${sourcePath}. Save the source as valid UTF-8 and retry the ingest.`,
+      );
     }
     const title =
       params.title?.trim() ||
@@ -85,7 +96,7 @@ export async function ingestMemoryWikiSource(params: {
     const existing = created
       ? ""
       : await readExistingWikiPage(
-          async () => (await readIngestFile(pagePath)).toString("utf8"),
+          async () => decodeWikiPageUtf8(await readIngestFile(pagePath), pagePath),
           (error) => asNullableRecord(error)?.code === "ENOENT",
         );
     params.signal?.throwIfAborted();

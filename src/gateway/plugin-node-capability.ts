@@ -266,7 +266,6 @@ export function hasAuthorizedClientPluginNodeCapabilityUrl(params: {
   client: PluginNodeCapabilityClient;
   surface: PluginNodeCapabilitySurface;
   url: string;
-  nowMs?: number;
 }): boolean {
   const storageKey = resolvePluginNodeCapabilityStorageKey(params.surface);
   const capability = pluginNodeCapabilityFromScopedHostUrl(params.url);
@@ -274,10 +273,9 @@ export function hasAuthorizedClientPluginNodeCapabilityUrl(params: {
     return false;
   }
   const entry = params.client.pluginNodeCapabilities?.[storageKey];
-  const nowMs = params.nowMs ?? Date.now();
   return Boolean(
     entry &&
-    isFutureDateTimestampMs(entry.expiresAtMs, { nowMs }) &&
+    isFutureDateTimestampMs(entry.expiresAtMs) &&
     safeEqualSecret(entry.capability, capability),
   );
 }
@@ -295,19 +293,20 @@ export function normalizePluginNodeCapabilityScopedUrl(
     };
   }
   const prefix = `${PLUGIN_NODE_CAPABILITY_PATH_PREFIX}/`;
-  const scopedPath = url.pathname.startsWith(prefix);
+  let scopedPath = false;
   let malformedScopedPath = false;
   let capabilityFromPath: string | undefined;
   let rewrittenUrl: string | undefined;
 
-  if (scopedPath) {
+  if (url.pathname.startsWith(prefix)) {
+    scopedPath = true;
     const remainder = url.pathname.slice(prefix.length);
     const slashIndex = remainder.indexOf("/");
     if (slashIndex <= 0) {
       malformedScopedPath = true;
     } else {
       const encodedCapability = remainder.slice(0, slashIndex);
-      const canonicalPath = remainder.slice(slashIndex);
+      const canonicalPath = remainder.slice(slashIndex) || "/";
       let decoded: string | undefined;
       try {
         decoded = decodeURIComponent(encodedCapability);
@@ -315,8 +314,7 @@ export function normalizePluginNodeCapabilityScopedUrl(
         malformedScopedPath = true;
       }
       capabilityFromPath = normalizeOptionalString(decoded);
-      // Leading separators can become an authority when handlers reparse or decode the path.
-      if (!capabilityFromPath || /^\/(?:\/|%2f|%5c)/i.test(canonicalPath)) {
+      if (!capabilityFromPath || !canonicalPath.startsWith("/")) {
         malformedScopedPath = true;
       } else {
         url.pathname = canonicalPath;
@@ -362,15 +360,7 @@ export function setClientPluginNodeCapability(params: {
 export function refreshClientPluginNodeCapability(params: {
   client: PluginNodeCapabilityClient;
   surface: PluginNodeCapabilitySurface;
-  nowMs?: number;
-}):
-  | {
-      surface: string;
-      capability: string;
-      expiresAtMs: number;
-      scopedUrl: string;
-    }
-  | undefined {
+}) {
   const surface = normalizeOptionalString(params.surface.surface);
   if (!surface) {
     return undefined;
@@ -381,7 +371,7 @@ export function refreshClientPluginNodeCapability(params: {
   }
   const capabilitySurface = params.client.pluginNodeCapabilitySurfaces?.[surface] ?? params.surface;
   const capability = mintPluginNodeCapabilityToken();
-  const nowMs = params.nowMs ?? Date.now();
+  const nowMs = Date.now();
   const expiresAtMs = resolvePluginNodeCapabilityExpiresAtMs(capabilitySurface, nowMs);
   if (expiresAtMs === undefined) {
     return undefined;
@@ -410,14 +400,13 @@ export function hasAuthorizedPluginNodeCapability(params: {
   clients: Iterable<PluginNodeCapabilityClient>;
   surface: PluginNodeCapabilitySurface;
   capability: string;
-  nowMs?: number;
 }) {
   const surface = normalizeOptionalString(params.surface.surface);
   const storageKey = resolvePluginNodeCapabilityStorageKey(params.surface);
   if (!surface || !storageKey) {
     return false;
   }
-  const nowMs = params.nowMs ?? Date.now();
+  const nowMs = Date.now();
   const nextExpiresAtMs = resolvePluginNodeCapabilityExpiresAtMs(params.surface, nowMs);
   if (nextExpiresAtMs === undefined) {
     return false;

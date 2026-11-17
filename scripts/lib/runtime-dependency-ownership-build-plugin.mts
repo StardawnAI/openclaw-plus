@@ -36,13 +36,12 @@ export function createRuntimeDependencyOwnershipBuildPlugin(rootDir = process.cw
             ? null
             : (/^extensions\/([a-z0-9][a-z0-9-]*)\//u.exec(relative)?.[1] ?? "");
           const pending = [entry.fileName];
-          const visited = new Set<string>();
           while (pending.length > 0) {
             const fileName = pending.pop()!;
-            if (visited.has(fileName)) {
+            // Entries with the same owner share one traversal of their chunk closure.
+            if (ownersByChunk.get(fileName)?.has(owner)) {
               continue;
             }
-            visited.add(fileName);
             const chunk = bundle[fileName];
             if (chunk?.type !== "chunk") {
               continue;

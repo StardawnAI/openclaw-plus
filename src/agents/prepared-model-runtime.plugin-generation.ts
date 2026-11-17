@@ -1,6 +1,5 @@
 import { captureRemoteModelCatalogSnapshot } from "../model-catalog/remote-overlay.js";
 import { registryContainsRuntimePluginIds } from "../plugins/active-runtime-registry.js";
-import { getPluginValueInstance } from "../plugins/plugin-instance-scope.js";
 import { capturePluginLifecycleAuthority } from "../plugins/registry-lifecycle.js";
 import { resolveAgentRuntimePluginSelectionOwners } from "./harness/runtime-plugin-load-plan.js";
 import { ownPreparedPluginGeneration } from "./prepared-model-runtime.plugin-lifetime.js";
@@ -31,15 +30,7 @@ export function acquirePreparedMediaCapabilityProviders(
   };
   assertOpen();
   // Execute through the composed view so nested lookups retain adopted donor registrations.
-  const instances = new Set(
-    Object.values(providers).flatMap((entries) =>
-      (entries ?? []).flatMap((provider) => {
-        const instance = getPluginValueInstance(provider);
-        return instance ? [instance] : [];
-      }),
-    ),
-  );
-  const invocations = source.resources.createInvocationScope(registry, instances);
+  const invocations = source.resources.createInvocationScope(registry);
   const claim = source.resources.retain();
   const wrapProvider = <T>(provider: T) => invocations.wrap(provider);
   return {
@@ -61,6 +52,10 @@ export function acquirePreparedMediaCapabilityProviders(
 // Lineage is cache identity only. Derived generations still require the exact open
 // parent lease at admission; they never become configured publication authority.
 const derivedGenerationBases = new WeakMap<
+  PreparedModelRuntimePluginGeneration,
+  PreparedModelRuntimePluginGeneration
+>();
+const configuredGenerationBases = new WeakMap<
   PreparedModelRuntimePluginGeneration,
   PreparedModelRuntimePluginGeneration
 >();
@@ -104,6 +99,33 @@ export function preparedPluginGenerationReusesBase(
     generation === base ||
     (generation !== undefined && derivedGenerationBases.get(generation) === base)
   );
+}
+
+/** Configured publication remains required for this generation and every derived view. */
+export function markPreparedPluginGenerationConfigured(
+  generation: PreparedModelRuntimePluginGeneration,
+): void {
+  configuredGenerationBases.set(generation, generation);
+}
+
+export function bindPreparedPluginGenerationConfiguredBase(
+  generation: PreparedModelRuntimePluginGeneration,
+  base: PreparedModelRuntimePluginGeneration,
+): void {
+  const configuredBase = configuredGenerationBases.get(base);
+  if (
+    configuredBase &&
+    preparedPluginGenerationReusesBase(generation, base) &&
+    !configuredGenerationBases.has(generation)
+  ) {
+    configuredGenerationBases.set(generation, configuredBase);
+  }
+}
+
+export function getPreparedPluginGenerationConfiguredBase(
+  generation: PreparedModelRuntimePluginGeneration,
+): PreparedModelRuntimePluginGeneration | undefined {
+  return configuredGenerationBases.get(generation);
 }
 
 export function createPreparedPluginGeneration(params: {

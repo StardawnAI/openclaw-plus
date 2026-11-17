@@ -1,4 +1,4 @@
-import { resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import type { CopilotClient, CopilotClientOptions } from "@github/copilot-sdk";
 import type { AgentHarnessRuntimeArtifactBinding } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { toStringifiedError as toCopilotRuntimeError } from "openclaw/plugin-sdk/error-runtime";
@@ -142,15 +142,21 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}) 
     const expected = runtimeArtifactRequest?.expected;
     if (
       expected &&
-      (!capture ||
-        capture.binding.id !== expected.id ||
-        capture.binding.fingerprint !== expected.fingerprint)
+      (capture?.binding.id !== expected.id || capture.binding.fingerprint !== expected.fingerprint)
     ) {
       throw new Error("[copilot] verified runtime changed; rerun setup verification");
     }
     const runtimeArtifact = capture?.binding;
-    const key = {
-      ...normalizePoolKey(inputKey, optionsForCreate.copilotHome, optionsForCreate.mode),
+    const clientMode = optionsForCreate.mode;
+    const key: PoolKey = {
+      agentId: inputKey.agentId,
+      copilotHome: normalizeCopilotHome(optionsForCreate.copilotHome),
+      authMode: inputKey.authMode,
+      authProfileId: inputKey.authProfileId,
+      authProfileVersion: inputKey.authProfileVersion,
+      // Undefined and `copilot-cli` are equivalent SDK defaults. Preserve the
+      // existing cache identity while keeping empty-mode finalizers isolated.
+      ...(clientMode === "empty" ? { clientMode } : {}),
       ...(runtimeArtifact ? { runtimeArtifactFingerprint: runtimeArtifact.fingerprint } : {}),
     };
     const cacheKey = JSON.stringify(key);
@@ -244,23 +250,6 @@ export function createCopilotClientPool(options: CopilotClientPoolOptions = {}) 
   };
 }
 
-function normalizePoolKey(
-  key: PoolKey,
-  rawCopilotHome: string,
-  clientMode: CopilotClientOptions["mode"],
-): PoolKey {
-  return {
-    agentId: key.agentId,
-    copilotHome: normalizeCopilotHome(rawCopilotHome),
-    authMode: key.authMode,
-    authProfileId: key.authProfileId,
-    authProfileVersion: key.authProfileVersion,
-    // Undefined and `copilot-cli` are equivalent SDK defaults. Preserve the
-    // existing cache identity while keeping empty-mode finalizers isolated.
-    ...(clientMode === "empty" ? { clientMode } : {}),
-  };
-}
-
 function normalizeClientCreateOptions(
   options: ClientCreateOptions,
   normalizedCopilotHome: string,
@@ -274,9 +263,6 @@ function normalizeClientCreateOptions(
 
 function normalizeCopilotHome(copilotHome: string): string {
   let normalizedHome = resolve(copilotHome);
-  if (normalizedHome.endsWith(sep) && normalizedHome.length > 1) {
-    normalizedHome = normalizedHome.slice(0, -1);
-  }
   if (process.platform === "win32") {
     normalizedHome = normalizedHome.toLowerCase();
   }

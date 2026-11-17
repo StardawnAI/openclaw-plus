@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // Materialize compiler and lint selections only after the check-planning job installs dependencies.
 import { appendFileSync, existsSync } from "node:fs";
-import { detectChangedLanes, detectChangedLanesForPaths } from "./changed-lanes.mts";
+import { detectChangedLanes } from "./changed-lanes.mts";
 import { isDirectRunUrl } from "./lib/direct-run.mjs";
 import { runWithFailedTrailer } from "./lib/failed-trailer.mts";
 import { isRecord } from "./lib/record-shared.mjs";
 import {
   resolveChangedCiTsgoInputs,
-  resolveCiTsgoGraphs,
   selectTsgoCoreTestStripe,
+  TSGO_ROOT_TEST_SHARDS,
 } from "./lib/tsgo-core-test-shards.mts";
 
 type CheckRow = {
@@ -32,7 +32,7 @@ export type CiCheckPlanInput = {
   changedBaseRef?: string;
   extensionLintMode?: "affected" | "full";
   preserveFullChecks?: boolean;
-  typeGraphBoundaryOwner: "" | "check-plan" | "additional-checks" | "changed-check";
+  typeGraphBoundaryOwner: "" | "check-plan" | "additional-checks";
   changedPaths: string[];
   changedCoreTestPaths: string[] | null;
   runnerProfile: string;
@@ -54,28 +54,8 @@ export async function createCiCheckPlan(input: CiCheckPlanInput) {
         })
       : null;
   const started = performance.now();
-  if (input.typeGraphBoundaryOwner === "changed-check" && input.preserveFullChecks) {
-    throw new Error("Changed-check compiler delegation cannot preserve unrelated full checks");
-  }
-  const changedCheck =
-    input.typeGraphBoundaryOwner === "changed-check"
-      ? (await import("./check-changed.mts")).createChangedCheckPlan(
-          detectChangedLanesForPaths({
-            paths: input.changedPaths,
-            base: input.changedBaseRef ?? "origin/main",
-            head: "HEAD",
-          }),
-          { delegateCompilers: true, base: input.changedBaseRef, head: "HEAD" },
-        )
-      : null;
-  const typePlan = changedCheck
-    ? {
-        mode: "changed-check",
-        graphs: changedCheck.delegatedTypeGraphs.length
-          ? resolveCiTsgoGraphs(changedCheck.delegatedTypeGraphs)
-          : [],
-      }
-    : !input.preserveFullChecks && (runs("prod-types") || runs("test-types"))
+  const typePlan =
+    !input.preserveFullChecks && (runs("prod-types") || runs("test-types"))
       ? await (
           await import("./run-tsgo-core-test-shards.mts")
         ).createChangedCiTypeCheckPlan(input.changedPaths, {
@@ -97,10 +77,11 @@ export async function createCiCheckPlan(input: CiCheckPlanInput) {
   const production = graphs.filter(({ name }) => ["core", "ui", "extensions"].includes(name));
   const coreTests = graphs.filter(({ name }) => name.startsWith("core-test-"));
   const hosted = ["github", "hybrid"].includes(input.runnerProfile);
+  const rootNames = ["test-root", ...TSGO_ROOT_TEST_SHARDS.map(({ name }) => name)];
   const otherOrder =
     !hosted && !input.changedCoreTestPaths
-      ? ["extensions-test", "test-root", "scripts"]
-      : ["extensions-test", "scripts", "test-root"];
+      ? ["extensions-test", ...rootNames, "scripts"]
+      : ["extensions-test", "scripts", ...rootNames];
   let other = otherOrder.flatMap((name) => graphs.filter((graph) => graph.name === name));
   if (production.length + coreTests.length + other.length !== graphs.length) {
     throw new Error("Every selected compiler graph must have a CI execution owner");
@@ -143,12 +124,15 @@ export async function createCiCheckPlan(input: CiCheckPlanInput) {
   if (
     !input.preserveFullChecks &&
     coreRows.length >= 4 &&
-    other.some(({ name }) => name === "test-root")
+    other.some(({ name }) => rootNames.includes(name))
   ) {
+    const fullRoot = other.some(({ name }) => name === "test-root");
     for (const [index, row] of coreRows.slice(-4).entries()) {
-      row.root_type_stripe = `${index + 1}/4`;
+      if (fullRoot || other.some(({ name }) => name === TSGO_ROOT_TEST_SHARDS[index]!.name)) {
+        row.root_type_stripe = `${index + 1}/4`;
+      }
     }
-    other = other.filter(({ name }) => name !== "test-root");
+    other = other.filter(({ name }) => !rootNames.includes(name));
   }
   const checkRows = input.checkMatrix.include.flatMap((row) => {
     if (input.preserveFullChecks) {
@@ -444,8 +428,7 @@ function parseInput(value: unknown): CiCheckPlanInput {
   if (
     boundaryOwner !== "" &&
     boundaryOwner !== "check-plan" &&
-    boundaryOwner !== "additional-checks" &&
-    boundaryOwner !== "changed-check"
+    boundaryOwner !== "additional-checks"
   ) {
     throw new Error("Check planning requires its compiler boundary owner");
   }

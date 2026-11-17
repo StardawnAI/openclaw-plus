@@ -379,8 +379,13 @@ export function normalizeLegacyNanoBananaSkill(cfg: OpenClawConfig, changes: str
       (value) => typeof value !== "string" || value.trim() !== key,
     );
     if (filtered.length !== skills.allowBundled.length) {
-      skills.allowBundled = filtered;
-      changes.push(`Removed ${key} from skills.allowBundled.`);
+      if (filtered.length) {
+        skills.allowBundled = filtered;
+        changes.push(`Removed ${key} from skills.allowBundled.`);
+      } else {
+        delete skills.allowBundled;
+        changes.push(`Removed skills.allowBundled entry for ${key}.`);
+      }
     }
   }
   const entries = skills.entries;

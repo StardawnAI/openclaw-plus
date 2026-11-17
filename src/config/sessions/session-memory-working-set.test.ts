@@ -3,7 +3,7 @@ import { expect, it } from "vitest";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { withSessionCleanupStore } from "./cleanup-service-read.js";
 import { replaceSessionEntrySync } from "./session-accessor.sqlite-entry.js";
-import { appendTranscriptMessageSync } from "./session-accessor.sqlite-transcript-write.js";
+import { appendTranscriptMessageSync } from "./session-accessor.sqlite-transcript-write.kernel.js";
 import {
   appendTranscriptEventSync,
   replaceTranscriptEventsSync,
@@ -36,32 +36,32 @@ it("exports every medium transcript through the production 512 MiB worker", asyn
       ).toBe(true);
     }
     // The previous worker retained all projected sources plus all rendered results and OOMed.
-    const counts = requests.map(() => ({ words: 0, first: "", last: "" }));
+    const contents = requests.map((): string[] => []);
     const results = await streamSessionEntriesInWorker(
       requests.map((request) => ({ ...request, pages: true, messages: false })),
       async (index, update) => {
-        const count = counts[index]!;
         if ("reset" in update) {
-          Object.assign(count, { words: 0, first: "", last: "" });
+          contents[index] = [];
         } else if ("page" in update) {
-          for (const line of update.page.lines) {
-            count.first ||= line.slice(0, 64);
-            count.last = line.slice(-64);
-            count.words += [...line.matchAll(/\b(?:synthetic|detail)\b/g)].length;
-          }
+          contents[index]!.push(...update.page.lines);
         }
       },
     );
     expect(results).toHaveLength(requests.length);
-    for (const [index, count] of counts.entries()) {
-      const result = results[index]!;
-      expect("cold" in result).toBe(false);
-      if ("summary" in result) {
-        expect(result.summary).not.toBeNull();
+    for (const [index, result] of results.entries()) {
+      if (!("summary" in result) || !result.summary) {
+        throw new Error("Synthetic hot source was reported cold");
       }
-      expect(count.first.startsWith("User: HEAD_" + index + " ")).toBe(true);
-      expect(count.last.endsWith(" TAIL_" + index)).toBe(true);
-      expect(count.words).toBe(262_144 * 2);
+      const content = contents[index]!.join("\n");
+      expect(content.startsWith("User: HEAD_" + index + " ")).toBe(true);
+      expect(content.endsWith(" TAIL_" + index)).toBe(true);
+      expect(result.summary.lineCount).toBe(contents[index]!.length);
+      const words = /\b(?:synthetic|detail)\b/g;
+      let wordCount = 0;
+      while (words.test(content)) {
+        wordCount++;
+      }
+      expect(wordCount).toBe(262_144 * 2);
     }
   });
 }, 30_000);

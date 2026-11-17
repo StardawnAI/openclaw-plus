@@ -1,4 +1,4 @@
-import { AsyncLocalStorage } from "node:async_hooks";
+import { AsyncContext } from "../shared/async-context.js";
 import { getAsyncWorkSignal } from "../shared/async-work-scope.js";
 
 type AgentDatabasePreparation = {
@@ -8,14 +8,16 @@ type AgentDatabasePreparation = {
   ): Promise<void> | undefined;
 };
 
-const preparation = new AsyncLocalStorage<() => AgentDatabasePreparation | undefined>();
+const preparation = new AsyncContext<() => AgentDatabasePreparation | undefined>(
+  Symbol("agentDatabasePreparation"),
+);
 
 /** Carry readiness observation without borrowing startup's database access. */
 export function withAgentDatabasePreparationContext<T>(
   resolveOwner: () => AgentDatabasePreparation | undefined,
   run: () => T,
 ): T {
-  return preparation.run(resolveOwner, run);
+  return preparation.getStore() === resolveOwner ? run() : preparation.run(resolveOwner, run);
 }
 
 export function waitForAgentDatabasePreparation(

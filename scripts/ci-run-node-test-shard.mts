@@ -20,9 +20,9 @@ import { join } from "node:path";
 import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { isRecord, isStringArray } from "@openclaw/normalization-core/record-coerce";
 import { decodeNodeTestGroups } from "./lib/ci-node-test-groups-codec.mts";
-import type { CiTestRuntimeSelection } from "./lib/ci-test-runtime.mts";
+import type { CiTestRuntimePolicy, CiTestRuntimeSelection } from "./lib/ci-test-runtime.mts";
 import { isDirectRunUrl } from "./lib/direct-run.mjs";
 import { isConstrainedCiCheckHost, isExclusiveCiTestConfig } from "./lib/local-check-runtime.mts";
 import { signalExitCode } from "./lib/managed-child-process.mts";
@@ -106,10 +106,6 @@ type RunShardOptions = {
   runChild?: typeof runChild;
   scratchDir?: string;
 };
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((entry) => typeof entry === "string");
-}
 
 function isShardGroupConfig(value: unknown): value is ShardGroupConfig {
   return isRecord(value) && isStringArray(value.configs);
@@ -291,12 +287,18 @@ export function pruneFsModuleCache(root: string, maxBytes = FS_MODULE_CACHE_MAX_
   return { beforeBytes, afterBytes: totalBytes, removedFiles };
 }
 
-export function clonePersistentCacheSlots(root: string | undefined, concurrency: number) {
+export function clonePersistentCacheSlots(
+  root: string | undefined,
+  concurrency: number,
+  policy: CiTestRuntimePolicy,
+) {
   if (!root || concurrency <= 1) {
     return 0;
   }
   let clonedSlots = 0;
-  for (const prefix of ["vitest-cache", "vitest-cache-bun"]) {
+  // Bun policies can still select Node-only contracts; pure Node never uses Bun's seed.
+  const prefixes = policy === "node" ? ["vitest-cache"] : ["vitest-cache", "vitest-cache-bun"];
+  for (const prefix of prefixes) {
     const seed = join(root, `${prefix}-0`);
     if (!existsSync(seed)) {
       continue;
@@ -318,10 +320,13 @@ export function clonePersistentCacheSlots(root: string | undefined, concurrency:
 
 const MAX_PENDING_LINE_CHARS = 1_000_000;
 
-function relayChildStream(stream: Readable, label: string) {
+function relayChildStream(stream: Readable, label: string, recordLine: (line: string) => void) {
   const decoder = new StringDecoder("utf8");
   let pending = "";
-  const writeLine = (line: string) => {
+  const writeLine = (rawLine: string) => {
+    // Test names can contain NUL; keep the job log searchable as text.
+    const line = rawLine.replaceAll("\0", "\\0");
+    recordLine(line);
     // Actions only parses workflow commands at the start of a line.
     const workflowCommand = /^::(?:error|warning|notice|group|endgroup)(?: .*?)?::/u.test(line);
     const output = workflowCommand ? line : `[shard:${label}] ${line}`;
@@ -470,6 +475,18 @@ async function runChild(
   let child: ChildProcess;
   let completion: Promise<number>;
   let teardown: (() => void) | undefined;
+  let terminationSignal: NodeJS.Signals | null = null;
+  let outputTail = "";
+  const recordLine = (line: string) => {
+    outputTail = `${outputTail}${line}\n`.slice(-16_384);
+  };
+  const reportFailure = (reason: string) => {
+    process.stdout.write(`[shard-failure:${label}] FAILED (${reason})\n`);
+    for (const line of (outputTail.trimEnd() || "(no child output)").split("\n")) {
+      // Prefix replayed workflow commands so Actions does not execute them twice.
+      process.stdout.write(`[shard-failure:${label}:tail] ${line}\n`);
+    }
+  };
   if (context) {
     const owned = context.spawn({
       command: childCommand.command,
@@ -490,6 +507,7 @@ async function runChild(
     completion = context.workerRun.borrow(
       child,
       owned.completion.then((result) => {
+        terminationSignal = result.signal;
         if (!result.groupJoined) {
           throw new Error("CI group descendant completion is unverified");
         }
@@ -505,10 +523,12 @@ async function runChild(
       stdio: ["ignore", "pipe", "pipe"],
     });
     completion = new Promise<number>((resolve) => {
-      child.once("close", (code, signal) =>
-        resolve(signal ? signalExitCode(signal) : (code ?? VITEST_INFRASTRUCTURE_EXIT_CODE)),
-      );
+      child.once("close", (code, signal) => {
+        terminationSignal = signal;
+        resolve(signal ? signalExitCode(signal) : (code ?? VITEST_INFRASTRUCTURE_EXIT_CODE));
+      });
       child.once("error", (error) => {
+        recordLine(`failed to spawn: ${error}`);
         process.stdout.write(`[shard:${label}] failed to spawn: ${error}\n`);
         resolve(VITEST_INFRASTRUCTURE_EXIT_CODE);
       });
@@ -519,18 +539,30 @@ async function runChild(
   // wrapper heap. Backpressure pauses the child stream while stdout drains,
   // and an oversized newline-free tail is force-flushed so the pending
   // partial line stays bounded too.
-  const flushers = [child.stdout!, child.stderr!].map((stream) => relayChildStream(stream, label));
+  const flushers = [child.stdout!, child.stderr!].map((stream) =>
+    relayChildStream(stream, label, recordLine),
+  );
   process.stdout.write(`[shard:${timingKey}] begin\n`);
   let code: number;
   try {
-    code = await completion;
-  } finally {
-    for (const flush of flushers) {
-      flush();
+    try {
+      code = await completion;
+    } finally {
+      for (const flush of flushers) {
+        flush();
+      }
+      teardown?.();
     }
-    teardown?.();
+  } catch (error) {
+    reportFailure(`error: ${String(error)}`);
+    throw error;
   }
   process.stdout.write(`[shard:${timingKey}] end (exit ${code})\n`);
+  if (code !== 0) {
+    reportFailure(
+      `exit ${code}${terminationSignal ? `, signal ${String(terminationSignal)}` : ""}`,
+    );
+  }
   return code;
 }
 
@@ -546,23 +578,6 @@ export async function runShardPlans(plans: ShardPlan[], options: RunShardOptions
       const value = parseJsonEnv(env, VITEST_EXTRA_ARGS_ENV_KEY, []);
       return isStringArray(value) ? value : [];
     });
-  // Invalid job settings must fail before runtime builds acquire artifact ownership.
-  // Historical targets use a workflow-owned adapter. Their Node
-  // contract must not import current target discovery or runtime policy code.
-  const runtimePolicy = baseEnv.OPENCLAW_CI_TEST_RUNTIME_POLICY?.trim() || "node";
-  const runtimeOwner =
-    runtimePolicy === "node" ? undefined : await import("./lib/ci-test-runtime.mts");
-  const policy = runtimeOwner?.resolveCiTestRuntimePolicy(baseEnv) ?? "node";
-  // Respect serial timing-sensitive bins and never clone cache slots that
-  // cannot receive a plan.
-  const requestedConcurrency =
-    options.concurrency === undefined
-      ? readPositiveEnvInt(
-          "OPENCLAW_NODE_TEST_PLAN_CONCURRENCY",
-          baseEnv,
-          MAX_CI_VITEST_PLAN_CONCURRENCY,
-        )
-      : parsePositiveInt(options.concurrency, "Shard plan concurrency");
   if (
     baseEnv.OPENCLAW_E2E_USE_PREBUILT_DIST === "1" &&
     fileURLToPath(import.meta.url) === join(process.cwd(), "scripts/ci-run-node-test-shard.mts")
@@ -602,6 +617,22 @@ export async function runShardPlans(plans: ShardPlan[], options: RunShardOptions
       return vitestInfrastructureExitCode(code);
     }
   }
+  // Historical targets use a workflow-owned adapter. Their Node
+  // contract must not import current target discovery or runtime policy code.
+  const runtimePolicy = baseEnv.OPENCLAW_CI_TEST_RUNTIME_POLICY?.trim() || "node";
+  const runtimeOwner =
+    runtimePolicy === "node" ? undefined : await import("./lib/ci-test-runtime.mts");
+  const policy = runtimeOwner?.resolveCiTestRuntimePolicy(baseEnv) ?? "node";
+  // Respect serial timing-sensitive bins and never clone cache slots that
+  // cannot receive a plan.
+  const requestedConcurrency =
+    options.concurrency === undefined
+      ? readPositiveEnvInt(
+          "OPENCLAW_NODE_TEST_PLAN_CONCURRENCY",
+          baseEnv,
+          MAX_CI_VITEST_PLAN_CONCURRENCY,
+        )
+      : parsePositiveInt(options.concurrency, "Shard plan concurrency");
   const ci = isCiLikeEnv(baseEnv);
   const continueOnFailure = shouldContinueVitestFailures(baseEnv);
   const hostResources = ci
@@ -765,7 +796,7 @@ export async function runShardPlans(plans: ShardPlan[], options: RunShardOptions
       );
       reportCiResourceSnapshot("start");
     }
-    const clonedCacheSlots = clonePersistentCacheSlots(persistentCacheRoot, concurrency);
+    const clonedCacheSlots = clonePersistentCacheSlots(persistentCacheRoot, concurrency, policy);
     if (clonedCacheSlots > 0) {
       process.stdout.write(
         `[shard:cache] cloned restored Vitest seed into ${clonedCacheSlots} isolated lane(s)\n`,

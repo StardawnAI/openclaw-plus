@@ -1,24 +1,21 @@
 // Model-bound thinking cannot be exposed or replayed after a model switch.
 import {
-  bindsClaudeThinkingPrefix,
   CLAUDE_FABLE_5_THINKING_PROFILE,
   CLAUDE_HAIKU_55_THINKING_PROFILE,
   CLAUDE_OPUS_55_THINKING_PROFILE,
   CLAUDE_SONNET_55_THINKING_PROFILE,
-  rejectsClaudeAssistantPrefill,
   requiresClaudeDefaultSampling,
   requiresClaudeMandatoryAdaptiveThinking,
   resolveClaudeFable5ModelIdentity,
   resolveClaudeHaiku55ModelIdentity,
-  resolveClaudeModelIdentity,
+  resolveClaudeMythos5ModelIdentity,
   resolveClaudeNativeThinkingLevelMap,
   resolveClaudeOpus55ModelIdentity,
   resolveClaudeOpus5ModelIdentity,
-  resolveClaudeSonnet55ModelIdentity,
   resolveClaudeSonnet5ModelIdentity,
+  resolveClaudeSonnet55ModelIdentity,
   supportsClaudeNativeMaxEffort,
   supportsClaudeNativeXhighEffort,
-  usesClaude5RequestContract,
 } from "@openclaw/llm-core";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
@@ -27,6 +24,7 @@ import type { AnthropicEffort } from "../provider-options.js";
 import type {
   Context,
   Model,
+  ModelRequestHeaders,
   ModelThinkingLevel,
   SimpleStreamOptions,
   StopReason,
@@ -124,7 +122,7 @@ export function resetLearnedClaudeCodeVersionForTest(): void {
 /** Build OAuth headers and the matching billing identity from one request snapshot. */
 export function buildAnthropicClaudeCodeIdentity(
   betaHeader: string | undefined,
-  ...headerSources: (Record<string, string> | undefined)[]
+  ...headerSources: (ModelRequestHeaders | undefined)[]
 ): { headers: Record<string, string>; version: string } {
   const headers = new Headers({
     accept: "application/json",
@@ -134,7 +132,11 @@ export function buildAnthropicClaudeCodeIdentity(
   });
   for (const source of headerSources) {
     for (const [name, value] of Object.entries(source ?? {})) {
-      headers.set(name, value);
+      if (value === null) {
+        headers.delete(name);
+      } else {
+        headers.set(name, value);
+      }
     }
   }
   const floor = currentClaudeCodeVersionFloor();
@@ -189,7 +191,16 @@ export function usesClaudeStreamingRefusalContract(model: {
   params?: Record<string, unknown>;
   api?: string;
 }): boolean {
-  return normalizeApi(model.api) === "anthropic-messages" && usesClaude5RequestContract(model);
+  if (normalizeApi(model.api) !== "anthropic-messages") {
+    return false;
+  }
+  return (
+    resolveClaudeHaiku55ModelIdentity(model) !== undefined ||
+    resolveClaudeFable5ModelIdentity(model) !== undefined ||
+    resolveClaudeMythos5ModelIdentity(model) !== undefined ||
+    resolveClaudeOpus5ModelIdentity(model) !== undefined ||
+    resolveClaudeSonnet5ModelIdentity(model) !== undefined
+  );
 }
 
 export function requiresClaudeAdaptiveThinking(model: {
@@ -211,7 +222,10 @@ export function defaultsClaudeAdaptiveThinking(model: {
 }): boolean {
   return (
     requiresClaudeAdaptiveThinking(model) ||
-    (normalizeApi(model.api) === "anthropic-messages" && usesClaude5RequestContract(model))
+    (normalizeApi(model.api) === "anthropic-messages" &&
+      (resolveClaudeOpus5ModelIdentity(model) !== undefined ||
+        resolveClaudeHaiku55ModelIdentity(model) !== undefined ||
+        resolveClaudeSonnet5ModelIdentity(model) !== undefined))
   );
 }
 
@@ -281,7 +295,11 @@ export function mapAnthropicStopReason(reason: string | undefined): StopReason {
 
 /** Remove unsupported assistant prefills while preserving completed tool-use turns. */
 export function prepareClaudeNoPrefillRequestContext(model: Model, context: Context): Context {
-  if (!rejectsClaudeAssistantPrefill(model)) {
+  if (
+    !resolveClaudeOpus5ModelIdentity(model) &&
+    !resolveClaudeSonnet5ModelIdentity(model) &&
+    !resolveClaudeHaiku55ModelIdentity(model)
+  ) {
     return context;
   }
 
@@ -301,15 +319,13 @@ export function prepareClaudeNoPrefillRequestContext(model: Model, context: Cont
     : { ...context, messages: context.messages.slice(0, end) };
 }
 
-type ClaudeSamplingRequestParams = {
-  temperature?: unknown;
-  top_p?: unknown;
-  top_k?: unknown;
-  service_tier?: unknown;
-};
-
 export function applyClaudeRequestContract(
-  params: ClaudeSamplingRequestParams,
+  params: {
+    temperature?: unknown;
+    top_p?: unknown;
+    top_k?: unknown;
+    service_tier?: unknown;
+  },
   model: {
     id?: string;
     params?: Record<string, unknown>;
@@ -319,61 +335,117 @@ export function applyClaudeRequestContract(
   if (normalizeApi(model.api) !== "anthropic-messages") {
     return;
   }
-  if (!requiresClaudeDefaultSampling(model)) {
+  const opus5 = resolveClaudeOpus5ModelIdentity(model) !== undefined;
+  const sonnet5 = resolveClaudeSonnet5ModelIdentity(model) !== undefined;
+  const haiku55 = resolveClaudeHaiku55ModelIdentity(model) !== undefined;
+  if (!requiresClaudeDefaultSampling(model) && !opus5 && !sonnet5) {
     return;
   }
   delete params.temperature;
   delete params.top_p;
   delete params.top_k;
-  if (
-    resolveClaudeOpus5ModelIdentity(model) !== undefined ||
-    resolveClaudeSonnet5ModelIdentity(model) !== undefined ||
-    resolveClaudeHaiku55ModelIdentity(model) !== undefined
-  ) {
+  if (opus5 || sonnet5 || haiku55) {
     delete params.service_tier;
   }
 }
 
-/**
- * Claude identity of a transcript or target model on the Messages API. The
- * response model wins when it differs, so server-side fallbacks keep their own identity.
- */
-function resolveReplayClaudeIdentity(ref: ReplayModelRef): string | undefined {
+function resolveReplayModelBoundIdentity(ref: ReplayModelRef): string | undefined {
   if (normalizeApi(ref.api) !== "anthropic-messages") {
     return undefined;
   }
   const modelRef = hasConcreteResponseModel(ref)
     ? { id: ref.responseModelId }
     : { id: ref.modelId, params: ref.modelParams };
-  const identity = resolveClaudeModelIdentity(modelRef);
-  return identity.startsWith("claude-") ? identity : undefined;
+  const fableIdentity = resolveClaudeFable5ModelIdentity(modelRef);
+  const haikuIdentity = resolveClaudeHaiku55ModelIdentity(modelRef);
+  if (haikuIdentity) {
+    return `haiku:${haikuIdentity}`;
+  }
+  if (fableIdentity) {
+    return `fable:${fableIdentity}`;
+  }
+  const mythosIdentity = resolveClaudeMythos5ModelIdentity(modelRef);
+  if (mythosIdentity) {
+    return `mythos:${mythosIdentity}`;
+  }
+  const opusIdentity = resolveClaudeOpus5ModelIdentity(modelRef);
+  if (opusIdentity) {
+    return `opus:${opusIdentity}`;
+  }
+  const sonnetIdentity = resolveClaudeSonnet5ModelIdentity(modelRef);
+  return sonnetIdentity ? `sonnet:${sonnetIdentity}` : undefined;
 }
 
-export function resolveModelBoundThinkingReplayMode(params: {
-  source: ReplayModelRef;
-  target: ReplayModelRef;
-}): "default" | "preserve" | "drop" {
-  const sourceApi = normalizeApi(params.source.api);
-  const targetApi = normalizeApi(params.target.api);
-  const sourceIdentity = resolveReplayClaudeIdentity(params.source);
-  const targetIdentity = resolveReplayClaudeIdentity(params.target);
-  const sameRoute =
-    normalizeLowercaseStringOrEmpty(params.source.provider) ===
-      normalizeLowercaseStringOrEmpty(params.target.provider) &&
-    sourceApi === targetApi &&
-    normalizeModelId(params.source.modelId) === normalizeModelId(params.target.modelId);
-  if (!sourceIdentity && !targetIdentity) {
-    return "default";
+const FABLE_51_REPLAY_IDENTITY = /^fable:claude-fable-5-1(?=$|[^a-z0-9])/;
+const SONNET_55_REPLAY_IDENTITY = /^sonnet:claude-sonnet-5-5(?=$|[^a-z0-9])/;
+
+/**
+ * Verified live (2026-09-28): Fable 5.1 reads every earlier Claude generation
+ * except Sonnet 5.5; Sonnet 5.5 reads Sonnet 5 and pre-Claude-5 thinking but
+ * not Opus 5, Fable, or Mythos; no other model reads Sonnet 5.5 thinking. The
+ * API drops what a target cannot read, and every other cross-identity move
+ * stays dropped here until its replay contract is proven separately.
+ */
+function readsPriorClaudeThinking(
+  targetIdentity: string | undefined,
+  sourceIdentity: string | undefined,
+): boolean {
+  if (targetIdentity === undefined) {
+    return false;
   }
-  if (sourceIdentity && targetIdentity && sourceApi === targetApi) {
-    // Prefix-bound blocks cannot follow a switch: its system prompt and tools differ.
-    // Unbound blocks stay; the API drops whichever blocks the target cannot read.
-    return sourceIdentity === targetIdentity || !bindsClaudeThinkingPrefix({ id: sourceIdentity })
-      ? "preserve"
-      : "drop";
+  if (FABLE_51_REPLAY_IDENTITY.test(targetIdentity)) {
+    return (
+      sourceIdentity === undefined ||
+      (!SONNET_55_REPLAY_IDENTITY.test(sourceIdentity) && !sourceIdentity.startsWith("haiku:"))
+    );
   }
-  if (!sourceIdentity && !hasConcreteResponseModel(params.source) && targetIdentity && sameRoute) {
-    return "preserve";
+  if (SONNET_55_REPLAY_IDENTITY.test(targetIdentity)) {
+    return sourceIdentity === undefined || sourceIdentity.startsWith("sonnet:");
   }
-  return sourceApi === targetApi && sourceIdentity === targetIdentity ? "preserve" : "drop";
+  return false;
+}
+
+function isClaudeReplaySource(ref: ReplayModelRef): boolean {
+  const modelId = hasConcreteResponseModel(ref) ? ref.responseModelId : ref.modelId;
+  return /(?:^|[-/])claude-/.test(normalizeModelId(modelId));
+}
+
+/** The destination is fixed during one synchronous history transform. */
+export function prepareModelBoundThinkingReplay(
+  target: Pick<Model, "api" | "provider" | "id" | "params">,
+) {
+  const targetApi = normalizeApi(target.api);
+  const targetIdentity = resolveReplayModelBoundIdentity({
+    api: target.api,
+    modelId: target.id,
+    modelParams: target.params,
+  });
+  const targetProvider = normalizeLowercaseStringOrEmpty(target.provider);
+  const targetModelId = normalizeModelId(target.id);
+  return (source: ReplayModelRef): "default" | "preserve" | "drop" => {
+    const sourceApi = normalizeApi(source.api);
+    const sourceIdentity = resolveReplayModelBoundIdentity(source);
+    if (!sourceIdentity && !targetIdentity) {
+      return "default";
+    }
+    if (
+      sourceApi === targetApi &&
+      readsPriorClaudeThinking(targetIdentity, sourceIdentity) &&
+      isClaudeReplaySource(source)
+    ) {
+      return "preserve";
+    }
+    if (
+      !sourceIdentity &&
+      !hasConcreteResponseModel(source) &&
+      targetIdentity &&
+      normalizeLowercaseStringOrEmpty(source.provider) === targetProvider &&
+      sourceApi === targetApi &&
+      normalizeModelId(source.modelId) === targetModelId
+    ) {
+      return "preserve";
+    }
+    const sameModel = sourceApi === targetApi && sourceIdentity === targetIdentity;
+    return sameModel ? "preserve" : "drop";
+  };
 }

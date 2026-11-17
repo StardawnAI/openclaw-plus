@@ -1,5 +1,4 @@
 import { expect, it } from "vitest";
-import { projectRecordedModelPrompt } from "../sessions/user-turn-transcript.message.js";
 import { projectChatDisplayMessages } from "./chat-display-projection.js";
 import { projectSessionMessagePayload } from "./session-transcript-message.js";
 
@@ -9,7 +8,7 @@ it.each(["history", "live", "delta"] as const)(
     const text = "Continue reviewing the patch.";
     const guidance = "Advisor guidance for the model only: check the rollback path.";
     const message = {
-      role: "user" as const,
+      role: "user",
       content: text,
       timestamp: 1,
       __openclaw: {
@@ -35,6 +34,41 @@ it.each(["history", "live", "delta"] as const)(
       __openclaw: { runId: "next-turn-run" },
     });
     expect(message).toEqual(canonical);
-    expect(projectRecordedModelPrompt(message).content).toBe(guidance + "\n\n" + text);
+  },
+);
+
+it.each(["history", "live", "delta"] as const)(
+  "omits provider input replay from %s without changing durable messages or tool arguments",
+  (surface) => {
+    const message = {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Visible answer." },
+        {
+          type: "toolCall",
+          id: "call-1",
+          name: "example",
+          arguments: { openclawResponsesInputReplay: "user-supplied argument" },
+        },
+      ],
+      openclawResponsesInputReplay: {
+        afterResponseId: "synthetic-response",
+        before: ["synthetic-input-fingerprint"],
+        after: [],
+      },
+    };
+    const canonical = structuredClone(message);
+    const display =
+      surface === "history"
+        ? projectChatDisplayMessages([message])[0]
+        : projectSessionMessagePayload({
+            sessionKey: "agent:main:input-replay",
+            message,
+            historyDelta: surface === "delta",
+          }).payload?.message;
+
+    expect(display).not.toHaveProperty("openclawResponsesInputReplay");
+    expect(display).toMatchObject({ role: "assistant", content: message.content });
+    expect(message).toEqual(canonical);
   },
 );

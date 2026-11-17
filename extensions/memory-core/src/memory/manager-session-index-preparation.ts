@@ -22,7 +22,7 @@ type SessionIndexLine = {
   text: string;
   lineNo: number;
   endOfLine: boolean;
-  sourceLine?: number;
+  sourceLine: number;
   provenance?: MemoryEntryProvenance;
 };
 /** A `reset` page discards every earlier line: the export restarted at line 1. */
@@ -44,7 +44,7 @@ export function sessionIndexPages(page: SessionEntryPage): SessionIndexPage[] {
         text,
         lineNo: page.startLine + index + 1,
         endOfLine: end === line.length,
-        sourceLine: page.lineMap[index],
+        sourceLine: page.lineMap[index] ?? page.startLine + index + 1,
         provenance: page.lineProvenance[index],
       });
       bytes += text.length * 2 + 64;
@@ -126,7 +126,6 @@ export async function prepareSessionIndexStream(
       if (
         !state.crossedReset &&
         input.cutoffLine !== undefined &&
-        line.sourceLine !== undefined &&
         line.sourceLine >= input.cutoffLine
       ) {
         if (line.lineNo > 1) {

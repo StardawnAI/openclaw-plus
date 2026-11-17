@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { extractErrorCode } from "openclaw/plugin-sdk/security-runtime";
+import { lstatIfExists } from "openclaw/plugin-sdk/path-existence-runtime";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import pLimit from "p-limit";
 
@@ -15,16 +15,14 @@ function createExcludeMatcher(excludeDirs?: readonly string[], literalNames = fa
     excluded.has(literalNames ? name.toLowerCase() : normalizeLowercaseStringOrEmpty(name));
 }
 
-const runLimitedFs = pLimit(COPY_TREE_FS_CONCURRENCY);
-
-async function lstatIfExists(targetPath: string) {
-  return await runLimitedFs(fs.lstat, targetPath).catch((error: unknown) => {
-    if (extractErrorCode(error) === "ENOENT") {
-      return null;
-    }
-    throw error;
-  });
+export function isOpenShellMirrorPathExcluded(parts: readonly string[]): boolean {
+  return (
+    createExcludeMatcher(DEFAULT_OPEN_SHELL_MIRROR_EXCLUDE_DIRS)(parts[0] ?? "") ||
+    parts.slice(1).some(createExcludeMatcher(NESTED_GIT_EXCLUDE_DIRS, true))
+  );
 }
+
+const runLimitedFs = pLimit(COPY_TREE_FS_CONCURRENCY);
 
 async function reconcileMirrorPath(params: {
   sourcePath?: string;
@@ -33,7 +31,7 @@ async function reconcileMirrorPath(params: {
   replace: boolean;
   excludeDirs?: readonly string[];
 }): Promise<PreservedEntry> {
-  const targetStats = await lstatIfExists(params.targetPath);
+  const targetStats = await runLimitedFs(lstatIfExists, params.targetPath, "ENOENT");
   // Preserve host entries mirror transport cannot represent and their ancestor directories.
   if (targetStats && !targetStats.isDirectory() && !targetStats.isFile()) {
     return "other";

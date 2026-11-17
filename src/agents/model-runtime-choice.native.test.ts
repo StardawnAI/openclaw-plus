@@ -5,7 +5,11 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { createDeferredCore } from "../shared/deferred.js";
-import { testing as cliBackendsTesting } from "./cli-backends.test-support.js";
+import {
+  createClaudeCliBackends,
+  testing as cliBackendsTesting,
+} from "./cli-backends.test-support.js";
+import { configFor } from "./model-auth.fixtures.test-support.js";
 import type { ModelCatalogEntry } from "./model-catalog.js";
 import { prepareModelChoice, preparePublishedModelRuntimeChoice } from "./model-runtime-choice.js";
 import { createModelRuntimeChoiceOwnerFixture } from "./model-runtime-choice.test-support.js";
@@ -18,6 +22,12 @@ vi.mock("./prepared-model-catalog.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./prepared-model-catalog.js")>()),
   getPublishedPreparedModelCatalogOwnerSnapshot: () => published.owner,
   materializePreparedModelCatalogOwner: (owner: PreparedModelRuntimeSnapshot) => owner,
+  loadProviderScopedThinkingCatalog: async () => {
+    if (!published.owner) {
+      throw new Error("No published test model owner");
+    }
+    return published.owner.modelCatalog.entries;
+  },
   withPreparedModelCatalogOwner: async <T>(
     _params: unknown,
     read: (owner: PreparedModelRuntimeSnapshot) => T | Promise<T>,
@@ -26,12 +36,6 @@ vi.mock("./prepared-model-catalog.js", async (importOriginal) => ({
       throw new Error("No published test model owner");
     }
     return await read(published.owner);
-  },
-  loadProviderScopedThinkingCatalog: async () => {
-    if (!published.owner) {
-      throw new Error("No published test model owner");
-    }
-    return published.owner.modelCatalog.entries;
   },
 }));
 beforeEach(() => {
@@ -44,15 +48,7 @@ afterEach(() => {
 const request = { agentId: "main", provider: "fixture", model: "model" };
 const custom: OpenClawConfig = {
   plugins: { enabled: false },
-  models: {
-    providers: {
-      fixture: {
-        api: "openai-completions",
-        baseUrl: "https://custom.invalid/v1",
-        models: [],
-      },
-    },
-  },
+  ...configFor("fixture", "https://custom.invalid/v1", { api: "openai-completions" }),
 };
 
 it.each([
@@ -169,6 +165,102 @@ it.each(["worker", "gateway", "optional", "account"] as const)(
     }
   },
 );
+
+it("reports missing sign-in instead of a catalog refresh", async () => {
+  const owner = createModelRuntimeChoiceOwnerFixture(custom);
+  bindPreparedModelRuntimeAuth(owner, { store: { version: 1, profiles: {} } });
+  published.owner = owner;
+  const selection = await preparePublishedModelRuntimeChoice({
+    ...request,
+    cfg: custom,
+    runtimeId: "openclaw",
+  });
+  expect(selection).toEqual({
+    kind: "unavailable",
+    message:
+      'Runtime "openclaw" is not available for fixture/model: sign-in needed. Connect its provider account, or choose another model.',
+  });
+});
+
+it("keeps the configured Claude CLI runtime when switching models with saved setup tokens", async () => {
+  vi.stubEnv("ANTHROPIC_API_KEY", "");
+  cliBackendsTesting.setDepsForTest({
+    resolveRuntimeCliBackends: createClaudeCliBackends,
+  });
+  const entry: ModelCatalogEntry = {
+    provider: "anthropic",
+    id: "claude-sonnet-5",
+    name: "Claude Sonnet",
+    api: "anthropic-messages",
+  };
+  const cfg: OpenClawConfig = {
+    agents: {
+      defaults: {
+        model: { primary: "anthropic/claude-opus-5" },
+        models: { "anthropic/*": { agentRuntime: { id: "claude-cli" } } },
+      },
+    },
+  };
+  const owner = createModelRuntimeChoiceOwnerFixture(cfg, undefined, {
+    modelCatalog: { entries: [entry], routeVariants: [entry] },
+    authModes: {},
+    metadataSnapshot: createPluginMetadataSnapshotFixture({
+      plugins: [{ id: "anthropic", providers: ["anthropic"], cliBackends: ["claude-cli"] }],
+    }),
+  });
+  bindPreparedModelRuntimeAuth(owner, {
+    store: {
+      version: 1,
+      profiles: {
+        first: { type: "token", provider: "anthropic", token: "synthetic-first-token" },
+        second: { type: "token", provider: "anthropic", token: "synthetic-second-token" },
+      },
+    },
+  });
+  published.owner = owner;
+  const selection = await prepareModelSelectionRuntime({
+    cfg,
+    agentId: "main",
+    provider: entry.provider,
+    model: entry.id,
+    sessionEntry: { modelProvider: "anthropic" },
+    catalog: [entry],
+    hydrateThinkingCatalog: false,
+  });
+  expect(selection).toMatchObject({
+    status: "ready",
+    runtime: { kind: "set", runtime: "claude-cli" },
+  });
+});
+
+it("points a signed-out Claude CLI route at claude auth login", async () => {
+  const entry: ModelCatalogEntry = {
+    provider: "anthropic",
+    id: "claude-fixture",
+    name: "Claude Fixture",
+    reasoning: false,
+  };
+  const cfg: OpenClawConfig = {
+    plugins: { enabled: false },
+    agents: { defaults: { models: { "anthropic/*": { agentRuntime: { id: "claude-cli" } } } } },
+  };
+  const owner = createModelRuntimeChoiceOwnerFixture(cfg, undefined, {
+    modelCatalog: { entries: [entry], routeVariants: [entry] },
+  });
+  bindPreparedModelRuntimeAuth(owner, { store: { version: 1, profiles: {} } });
+  published.owner = owner;
+  const selection = await preparePublishedModelRuntimeChoice({
+    cfg,
+    agentId: "main",
+    provider: "anthropic",
+    model: "claude-fixture",
+  });
+  expect(selection).toEqual({
+    kind: "unavailable",
+    message:
+      "A runtime is not available for anthropic/claude-fixture: sign-in needed. If Claude Code is signed out, run claude auth login on the Gateway host, or choose another model.",
+  });
+});
 
 it("keeps keyless host selection after an explicit runtime reset without granting explicit availability", async () => {
   for (const agentRuntimeOverride of [undefined, "claude-cli"]) {
@@ -306,6 +398,61 @@ it("validates off-catalog host routes without granting an incompatible runtime",
   expect(choice.validate()).toContain("not available");
 });
 
+it.each(["implicit", "configured"] as const)(
+  "admits a %s native-only model for spawn like the turn path",
+  async (routing) => {
+    // Only the native runtime lists this model; no API row can materialize it.
+    const entry: ModelCatalogEntry = {
+      provider: "fixture",
+      id: "native-only",
+      name: "Native only",
+      reasoning: true,
+      nativeRuntime: "native-test",
+    };
+    const cfg: OpenClawConfig =
+      routing === "configured"
+        ? {
+            agents: {
+              defaults: {
+                models: { "fixture/native-only": { agentRuntime: { id: "native-test" } } },
+              },
+            },
+          }
+        : {};
+    const registry = createEmptyPluginRegistry();
+    registry.agentHarnesses.push({
+      pluginId: "native-test",
+      source: "fixture",
+      harness: {
+        id: "native-test",
+        label: "Native test",
+        authBootstrap: "harness",
+        supports: () => ({ supported: true }),
+        readModelCatalogReadiness: () => ({ accountType: "oauth" }),
+        runAttempt: vi.fn(),
+      },
+    });
+    const owner = createModelRuntimeChoiceOwnerFixture(cfg, () => true, {
+      pluginRegistry: registry,
+      modelCatalog: { entries: [entry], routeVariants: [entry] },
+    });
+    bindPreparedModelRuntimeAuth(owner, { store: { version: 1, profiles: {} } });
+    published.owner = owner;
+    expect(
+      await prepareModelChoice({
+        cfg,
+        agentId: "main",
+        raw: "fixture/native-only",
+        source: "override",
+      }),
+    ).toMatchObject({
+      kind: "resolved",
+      ref: { provider: "fixture", model: "native-only" },
+      model: { provider: "fixture", id: "native-only" },
+    });
+  },
+);
+
 it("rejects a stale native observation without renewing it", async () => {
   // This choice also runs inside config write locks; native discovery there needs its own decision.
   const entry: ModelCatalogEntry = {
@@ -346,62 +493,4 @@ it("rejects a stale native observation without renewing it", async () => {
     message: expect.stringContaining("Refresh the model catalog and choose again"),
   });
   expect(reload).not.toHaveBeenCalled();
-});
-
-it("keeps the configured Claude CLI runtime when switching models with saved setup tokens", async () => {
-  vi.stubEnv("ANTHROPIC_API_KEY", "");
-  cliBackendsTesting.setDepsForTest({
-    resolveRuntimeCliBackends: () => [
-      {
-        id: "claude-cli",
-        modelProvider: "anthropic",
-        pluginId: "anthropic",
-        config: { command: "claude" },
-      },
-    ],
-  });
-  const entry: ModelCatalogEntry = {
-    provider: "anthropic",
-    id: "claude-sonnet-5",
-    name: "Claude Sonnet",
-    api: "anthropic-messages",
-  };
-  const cfg: OpenClawConfig = {
-    agents: {
-      defaults: {
-        model: { primary: "anthropic/claude-opus-5" },
-        models: { "anthropic/*": { agentRuntime: { id: "claude-cli" } } },
-      },
-    },
-  };
-  const owner = createModelRuntimeChoiceOwnerFixture(cfg, undefined, {
-    modelCatalog: { entries: [entry], routeVariants: [entry] },
-    authModes: {},
-    metadataSnapshot: createPluginMetadataSnapshotFixture({
-      plugins: [{ id: "anthropic", providers: ["anthropic"], cliBackends: ["claude-cli"] }],
-    }),
-  });
-  bindPreparedModelRuntimeAuth(owner, {
-    store: {
-      version: 1,
-      profiles: {
-        first: { type: "token", provider: "anthropic", token: "synthetic-first-token" },
-        second: { type: "token", provider: "anthropic", token: "synthetic-second-token" },
-      },
-    },
-  });
-  published.owner = owner;
-  const selection = await prepareModelSelectionRuntime({
-    cfg,
-    agentId: "main",
-    provider: entry.provider,
-    model: entry.id,
-    sessionEntry: { modelProvider: "anthropic" },
-    catalog: [entry],
-    hydrateThinkingCatalog: false,
-  });
-  expect(selection).toMatchObject({
-    status: "ready",
-    runtime: { kind: "set", runtime: "claude-cli" },
-  });
 });

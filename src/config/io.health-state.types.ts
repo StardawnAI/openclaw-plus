@@ -42,5 +42,7 @@ export type ConfigHealthSnapshot = {
   basis: Readonly<Record<string, ConfigHealthEntryBasis>> | null;
 };
 
-/** Unavailable includes failed reads and writes whose outcome is unknown. */
-export type ConfigHealthUpdateResult = { status: "applied" | "conflict" | "unavailable" };
+/** Unavailable includes missing read basis and writes whose outcome is unknown. */
+export type ConfigHealthUpdateResult = {
+  status: "applied" | "conflict" | "unavailable";
+};

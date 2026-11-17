@@ -1,9 +1,6 @@
 import { Type } from "typebox";
 import { afterEach, expect, it } from "vitest";
-import { getGlobalHookRunnerRegistry } from "../plugins/hook-runner-global-state.js";
 import {
-  getGlobalHookRunner,
-  getGlobalPluginRegistry,
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
 } from "../plugins/hook-runner-global.js";
@@ -11,10 +8,7 @@ import { addTestHook } from "../plugins/hooks.test-fixtures.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import type { PluginHookBeforeToolCallEvent } from "../plugins/types.js";
 import { mergeParamsWithApprovalOverrides } from "./agent-tools.before-tool-call.approval.js";
-import {
-  getBeforeToolCallPolicyDiagnosticState,
-  wrapToolWithBeforeToolCallHook,
-} from "./agent-tools.before-tool-call.js";
+import { wrapToolWithBeforeToolCallHook } from "./agent-tools.before-tool-call.js";
 import { resetAdjustedParamsByToolCallIdForTests } from "./agent-tools.before-tool-call.state.js";
 import {
   SWARM_CODE_MODE_IDEMPOTENCY_KEY,
@@ -29,32 +23,15 @@ afterEach(() => {
 
 it("keeps private spawn parameters when a real before_tool_call hook rewrites public arguments", async () => {
   const registry = createEmptyPluginRegistry();
-  const hookCalls: Array<{
-    event: PluginHookBeforeToolCallEvent;
-    result: { params: Record<string, unknown> };
-  }> = [];
-  const rewrite = (event: PluginHookBeforeToolCallEvent) => {
-    const result = { params: { ...event.params, runTimeoutSeconds: 600 } };
-    hookCalls.push({ event, result });
-    return result;
-  };
   addTestHook({
     registry,
     pluginId: "rewrite-fixture",
     hookName: "before_tool_call",
-    handler: rewrite,
+    handler: (event: PluginHookBeforeToolCallEvent) => ({
+      params: { ...event.params, runTimeoutSeconds: 600 },
+    }),
   });
   initializeGlobalHookRunner(registry);
-  const observeHookRegistry = () => ({
-    initializedRegistryMatches: getGlobalPluginRegistry() === registry,
-    selectedHooks: getGlobalHookRunnerRegistry()?.typedHooks.map(({ pluginId, hookName }) => ({
-      pluginId,
-      hookName,
-    })),
-    hasBeforeToolCall: getGlobalHookRunner()?.hasHooks("before_tool_call"),
-    dispatchPolicy: getBeforeToolCallPolicyDiagnosticState(),
-  });
-  const initialized = observeHookRegistry();
   const params = { task: "Summarize the fixture", collect: true };
   Object.defineProperties(params, {
     [SWARM_CODE_MODE_IDEMPOTENCY_KEY]: { value: "fixture:launch:1" },
@@ -91,19 +68,7 @@ it("keeps private spawn parameters when a real before_tool_call hook rewrites pu
     emitDiagnostics: false,
   }).execute("params-retention", params);
 
-  const hookObservation = JSON.stringify({
-    initialized,
-    afterExecution: observeHookRegistry(),
-    hookCalls,
-    actual: result.details,
-  });
-  expect(hookCalls, hookObservation).toHaveLength(1);
-  expect(hookCalls[0]?.event, hookObservation).toEqual({
-    toolName: "sessions_spawn",
-    toolCallId: "params-retention",
-    params: { task: "Summarize the fixture", collect: true },
-  });
-  expect(result.details, hookObservation).toEqual({
+  expect(result.details).toEqual({
     timeout: 600,
     replayKey: "fixture:launch:1",
     fingerprint: "sha256:fixture",

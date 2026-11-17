@@ -1,26 +1,17 @@
 /** Process-local index of session keys that enabled cron jobs are bound to. */
-import { registerSessionMaintenancePreserveKeysProvider } from "../config/sessions/store-maintenance-preserve.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { tryResolveCronJobEffectiveAgentId } from "../cron/agent-id.js";
 import { resolveCronJobBoundSessionKeys } from "../cron/job-session-bindings.js";
 import type { CronJob } from "../cron/types.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../routing/session-key.js";
 import { sessionChanges } from "../sessions/session-row-changes.js";
 
 type SessionAutomationSource = {
-  getConfig: () => OpenClawConfig;
-  /** Disabled cron has a complete empty snapshot, including after stop. */
-  enabled?: boolean;
   /** Current in-memory cron jobs; undefined until the cron store is loaded. */
   getJobs: () => readonly CronJob[] | undefined;
   getDefaultAgentId: () => string | undefined;
 };
 
 let source: SessionAutomationSource | null = null;
-let unavailable = false;
-let sourceLoadFailed = false;
-let epochCounter = 0;
-let registeredEpoch = 0;
 
 let memo: {
   jobs: readonly CronJob[] | undefined;
@@ -32,28 +23,9 @@ let memo: {
 // jobs array before awaited persistence, so a read must not consume that delta.
 let publishedKeys: ReadonlySet<string> | undefined;
 
-/**
- * Claimed at cron service build time so registration authority follows build
- * order: a stale service whose start resolves after a config reload cannot
- * clobber the replacement's registration.
- */
-function claimSessionAutomationEpoch(): number {
-  return ++epochCounter;
-}
-
-/** Registered by the gateway cron owner; newer epochs win over stale services. */
-export function registerSessionAutomationSource(
-  next: SessionAutomationSource | null,
-  epoch?: number,
-): void {
-  const effectiveEpoch = epoch ?? claimSessionAutomationEpoch();
-  if (effectiveEpoch < registeredEpoch) {
-    return;
-  }
-  registeredEpoch = effectiveEpoch;
+/** The latest started cron service supplies the display-only automation index. */
+export function registerSessionAutomationSource(next: SessionAutomationSource | null): void {
   source = next;
-  sourceLoadFailed = false;
-  unavailable = next !== null && next.getJobs() === undefined;
   invalidateSessionAutomationIndex();
 }
 
@@ -65,7 +37,6 @@ export function unregisterSessionAutomationSource(owner: SessionAutomationSource
   if (source !== owner) {
     return;
   }
-  unavailable = source.enabled !== false;
   source = null;
   invalidateSessionAutomationIndex();
 }
@@ -110,7 +81,7 @@ function buildAutomationKeys(
       continue;
     }
     for (const key of resolveCronJobBoundSessionKeys(job, { cfg, defaultAgentId })) {
-      const agentId = tryResolveCronJobEffectiveAgentId(job, defaultAgentId);
+      const agentId = job.owner?.agentId ?? defaultAgentId;
       if (parseAgentSessionKey(key)) {
         keys.add(key);
       } else if (agentId) {
@@ -134,73 +105,6 @@ function refreshAutomationKeys(cfg: OpenClawConfig) {
   publishedKeys ??= memo.keys;
   return memo;
 }
-
-/** Only the current build can mark its resident snapshot unavailable after a load failure. */
-export function markSessionAutomationSourceUnavailable(epoch: number): void {
-  if (registeredEpoch === epoch && source?.enabled !== false) {
-    sourceLoadFailed = true;
-  }
-}
-
-/** Reserve replacement authority before retiring the previous scheduler or loading cron. */
-export function expectSessionAutomationSource(
-  cfg: OpenClawConfig,
-  enabled: boolean,
-  epoch = claimSessionAutomationEpoch(),
-): number {
-  registerSessionAutomationSource(
-    {
-      getConfig: () => cfg,
-      getJobs: () => (enabled ? undefined : []),
-      getDefaultAgentId: () => undefined,
-      enabled,
-    },
-    epoch,
-  );
-  return epoch;
-}
-
-// One process-local provider follows the Gateway's current epoch, including lazy startup.
-// It borrows cron's resident snapshot only; it never opens a second cron store.
-registerSessionMaintenancePreserveKeysProvider(async ({ storePath }) => {
-  const { resolveExplicitIncognitoAgentSqliteTarget } =
-    await import("../state/openclaw-agent-db.paths.js");
-  const memory = resolveExplicitIncognitoAgentSqliteTarget(storePath);
-  const { prepareSqliteTargetFromSessionStorePath } =
-    await import("../config/sessions/session-sqlite-target.js");
-  const target = memory ?? (await prepareSqliteTargetFromSessionStorePath(storePath));
-  const read = () => {
-    const current = source;
-    const jobs = current?.getJobs();
-    const deferArchiving = sourceLoadFailed || (current ? jobs === undefined : unavailable);
-    if (!current || !jobs) {
-      return { keys: new Set<string>(), deferArchiving };
-    }
-    const identities = buildAutomationKeys(jobs, current.getConfig(), current.getDefaultAgentId());
-    const keys = new Set<string>();
-    for (const identity of identities) {
-      const separator = identity.indexOf("\0");
-      const agentId =
-        separator < 0 ? parseAgentSessionKey(identity)?.agentId : identity.slice(0, separator);
-      if (agentId === target.agentId) {
-        keys.add(separator < 0 ? identity : identity.slice(separator + 1));
-      }
-    }
-    // An unresolved physical owner cannot safely map unqualified bindings to a store.
-    return { keys, deferArchiving: deferArchiving || (!target.agentId && identities.size > 0) };
-  };
-  let snapshot = read();
-  const capture = () => {
-    snapshot = read();
-    return snapshot.keys;
-  };
-  return {
-    capture,
-    refreshCandidates: capture,
-    deferArchiving: () => snapshot.deferArchiving,
-    dispose() {},
-  };
-});
 
 /** True when an enabled cron job is bound to the canonical session key. */
 export function sessionHasAutomation(

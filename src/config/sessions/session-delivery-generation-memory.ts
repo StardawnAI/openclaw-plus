@@ -1,4 +1,4 @@
-import { isSessionLifecycleMutationActive } from "../../sessions/session-lifecycle-admission.js";
+import { isSessionMutationActive } from "../../sessions/session-controller.lifecycle.js";
 import { assertSessionEntryCreationPublication } from "./session-accessor.sqlite-entry-cache-publication.js";
 import type { SessionEntryCreationOperation } from "./session-accessor.sqlite-entry-cache.types.js";
 import type { CapturedSessionActorStorageOwner } from "./session-actor-storage-binding.js";
@@ -11,7 +11,12 @@ import type {
   SessionGenerationFacts,
 } from "./session-delivery-generation.types.js";
 
-/** Stored links follow edits; a null revision also follows resets. Writers stay exact. */
+/**
+ * A stored reference names its conversation by key, plus its incarnation when it carries a
+ * lifecycle revision, so it follows message edits and branch switches to the current
+ * transcript. Live-writer fences (`exactTranscript`) also pin the transcript id. A null
+ * session id leases the row's absence.
+ */
 export function matchesSessionGeneration(
   input: SessionGenerationFacts,
   entry: Pick<SessionGenerationEntry, "sessionId" | "lifecycleRevision"> | null | undefined,
@@ -19,10 +24,12 @@ export function matchesSessionGeneration(
   if (!entry || input.sessionId === null) {
     return Boolean(entry) !== (input.sessionId === null);
   }
+  if (input.exactTranscript && entry.sessionId !== input.sessionId) {
+    return false;
+  }
   return (
-    (input.followConversation || entry.sessionId === input.sessionId) &&
-    ((input.followConversation && input.lifecycleRevision === null) ||
-      (entry.lifecycleRevision ?? null) === input.lifecycleRevision)
+    (!input.exactTranscript && input.lifecycleRevision === null) ||
+    (entry.lifecycleRevision ?? null) === input.lifecycleRevision
   );
 }
 
@@ -93,7 +100,7 @@ export async function prepareMemorySessionGeneration(
   return {
     assertCurrent,
     assertDeliveryCurrent() {
-      if (isSessionLifecycleMutationActive(source.path, [input.sessionKey, initial?.sessionId])) {
+      if (isSessionMutationActive(source.path, [input.sessionKey, initial?.sessionId])) {
         throw new SessionDeliveryGenerationUnavailableError();
       }
       assertCurrent();

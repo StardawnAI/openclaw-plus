@@ -1,9 +1,9 @@
-import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import {
-  getPluginInstance,
-  pluginInvocationContext,
-  type PluginInstanceHandle,
-} from "./plugin-instance-scope.js";
+  collectNestedErrorCandidates,
+  materializeErrorStack,
+} from "../infra/error-graph-internal.js";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { getPluginInstance, type PluginInstanceHandle } from "./plugin-instance-scope.js";
 import {
   collectRegistryInvocationInstances,
   PluginInvocationScope,
@@ -32,6 +32,13 @@ export function getPluginRegistryInspectionResources(registry: PluginRegistry) {
 
 function throwDisposalFailures(failures: Error[]): void {
   if (failures.length > 0) {
+    for (const failure of failures.flatMap(collectNestedErrorCandidates)) {
+      try {
+        materializeErrorStack(failure);
+      } catch {
+        // Plugin errors may be frozen; preserve their identity and custody classification.
+      }
+    }
     const Failure = failures.some(hasRetainedPluginRuntimeCloseError)
       ? AggregateError
       : PluginRuntimeCloseCompletedError;
@@ -42,8 +49,15 @@ function throwDisposalFailures(failures: Error[]): void {
 /** Owns only an explicitly acquired, uncached inspection's registration resources. */
 export class PluginRegistryInspectionResources {
   readonly #rollbackInstances = new Set<object>();
-  readonly #source = new PluginRegistrationResourceSource(() =>
-    this.retire(this.#registry, this.#rollbackInstances),
+  readonly #source = new PluginRegistrationResourceSource(
+    () => this.retire?.(this.#registry, this.#rollbackInstances),
+    () => {
+      // Released handles can outlive physical disposal; do not retain their load graphs.
+      this.retire = undefined;
+      this.#registry = undefined;
+      this.#rollbackInstances.clear();
+      this.#adoptedInvocations = undefined;
+    },
   );
   readonly #claim = this.#source.acquireClaim("inspection");
   readonly #registries = new Set<PluginRegistry>();
@@ -53,10 +67,12 @@ export class PluginRegistryInspectionResources {
   #release?: Promise<void>;
 
   constructor(
-    private readonly retire: (
-      registry: PluginRegistry | undefined,
-      rollbackInstances: ReadonlySet<object>,
-    ) => Promise<void>,
+    private retire:
+      | ((
+          registry: PluginRegistry | undefined,
+          rollbackInstances: ReadonlySet<object>,
+        ) => Promise<void>)
+      | undefined,
   ) {}
 
   attach(registry: PluginRegistry): void {
@@ -151,39 +167,28 @@ export class PluginRegistryInspectionResources {
     this.#adoptedInvocations = new PluginInvocationScope(registry, borrowed, {
       retained: true,
       kind: "custody",
-      // The inspection outlives its construction caller; it owns physical donor
-      // authority, never that caller's execution collector.
-      parent: { lookup: () => undefined },
     });
   }
 
   wrapAdoptedValue<T>(value: T): T {
+    // Borrowers can still need adopted values before physical cleanup finishes.
+    if (!this.retire) {
+      throw new Error("Plugin inspection resources have been released");
+    }
     return this.#adoptedInvocations ? this.#adoptedInvocations.wrap(value) : value;
   }
 
-  /** Callers name executable capabilities; an inspection itself is only physical custody. */
+  /** Logical use owns its execution consumers separately from this inspection's physical claims. */
   createInvocationScope(
     registry: PluginRegistry,
-    instances: Iterable<PluginInstanceHandle>,
+    instances: Iterable<PluginInstanceHandle> = collectRegistryInvocationInstances(registry),
   ): PluginInvocationScope {
     if (this.#release) {
       throw new Error("Plugin inspection resources have been released");
     }
-    const current = pluginInvocationContext.getStore();
-    const adopted = this.#adoptedInvocations;
     return new PluginInvocationScope(registry, instances, {
       retained: true,
-      // Donor bindings lend invocation authority; only the live caller lends work
-      // custody. Reporting every physical donor as turn work would widen reload fencing.
-      parent: adopted
-        ? {
-            lookup: (instance) => current?.lookup(instance) ?? adopted.lookup(instance),
-            retainInvocation: (instance) => current?.retainInvocation?.(instance),
-            get retainedInstances() {
-              return current?.retainedInstances;
-            },
-          }
-        : current,
+      parent: this.#adoptedInvocations,
     });
   }
 

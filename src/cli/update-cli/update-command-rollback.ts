@@ -26,10 +26,12 @@ import type { PackageUpdateTransaction } from "../../infra/package-update-swap-c
 import { readExistingStateRootMode } from "../../infra/private-dir-mode.js";
 import {
   readUpdateStateSchemaVersions,
-  resolveUpdateStateContentVersion,
-  updateStateSchemaVersionsMatch,
   type UpdateStateSchemaVersion,
 } from "../../infra/update-candidate-state.js";
+import {
+  resolveUpdateStateContentVersion,
+  updateStateSchemaVersionsMatch,
+} from "../../infra/update-candidate-state.versions.js";
 import type { UpdateDatabaseBackup } from "../../infra/update-database-backup.js";
 import { NativePackageRollbackError } from "../../infra/update-native-package-stage.js";
 import { unsafeUpdateRecovery } from "../../infra/update-recovery.js";
@@ -457,7 +459,7 @@ export async function rollbackFailedUpdate(params: {
               endedAtMs: Date.now(),
               detail: restored.advisory?.message ?? restored.stderrTail ?? restored.reason,
             },
-            { env: opts.run.env },
+            opts.run,
           );
         }
         if (restored.exitCode !== 0) {
@@ -583,6 +585,9 @@ export async function rollbackFailedUpdate(params: {
         }
       : stopped;
     failureReason = "service-revalidation-failed";
+    if (stopped.windowsTaskAutoStartRecovery) {
+      params.onGatewayStartAttempted?.();
+    }
     await stopped.windowsTaskAutoStartRecovery?.restore(
       true,
       createWindowsTaskAutoStartGuard({
@@ -628,7 +633,7 @@ export async function rollbackFailedUpdate(params: {
           status: "completed",
           endedAtMs: Date.now(),
         },
-        { env: opts.run.env },
+        opts.run,
       );
     }
     failureReason = "restart-unhealthy";
@@ -725,7 +730,7 @@ export async function rollbackFailedUpdate(params: {
     if (run) {
       const endedAtMs = Date.now();
       for (const row of updateRunStepsFromResultStep(step)) {
-        recordUpdateRunStep(run.runId, { ...row, detail, endedAtMs }, { env: run.env });
+        recordUpdateRunStep(run.runId, { ...row, detail, endedAtMs }, run);
       }
     }
     return failed(failureReason, dataAtRisk);

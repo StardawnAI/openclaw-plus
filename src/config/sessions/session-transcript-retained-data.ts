@@ -1,4 +1,3 @@
-import type { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { sql, type AliasableExpression } from "kysely";
@@ -6,15 +5,15 @@ import {
   jsonPathValue,
   jsonRemovePaths,
   jsonSetPath,
-  jsonNativeFieldsValid,
+  jsonValid,
 } from "../../infra/database-engine/json-values.js";
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import type { EngineConnection } from "../../infra/sql-connection.js";
 import { isPostgresSqlConnection } from "../../infra/sql-connection.js";
 import {
   sqliteSessionIdWriteScope,
   withSqliteDatabaseWriteScope,
 } from "../../infra/sqlite-database-admission.js";
-import { scanJsonObjectFields } from "../../state/json-predicate-fields.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import type { TranscriptEvent } from "./session-accessor.sqlite-contract.js";
 import type { SqliteTranscriptStorageRow } from "./session-accessor.sqlite-read.js";
@@ -22,6 +21,7 @@ import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import { readNextTranscriptSeq } from "./session-accessor.sqlite-transcript-state.js";
 import { transcriptEventReadBytesSql } from "./session-transcript-read-bytes.js";
 import {
+  TRANSCRIPT_PAYLOAD_COLUMNS,
   transcriptEventJsonSql,
   transcriptEventNavigationSql,
   transcriptEventWithoutCustomDataBytesSql,
@@ -29,14 +29,14 @@ import {
 
 /** Admit suffix repairs against their projected bytes without decoding opaque bodies. */
 export function transcriptRetainedDataBytesSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   retainedIds: readonly string[],
 ) {
   if (retainedIds.length === 0) {
     return transcriptEventReadBytesSql();
   }
   const event = transcriptEventNavigationSql(database);
-  return /* kysely-allow-raw: mirror the retained-data projection's SQLite-first member matching. */ sql<number>`CASE WHEN ${jsonNativeFieldsValid(database, event)} THEN
+  return /* kysely-allow-raw: mirror the retained-data projection's SQLite-first member matching. */ sql<number>`CASE WHEN ${jsonValid(database, event)} THEN
     CASE WHEN ${jsonPathValue(database, event, sql.lit("$.type"))} = 'custom'
       AND ${jsonPathValue(database, event, sql.lit("$.id"))} IN (${sql.join(retainedIds)})
       THEN ${transcriptEventWithoutCustomDataBytesSql(database)} ELSE ${transcriptEventReadBytesSql()} END
@@ -45,13 +45,13 @@ export function transcriptRetainedDataBytesSql(
 
 /** Custom data is opaque to topology and indexing; cleanup keeps it in SQLite. */
 export function projectTranscriptRetainedDataSql(
-  database: DatabaseSync,
+  database: EngineConnection,
   event: AliasableExpression<string>,
   retainedIds: readonly string[],
 ): AliasableExpression<string> {
   return retainedIds.length === 0
     ? event
-    : /* kysely-allow-raw: bound cleanup planning to navigation while retaining opaque custom data in its original row. */ sql<string>`CASE WHEN ${jsonNativeFieldsValid(database, event)} THEN
+    : /* kysely-allow-raw: bound cleanup planning to navigation while retaining opaque custom data in its original row. */ sql<string>`CASE WHEN ${jsonValid(database, event)} THEN
         CASE WHEN ${jsonPathValue(database, event, sql.lit("$.type"))} = 'custom'
           AND ${jsonPathValue(database, event, sql.lit("$.id"))} IN (${sql.join(retainedIds)})
         THEN ${jsonRemovePaths(database, event, [sql.lit("$.data")])} ELSE ${event} END
@@ -94,11 +94,11 @@ export function stageRetainedTranscriptData(
     if (!original) {
       throw new Error("Retained transcript data has no original suffix row");
     }
-    const { parentId: _oldParent, data: originalData, ...before } = original.event;
-    const { parentId, data: nextData, ...after } = event;
+    const { parentId: _oldParent, ...before } = original.event;
+    const { parentId, ...after } = event;
     if (
-      // Exceptional projections retain opaque data; compare its serialized representation without recursive equality.
-      (Object.hasOwn(event, "data") && JSON.stringify(originalData) !== JSON.stringify(nextData)) ||
+      Object.hasOwn(before, "data") ||
+      Object.hasOwn(after, "data") ||
       !isDeepStrictEqual(before, after) ||
       (parentId !== null && typeof parentId !== "string")
     ) {
@@ -130,30 +130,6 @@ export function copyRetainedTranscriptPayload(
   parentId?: string | null,
 ): void {
   const db = getSessionKysely(database.db);
-  // Ordinary rows remain an INSERT SELECT. Only exceptional parent rewrites decode text.
-  let exceptionalJson: string | undefined;
-  if (parentId !== undefined) {
-    const source = executeSqliteQuerySync(
-      database.db,
-      db
-        .selectFrom("transcript_events")
-        .select(transcriptEventJsonSql(database.db).as("event_json"))
-        .where("session_id", "=", sessionId)
-        .where("seq", "=", sourceSeq)
-        .where((eb) =>
-          eb.not(jsonNativeFieldsValid(database.db, transcriptEventJsonSql(database.db))),
-        ),
-    ).rows[0];
-    if (source) {
-      const raw = source.event_json;
-      const fields = scanJsonObjectFields(raw, ["parentId"]);
-      const span = fields.firstOffsets.get("parentId");
-      if (!fields.valid || !span) {
-        throw new Error("Retained transcript parent is invalid");
-      }
-      exceptionalJson = raw.slice(0, span.start) + JSON.stringify(parentId) + raw.slice(span.end);
-    }
-  }
   const copied = withSqliteDatabaseWriteScope(
     database.db,
     [sqliteSessionIdWriteScope(sessionId)],
@@ -162,37 +138,20 @@ export function copyRetainedTranscriptPayload(
         database.db,
         db
           .insertInto("transcript_events")
-          .columns([
-            "session_id",
-            "seq",
-            "event_json",
-            "event_zstd",
-            "event_utf8_bytes",
-            "navigation_json",
-            "navigation_type",
-            "navigation_custom_type",
-            "navigation_display",
-            "message_role",
-            "navigation_last_type",
-            "navigation_last_custom_type",
-            "navigation_valid",
-            "created_at",
-          ])
+          .columns(TRANSCRIPT_PAYLOAD_COLUMNS)
           .expression(
             db
               .selectFrom("transcript_events")
               .select((eb) => {
                 const eventJson: AliasableExpression<string | null> =
-                  exceptionalJson !== undefined
-                    ? eb.val(exceptionalJson)
-                    : parentId === undefined
-                      ? eb.ref("event_json")
-                      : jsonSetPath(
-                          database.db,
-                          transcriptEventJsonSql(database.db),
-                          sql.lit("$.parentId"),
-                          sql.val(parentId),
-                        );
+                  parentId === undefined
+                    ? eb.ref("event_json")
+                    : jsonSetPath(
+                        database.db,
+                        transcriptEventJsonSql(database.db),
+                        sql.lit("$.parentId"),
+                        sql.val(parentId),
+                      );
                 return [
                   eb.val(sessionId).as("session_id"),
                   eb.val(destinationSeq).as("seq"),

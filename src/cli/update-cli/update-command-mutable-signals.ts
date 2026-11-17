@@ -1,3 +1,4 @@
+import { sendUpdateResultTelemetry } from "../../infra/update-result-telemetry.js";
 import {
   finishInterruptedUpdateBeforeActivation,
   getUpdateRun,
@@ -27,7 +28,6 @@ type MutableAdmission = {
   phase: UpdateRunRecord["phase"];
   terminal?: Promise<void>;
   recovering?: true;
-  ledgerRecordingRetired?: true;
   interruption?: { signal: "SIGINT" | "SIGTERM" | "SIGHUP"; phase: string; error: Error };
   forward: Set<() => void>;
 };
@@ -183,14 +183,7 @@ export function admitMutableUpdateSignalRun(run: Run, record: UpdateRunRecord): 
   });
 }
 
-export function retireMutableUpdateSignalLedgerRecording(run: Run): void {
-  const admission = admissions.get(run);
-  if (admission) {
-    admission.ledgerRecordingRetired = true;
-  }
-}
-
-function retireMutableUpdateSignalRun(run: Run): void {
+export function retireMutableUpdateSignalRun(run: Run): void {
   admissions.delete(run);
 }
 
@@ -218,10 +211,6 @@ export async function withMutableUpdateSignals<T>(
       executorFence.assertCurrent();
     };
     return () => {
-      // Candidate migrations can retire this reader without ending signal ownership.
-      if (admission.ledgerRecordingRetired) {
-        return;
-      }
       assertCurrent();
       if (admission.unconfirmedWrite) {
         throw admission.unconfirmedWrite.error;
@@ -236,7 +225,12 @@ export async function withMutableUpdateSignals<T>(
       }
       assertCurrent();
       // Accepted worker writes have settled; the original interruption policy owns this row.
-      finishInterruptedUpdateBeforeActivation(expected, assertCurrent, { env });
+      finishInterruptedUpdateBeforeActivation(
+        expected,
+        assertCurrent,
+        { env },
+        (payload) => void sendUpdateResultTelemetry(payload, { env }),
+      );
     };
   };
   let settle: (() => void) | undefined;

@@ -6,7 +6,7 @@ import { stripInternalRuntimeContext } from "../../../../src/agents/internal-run
 import { isHeartbeatUserMessage } from "../../../../src/auto-reply/heartbeat-filter.js";
 import { HEARTBEAT_PROMPT } from "../../../../src/auto-reply/heartbeat.js";
 import { stripInboundMetadata } from "../../../../src/auto-reply/reply/strip-inbound-meta.js";
-import { HEARTBEAT_TOKEN, isSilentReplyPayloadText } from "../../../../src/auto-reply/tokens.js";
+import { HEARTBEAT_TOKEN } from "../../../../src/auto-reply/tokens.js";
 import {
   isSessionArchiveArtifactName,
   isUsageCountedSessionTranscriptFileName,
@@ -18,6 +18,7 @@ import {
   isCronRunSessionKey,
   isDreamingNarrativeSessionStoreKey,
 } from "../../../../src/sessions/session-key-utils.js";
+import { prepareAssistantTranscriptText } from "../../../../src/shared/chat-message-content.js";
 import {
   collectRawSessionText,
   createSessionEntryHasher,
@@ -167,9 +168,6 @@ function sanitizeSessionText(text: string, role: "user" | "assistant"): string |
       DIRECT_CRON_PROMPT_RE.test(normalized) ||
       isHeartbeatUserMessage({ role, content: normalized }, HEARTBEAT_PROMPT))
   ) {
-    return null;
-  }
-  if (isSilentReplyPayloadText(normalized)) {
     return null;
   }
   // Assistant-side machinery acks: HEARTBEAT_OK is the canonical "all clear,
@@ -425,15 +423,19 @@ export async function renderSessionEntry(
       insideHeartbeatTurn ||
       insideRecalledMemoryTurn ||
       generatedByDreamingNarrative ||
-      generatedByCronRun
+      generatedByCronRun ||
+      ("display" in message && message.display === false)
     ) {
       await flushPage(false);
       continue;
     }
-    const rawText = collectRawSessionText(message.content);
+    const rawText = prepareAssistantTranscriptText(
+      message,
+      collectRawSessionText(message.content) ?? undefined,
+    );
     // User text is not trusted archive-wide provenance. Per-message sanitization
     // drops cron prompts without clearing unrelated content from the archive.
-    const text = rawText === null ? null : sanitizeSessionText(rawText, message.role);
+    const text = rawText === undefined ? null : sanitizeSessionText(rawText, message.role);
     if (!text) {
       await flushPage(false);
       continue;

@@ -1,78 +1,55 @@
-import type { DatabaseSync } from "node:sqlite";
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { sql } from "kysely";
 import {
   jsonArrayElements,
-  jsonNativeFieldsValid,
   jsonObjectValue,
   jsonPathValue,
   jsonSetPath,
 } from "../../infra/database-engine/json-values.js";
-import { iterateSqliteQuerySync } from "../../infra/kysely-sync.js";
+import {
+  executeSqliteQueryTakeFirstSync,
+  iterateSqliteQuerySync,
+} from "../../infra/kysely-sync.js";
+import type { EngineConnection } from "../../infra/sql-connection.js";
 import {
   resolveHistoryMessageSequence,
   resolveVisibleHistoryProjection,
   resolveVisibleHistoryRange,
 } from "./session-accessor.sqlite-history-projection.js";
 import {
-  getActiveTranscriptKysely,
+  selectActiveTranscriptEventRows,
   type CurrentTranscriptProjection,
 } from "./session-accessor.sqlite-projection-read.js";
 import { resolveVisibleMessagePositions } from "./session-accessor.sqlite-reset-window.js";
 import { resolveSqliteSessionTranscriptReadFence } from "./session-transcript-read-fence.js";
-import { transcriptEventNavigationSql, transcriptEventRunIdSql } from "./transcript-payload.js";
+import {
+  transcriptEventNavigationSql,
+  transcriptEventRunIdSql,
+  transcriptPredicateSql,
+} from "./transcript-payload.js";
 import { assertTranscriptNavigationValid } from "./transcript-predicate-fields.js";
 
 // These derived facts omit transcript bodies and remain inside the admitted snapshot.
-// Rows native fields cannot decode return the original entry for readInputMessage.
-export const inputMessageJson = (database: DatabaseSync, includeSteering = true) => {
+const inputMessageJson = (database: EngineConnection) => {
   const navigation = transcriptEventNavigationSql(database, "event");
-  const facts = jsonSetPath(
+  return jsonSetPath(
     database,
     jsonObjectValue(database, {
       role: jsonPathValue(database, navigation, sql.lit("$.message.role")),
       idempotencyKey: jsonPathValue(database, navigation, sql.lit("$.message.idempotencyKey")),
       __openclaw: jsonObjectValue(database, {
         runId: transcriptEventRunIdSql(database, "event"),
-        ...(includeSteering
-          ? {
-              steerTargetRunId: jsonPathValue(
-                database,
-                navigation,
-                sql.lit("$.message.__openclaw.steerTargetRunId"),
-              ),
-            }
-          : {}),
+        steerTargetRunId: jsonPathValue(
+          database,
+          navigation,
+          sql.lit("$.message.__openclaw.steerTargetRunId"),
+        ),
       }),
     }),
     sql.lit("$.provenance"),
     jsonPathValue(database, navigation, sql.lit("$.message.provenance"), "json"),
     true,
   );
-  return /* kysely-allow-raw: CASE fences native decoding of escapes JSONB rejects. */ sql<string>`CASE WHEN ${jsonNativeFieldsValid(database, navigation)} THEN ${facts} ELSE ${navigation} END`;
 };
-
-export function readInputMessage(
-  row: { native: unknown; message_json: string },
-  includeSteering = true,
-) {
-  const parsed: unknown = JSON.parse(row.message_json);
-  if (row.native) {
-    return asOptionalRecord(parsed);
-  }
-  const message = asOptionalRecord(asOptionalRecord(parsed)?.message);
-  const internal = asOptionalRecord(message?.["__openclaw"]);
-  // Match the native control-facts shape without passing exceptional message bodies to callers.
-  return {
-    role: message?.role ?? null,
-    idempotencyKey: message?.idempotencyKey ?? null,
-    provenance: message?.provenance ?? null,
-    __openclaw: {
-      runId: internal?.runId ?? null,
-      ...(includeSteering ? { steerTargetRunId: internal?.steerTargetRunId ?? null } : {}),
-    },
-  };
-}
 
 type RunInputVisibility =
   | { hidden: false }
@@ -100,29 +77,16 @@ export function readSessionTranscriptRunInputVisibilityFromProjection(
     ...projection.resolved,
   });
   const visible = resolveVisibleMessagePositions(projection);
-  const db = projection.database.db;
-  const navigation = transcriptEventNavigationSql(db, "event");
-  const native = jsonNativeFieldsValid(db, navigation);
-  const steerTargetRunId =
-    /* kysely-allow-raw: CASE fences native decoding; readInputMessage rechecks other rows. */
-    sql<
-      string | null
-    >`CASE WHEN ${native} THEN ${jsonPathValue(db, navigation, sql.lit("$.message.__openclaw.steerTargetRunId"))} END`;
   const keptPositions =
     /* kysely-allow-raw: Bind the exact retained display positions without SQLite's variable limit. */
-    sql<number>`(SELECT CAST(value AS BIGINT) FROM ${jsonArrayElements(db, sql.val(JSON.stringify(visible.kept)))})`;
-  const userInputs = getActiveTranscriptKysely(projection.database)
-    .selectFrom("session_transcript_active_events as active")
-    .innerJoin("transcript_events as event", (join) =>
-      join
-        .onRef("event.session_id", "=", "active.session_id")
-        .onRef("event.seq", "=", "active.event_seq"),
-    )
+    sql<number>`(SELECT CAST(value AS BIGINT) FROM ${jsonArrayElements(projection.database.db, sql.val(JSON.stringify(visible.kept)))})`;
+  const userInputs = selectActiveTranscriptEventRows(projection.database)
     .select([
       "active.message_position",
-      "event.navigation_valid",
+      transcriptPredicateSql(projection.database.db, "navigation_valid", "event").as(
+        "navigation_valid",
+      ),
       inputMessageJson(projection.database.db).as("message_json"),
-      native.as("native"),
     ])
     .where("active.session_id", "=", projection.resolved.sessionId)
     .where("active.message_position", "<", projection.state.activeMessageCount)
@@ -135,16 +99,16 @@ export function readSessionTranscriptRunInputVisibilityFromProjection(
         : eb("active.message_position", ">=", visible.postStart),
     )
     .where((eb) =>
-      eb.or([eb("event.message_role", "=", "user"), eb("event.navigation_valid", "=", 0)]),
+      eb.or([
+        eb(transcriptPredicateSql(projection.database.db, "message_role", "event"), "=", "user"),
+        eb(transcriptPredicateSql(projection.database.db, "navigation_valid", "event"), "=", 0),
+      ]),
     )
     .$narrowType<{ message_position: number }>();
   let readAfter = params.previous?.scannedThroughMessagePosition;
   if (readAfter === undefined) {
-    let anchor:
-      | { message_position: number; message: Record<string, unknown> | undefined }
-      | undefined;
-    for (const row of iterateSqliteQuerySync(
-      db,
+    const anchor = executeSqliteQueryTakeFirstSync(
+      projection.database.db,
       userInputs
         .innerJoin("transcript_event_identities as identity", (join) =>
           join
@@ -152,16 +116,19 @@ export function readSessionTranscriptRunInputVisibilityFromProjection(
             .onRef("identity.seq", "=", "active.event_seq"),
         )
         .where("identity.message_idempotency_key", "=", params.idempotencyKey)
-        .where(steerTargetRunId, "is", null),
-    )) {
-      assertTranscriptNavigationValid(row.navigation_valid);
-      const message = readInputMessage(row);
-      if (asOptionalRecord(message?.["__openclaw"])?.steerTargetRunId == null) {
-        anchor = { message_position: row.message_position, message };
-        break;
-      }
-    }
-    if (!anchor || !params.isHiddenInput(anchor.message)) {
+        .where(
+          jsonPathValue(
+            projection.database.db,
+            transcriptEventNavigationSql(projection.database.db, "event"),
+            sql.lit("$.message.__openclaw.steerTargetRunId"),
+          ),
+          "is",
+          null,
+        )
+        .limit(1),
+    );
+    assertTranscriptNavigationValid(anchor?.navigation_valid);
+    if (!anchor || !params.isHiddenInput(JSON.parse(anchor.message_json))) {
       return { hidden: false };
     }
     readAfter = anchor.message_position;
@@ -188,24 +155,22 @@ export function readSessionTranscriptRunInputVisibilityFromProjection(
     .where("active.message_position", "<=", scannedThroughMessagePosition)
     .where((eb) =>
       eb.or([
-        eb.not(native),
-        eb(steerTargetRunId, "=", params.runId),
-        eb(transcriptEventRunIdSql(db, "event"), "=", params.runId),
+        eb(
+          jsonPathValue(
+            projection.database.db,
+            transcriptEventNavigationSql(projection.database.db, "event"),
+            sql.lit("$.message.__openclaw.steerTargetRunId"),
+          ),
+          "=",
+          params.runId,
+        ),
+        eb(transcriptEventRunIdSql(projection.database.db, "event"), "=", params.runId),
       ]),
     )
     .orderBy("active.message_position", "asc");
-  for (const row of iterateSqliteQuerySync(db, laterInputs)) {
+  for (const row of iterateSqliteQuerySync(projection.database.db, laterInputs)) {
     assertTranscriptNavigationValid(row.navigation_valid);
-    const message = readInputMessage(row);
-    const internal = asOptionalRecord(message?.["__openclaw"]);
-    if (
-      !row.native &&
-      internal?.steerTargetRunId !== params.runId &&
-      internal?.runId !== params.runId
-    ) {
-      continue;
-    }
-    if (!params.isHiddenInput(message)) {
+    if (!params.isHiddenInput(JSON.parse(row.message_json))) {
       const firstVisibleMessageSeq = resolveHistoryMessageSequence(
         visible,
         history,

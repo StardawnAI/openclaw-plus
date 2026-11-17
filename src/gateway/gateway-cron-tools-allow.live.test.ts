@@ -19,7 +19,6 @@ import type { CronRunLogEntry } from "../cron/run-log-types.js";
 import type { CronJob } from "../cron/types.js";
 import type { Message } from "../llm/types.js";
 import { listKnownProviderAuthEnvVarNamesCore } from "../secrets/provider-env-vars.js";
-import type { SessionsUsageResult } from "../shared/usage-types.js";
 import { isProjectedForwardedMessage } from "./chat-display-projection.helpers.js";
 import { summarizeCronToolProbe } from "./gateway-cron-tools-allow.test-helpers.js";
 
@@ -36,47 +35,6 @@ async function cliJson(instance: OpenClawTestInstance, args: string[]): Promise<
   );
   expect(result.code, `${args[0]} ${args[1]}: ${result.stderr}\n${result.stdout}`).toBe(0);
   return JSON.parse(result.stdout);
-}
-
-// Failure-only observation: never replace the original assertion with a diagnostic RPC failure.
-async function readHostReportedToolNames(
-  instance: OpenClawTestInstance,
-  sessionKey: string,
-  sessionId: string,
-): Promise<string[] | undefined> {
-  try {
-    const result = await instance.cli(
-      [
-        "gateway",
-        "call",
-        "sessions.usage",
-        "--params",
-        JSON.stringify({
-          key: sessionKey,
-          agentId: "probe",
-          range: "all",
-          includeContextWeight: true,
-        }),
-        "--url",
-        instance.url,
-        "--token",
-        instance.gatewayToken,
-        "--json",
-      ],
-      { timeoutMs: 30_000 },
-    );
-    if (result.code !== 0) {
-      return undefined;
-    }
-    const usage = JSON.parse(result.stdout) as SessionsUsageResult;
-    const report = usage.sessions.find((row) => row.sessionId === sessionId)?.contextWeight;
-    // A stable cron row can advance; do not attribute a different attempt's catalog to this run.
-    return report?.source === "run" && report.sessionId === sessionId
-      ? report.tools.entries.map((tool) => tool.name)
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 describeLive("cron tool allowlists through live harnesses", () => {
@@ -124,7 +82,12 @@ describeLive("cron tool allowlists through live harnesses", () => {
               },
               entries: { probe: { workspace } },
             },
-            tools: { exec: { host: "gateway", security: "full", ask: "off" } },
+            tools: {
+              // This probe checks direct tool receipts, not model-selected code-mode wrappers.
+              codeMode: false,
+              toolSearch: false,
+              exec: { host: "gateway", security: "full", ask: "off" },
+            },
             models: {
               mode: "merge",
               providers: {
@@ -242,22 +205,7 @@ describeLive("cron tool allowlists through live harnesses", () => {
               )
               .filter(Boolean)
               .join(" ");
-            const expectedTool = cap === "bash" ? "exec" : "read";
-            const reportedToolNames =
-              runtime === "codex" && cap !== "" && !calls.some((call) => call.name === expectedTool)
-                ? await readHostReportedToolNames(
-                    instance,
-                    `agent:probe:cron:${job.id}`,
-                    history.sessionId,
-                  )
-                : undefined;
-            const diagnostic = summarizeCronToolProbe({
-              calls,
-              results,
-              assistantText,
-              marker,
-              reportedToolNames,
-            });
+            const diagnostic = summarizeCronToolProbe({ calls, results, assistantText, marker });
             expect(assistants.length, diagnostic).toBeGreaterThan(0);
             if (cap === "") {
               // Codex model metadata (`tool_mode: code_mode_only`) outranks the thread's

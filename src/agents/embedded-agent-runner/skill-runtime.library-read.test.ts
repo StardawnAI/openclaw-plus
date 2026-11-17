@@ -348,7 +348,6 @@ describe("manual library resources through embedded and host-bound reads", () =>
           { sessionId: "manual-parent-id", updatedAt: Date.now(), skillLibrarySelections: pins },
         );
         const child = await createInitialSubagentSession({
-          projectRequester: { kind: "internal" },
           cfg: config,
           requesterAgentId: "main",
           targetAgentId: "main",

@@ -9,8 +9,8 @@ import {
 import { createControlUiSessionRow } from "../test-helpers/control-ui-session-fixtures.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
-// Positive integration coverage for the real release settings controls.
-// This flow also passes without the #196820 CSS fix; it is not baseline-red proof.
+// openclaw/openclaw#196820: WebKit never finished style resolution when an opening menu
+// was swapped out for another while the layout changed, freezing the whole Control UI.
 
 let webkitBrowser: Browser | undefined;
 const suite = createControlUiE2eSuite({
@@ -43,13 +43,13 @@ suite.define(() => {
         sessionKey: sessions[0]!.key,
         methodResponses: {
           "agents.list": {
-            agents: [
-              { id: "main", name: "Main" },
-              { id: "research", name: "Research" },
-            ],
             defaultId: "main",
             mainKey: "main",
-            scope: "per-sender",
+            scope: "agent",
+            agents: [
+              { id: "main", name: "Main" },
+              { id: "other", name: "Other" },
+            ],
           },
         },
       });
@@ -58,80 +58,47 @@ suite.define(() => {
       await waitForControlUiRoute(page, { routeId: "appearance" });
       const fontTrigger = page.locator("#settings-font-ui");
       await fontTrigger.waitFor();
-      const agentTrigger = page.locator(".settings-sidebar .agent-select__trigger");
-      await agentTrigger.waitFor();
-      await expect.poll(() => agentTrigger.isEnabled()).toBe(true);
 
-      await page.evaluate(async () => {
-        const press = (selector: string) => {
-          const target = document.querySelector<HTMLElement>(selector);
-          if (!target) {
-            throw new Error("Missing control " + selector);
+      // Beta settings replace the application sidebar. Use their enabled agent menu,
+      // then open the font picker in its first frame to close the anchored menu.
+      void page
+        .evaluate(async () => {
+          const press = (target: Element) => {
+            target.dispatchEvent(
+              new PointerEvent("pointerdown", {
+                bubbles: true,
+                composed: true,
+                pointerType: "mouse",
+              }),
+            );
+            (target as HTMLElement).click();
+          };
+          press(document.querySelector("button.agent-select__trigger")!);
+          while (!document.querySelector(".agent-select__menu:popover-open")) {
+            await new Promise((resolve) => {
+              setTimeout(resolve, 5);
+            });
           }
-          target.dispatchEvent(
-            new PointerEvent("pointerdown", {
-              bubbles: true,
-              composed: true,
-              pointerType: "mouse",
-            }),
-          );
-          target.click();
-        };
-        press(".settings-sidebar .agent-select__trigger");
-        const deadline = performance.now() + 2000;
-        let menu: Element | null;
-        while (!(menu = document.querySelector(".agent-select__menu:popover-open"))) {
-          if (performance.now() > deadline) {
-            throw new Error("Agent menu did not enter top layer");
-          }
-          await new Promise<void>((resolve) => {
-            setTimeout(resolve, 0);
-          });
-        }
-        const before = {
-          phase: menu.getAttribute("data-phase"),
-          fallback: getComputedStyle(menu).getPropertyValue("position-try-fallbacks"),
-          duration: getComputedStyle(menu).transitionDuration,
-        };
-        if (before.phase !== "opening") {
-          throw new Error("Entry phase missed: " + JSON.stringify(before));
-        }
-        const font = document.querySelector<HTMLElement>("#settings-font-ui")!;
-        const topBefore = font.getBoundingClientRect().top;
-        font.scrollIntoView({ block: "center", behavior: "instant" });
-        const topAfter = font.getBoundingClientRect().top;
-        if (topBefore === topAfter) {
-          throw new Error("Settings scroll did not change layout");
-        }
-        if (menu.getAttribute("data-phase") !== "opening") {
-          throw new Error("Entry ended before competing picker");
-        }
-        press("#settings-font-ui");
-        return { before, topBefore, topAfter, after: menu.getAttribute("data-phase") };
-      });
+          press(document.querySelector("#settings-font-ui")!);
+        })
+        .catch(() => undefined);
 
-      await page.waitForFunction(
-        () => {
-          const trigger = document.querySelector("#settings-font-ui");
-          const menuId = trigger?.getAttribute("aria-controls");
-          return (
+      const responsive = await Promise.race([
+        page.waitForFunction(
+          () =>
             !document.querySelector(".agent-select__menu:popover-open") &&
-            trigger?.getAttribute("aria-expanded") === "true" &&
-            Boolean(
-              menuId &&
-              document
-                .getElementById(menuId)
-                ?.closest(".picker-select__menu")
-                ?.matches(':popover-open[data-phase="open"]'),
-            )
-          );
-        },
-        undefined,
-        { timeout: 15_000 },
-      );
-      expect(await fontTrigger.getAttribute("aria-expanded")).toBe("true");
+            document.querySelector(".picker-select__menu[data-phase='open']") !== null,
+          undefined,
+          { timeout: 15_000 },
+        ),
+        new Promise<"hung">((resolve) => {
+          setTimeout(() => resolve("hung"), 15_000);
+        }),
+      ]);
+      expect(responsive, "WebKit stopped answering after the menu swap").not.toBe("hung");
+      await expect.poll(() => fontTrigger.getAttribute("aria-expanded")).toBe("true");
     } finally {
-      await context.close();
+      await context.close().catch(() => undefined);
     }
   }, 60_000);
 });

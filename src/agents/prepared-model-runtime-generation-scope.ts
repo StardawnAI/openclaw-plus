@@ -1,9 +1,8 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import {
   runOutsideRemoteModelCatalogSnapshot,
   withRemoteModelCatalogSnapshot,
 } from "../model-catalog/remote-overlay.js";
-import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { AsyncContext } from "../shared/async-context.js";
 import type {
   PreparedModelRuntimeLease,
   PreparedModelRuntimePluginGeneration,
@@ -15,15 +14,10 @@ type PreparedModelRuntimeGenerationScope = Readonly<{
   borrowSnapshot?: () => PreparedModelRuntimeSnapshot | undefined;
 }>;
 
-// Global singleton keeps one scope instance across lazy module boundaries so a
-// wrapped turn and the nested embedded runner always share the same store.
-const PREPARED_MODEL_RUNTIME_PLUGIN_GENERATION_SCOPE_KEY: unique symbol = Symbol.for(
-  "openclaw.preparedModelRuntimePluginGenerationScope",
-);
-
-const preparedModelRuntimePluginGenerationScope = resolveGlobalSingleton<
-  AsyncLocalStorage<PreparedModelRuntimeGenerationScope | undefined>
->(PREPARED_MODEL_RUNTIME_PLUGIN_GENERATION_SCOPE_KEY, () => new AsyncLocalStorage());
+const preparedModelRuntimePluginGenerationScope =
+  new AsyncContext<PreparedModelRuntimeGenerationScope>(
+    Symbol.for("openclaw.preparedModelRuntimePluginGenerationScope"),
+  );
 
 /** Borrow authority closes before the retained generation begins asynchronous disposal. */
 export function scopePreparedModelRuntimeLease(lease: PreparedModelRuntimeLease) {
@@ -39,32 +33,11 @@ export function scopePreparedModelRuntimeLease(lease: PreparedModelRuntimeLease)
       if (!open) {
         throw new Error("Captured reply runtime lease is closed");
       }
-      const enter = () =>
-        withPreparedModelRuntimePluginGenerationScope(lease.pluginGeneration, run, () =>
-          open ? lease.snapshot : undefined,
-        );
-      return lease.run ? lease.run(enter) : enter();
+      return withPreparedModelRuntimePluginGenerationScope(lease.pluginGeneration, run, () =>
+        open ? lease.snapshot : undefined,
+      );
     },
   };
-}
-
-/** Enter a lease's capability collector without changing generation inheritance. */
-export function runInPreparedModelRuntimeLease<T>(
-  lease: PreparedModelRuntimeLease,
-  run: () => T,
-): T {
-  return lease.run ? lease.run(run) : run();
-}
-
-/** Compose physical generation scope with the lease's exact execution custody. */
-export function withPreparedModelRuntimeLease<T>(
-  lease: PreparedModelRuntimeLease,
-  run: () => T,
-  borrowSnapshot?: () => PreparedModelRuntimeSnapshot | undefined,
-): T {
-  return runInPreparedModelRuntimeLease(lease, () =>
-    withPreparedModelRuntimePluginGenerationScope(lease.pluginGeneration, run, borrowSnapshot),
-  );
 }
 
 /** Keeps the exact admitted generation available to nested embedded agent runs. */

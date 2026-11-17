@@ -1,6 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
-import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { ProviderCatalogOutcome } from "../plugins/provider-catalog-outcome.js";
 import type { PreparedAgentCredentialModes } from "./agent-auth-credential-modes.js";
 import { isOAuthRefreshFence } from "./auth-profiles/oauth-refresh-marker.js";
@@ -106,13 +105,13 @@ export type PreparedAccountCatalogAccess = {
     includesProvider: (provider: string) => boolean,
     profileIds?: readonly string[],
   ) => void;
-  readServiceTierObservation: (params: {
+  readServiceTierObservations: (params: {
     identityKey: string;
     modelId: string;
     runtimeId: string;
     api: string;
     baseUrl: string;
-  }) => Pick<ModelServiceTierObservation, "requestedTier" | "responseTier"> | undefined;
+  }) => Pick<ModelServiceTierObservation, "requestedTier" | "responseTier">[];
   prepareServiceTierObserver: (params: {
     selectedCredential: SelectedModelCredential;
     credential?: AuthProfileCredential;
@@ -123,13 +122,16 @@ export type PreparedAccountCatalogAccess = {
     allowDiscovery: boolean;
     refresh?: boolean;
     load: () => Promise<readonly ProviderCatalogOutcome[]>;
-  }) => Promise<{ outcomes: readonly ProviderCatalogOutcome[]; isCurrent: () => boolean }>;
+  }) => Promise<{
+    outcomes: readonly ProviderCatalogOutcome[];
+    /** Distinguishes an authoritative empty publication from a cold private catalog. */
+    hasPublishedCatalog: boolean;
+    isCurrent: () => boolean;
+  }>;
 };
 
 /** Private auth facts owned by an immutable prepared model generation. */
 type RuntimeAuthBinding = {
-  /** Host-only policy selection; public snapshots carry no callable policy authority. */
-  readPolicyConfig?: () => OpenClawConfig;
   store?: AuthProfileStore;
   readUsage?: (store: AuthProfileStore) => AuthProfileStore;
   labels?: ModelCatalogAuthLabels;
@@ -150,12 +152,6 @@ export function bindPreparedModelRuntimeAuth(snapshot: object, binding: RuntimeA
   runtimeAuth.set(snapshot, { ...runtimeAuth.get(snapshot), ...binding });
 }
 
-export function getPreparedModelRuntimePolicyConfigReader(
-  snapshot: object | undefined,
-): (() => OpenClawConfig) | undefined {
-  return snapshot ? runtimeAuth.get(snapshot)?.readPolicyConfig : undefined;
-}
-
 export function getPreparedModelRuntimeAuthStore(snapshot: object): AuthProfileStore | undefined {
   const binding = runtimeAuth.get(snapshot);
   return binding?.store ? (binding.readUsage?.(binding.store) ?? binding.store) : undefined;
@@ -167,6 +163,14 @@ export function getPreparedModelRuntimeAuthLabels(snapshot: object): ModelCatalo
     throw new Error("Prepared model runtime omitted auth display labels");
   }
   return labels;
+}
+
+// Auth bindings can outlive publication; do not retain the catalog access scope.
+export function createPreparedModelCatalogUsageReader(
+  isCurrent: () => boolean,
+  readUsage: (store: AuthProfileStore) => AuthProfileStore,
+) {
+  return (store: AuthProfileStore) => (isCurrent() ? readUsage(store) : store);
 }
 
 export function setPreparedModelFullCatalogAuth(

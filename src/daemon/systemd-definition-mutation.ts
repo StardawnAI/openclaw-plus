@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, promises as fs, type BigIntStats } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { readFileHandleBounded } from "@openclaw/fs-safe/advanced";
 import { toErrorObject } from "@openclaw/normalization-core/error-coercion";
 import { decodeMountInfoPath } from "@openclaw/normalization-core/mountinfo-path";
 import { resolveStateDir } from "../config/paths.js";
@@ -97,7 +98,7 @@ async function readStableFile(
         return { sealed: true };
       }
     }
-    return { contents: await handle.readFile() };
+    return { contents: await readFileHandleBounded(handle, Infinity) };
   } finally {
     await handle.close();
   }
@@ -405,7 +406,6 @@ export async function withSystemdDefinitionMutation<T>(
       }
       try {
         await assertNoSystemGatewayOwnership(env, remainingTimeoutMs());
-        assertGatewayServiceUpdateCurrent();
         const result = await execSystemctlUser(
           env,
           ["daemon-reload"],

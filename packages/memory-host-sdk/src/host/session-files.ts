@@ -2,11 +2,12 @@ import fsSync from "node:fs";
 import path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { safeStatSync } from "@openclaw/fs-safe/path";
+import { sha256Hex } from "@openclaw/normalization-core/node-crypto";
 import { normalizeComparablePath, readRegularFile, statRegularFile } from "./fs-utils.js";
-import { hashText } from "./hash.js";
 import { createSubsystemLogger } from "./openclaw-runtime-io.js";
 import { isCronRunSessionKey } from "./openclaw-runtime-paths.js";
 import {
+  assertBoundIncognitoMemorySyncAccess,
   captureIncognitoMemoryReader,
   isDreamingNarrativeSessionStoreKey,
   extractAgentIdFromSessionPath,
@@ -21,12 +22,11 @@ import {
   readTranscriptStatsSync,
   resolveSessionTranscriptsDirForAgent,
   SessionTranscriptColdError,
+  type SessionEntrySnapshot,
   streamSessionEntriesInWorker,
   warnPluginSdkDeprecation,
-  type SessionEntrySnapshot,
 } from "./openclaw-runtime-session.js";
 import { retryTransientMemoryRead } from "./read-retry.js";
-import { hashSessionEntrySnapshot } from "./session-entry-projection.js";
 import {
   attachSessionEntryResetRecallCutoff,
   isUsageCountedSessionArchiveTranscriptPath,
@@ -38,7 +38,6 @@ import {
   type SessionEntryRenderedPage,
 } from "./session-entry-render.js";
 import { resolveBuildSessionSqliteIdentity } from "./session-entry-source.js";
-import { assertBoundIncognitoMemorySyncAccess } from "./session-memory-authority.js";
 import {
   listSessionTranscriptCorpusEntriesForAgent,
   type SessionTranscriptCorpusEntry,
@@ -56,8 +55,10 @@ export {
   type SessionTranscriptCorpusEntry,
   type SessionTranscriptCorpusOptions,
 } from "./session-transcript-corpus.js";
-export { readTranscriptStatsBatchReadOnlyAsync } from "./openclaw-runtime-session.js";
-export { readTranscriptStatsBatchReadOnlySync } from "./session-transcript-stats-read.js";
+export {
+  readTranscriptStatsBatchReadOnlyAsync,
+  readTranscriptStatsBatchReadOnlySync,
+} from "./openclaw-runtime-session.js";
 
 export type SessionFileEntry = {
   path: string;
@@ -120,6 +121,7 @@ export type SessionEntryStream = {
 };
 
 export type { SessionEntrySnapshot } from "./openclaw-runtime-session.js";
+
 export type BuildSessionEntryOptions = {
   /** Optional preclassification from a caller-managed dreaming transcript lookup. */
   generatedByDreamingNarrative?: boolean;
@@ -144,26 +146,6 @@ type SessionTranscriptClassification = {
   dreamingNarrativeTranscriptPaths: ReadonlySet<string>;
   cronRunTranscriptPaths: ReadonlySet<string>;
 };
-
-export function matchesSessionEntryPrefixHash(
-  entry: SessionFileEntry,
-  lineCount: number,
-  expectedHash: string,
-): boolean {
-  const lines = entry.content ? entry.content.split("\n") : [];
-  if (!Number.isInteger(lineCount) || lineCount < 0 || lineCount > lines.length) {
-    return false;
-  }
-  const resetRecallCutoff = readSessionEntryResetRecallCutoff(entry);
-  const prefix = {
-    content: lines.slice(0, lineCount).join("\n"),
-    lineMap: entry.lineMap.slice(0, lineCount),
-    messageTimestampsMs: entry.messageTimestampsMs.slice(0, lineCount),
-    lineProvenance: entry.lineProvenance.slice(0, lineCount),
-  };
-  // Content alone is insufficient: rewrites and resets can retain the same rendered text.
-  return hashSessionEntrySnapshot({ ...prefix, resetRecallCutoff }) === expectedHash;
-}
 
 type SessionTranscriptStoreEntry = {
   sessionFile?: unknown;
@@ -341,7 +323,7 @@ export function parseCanonicalSessionSyncTargetFromPath(
   return { agentId, sessionId };
 }
 
-/** @deprecated Await statSessionEntry. Final compatibility day: 2026-12-31; prepared statistics do not read SQLite. */
+/** @deprecated Await statSessionEntry. Final compatibility day: 2026-12-31; prepared statistics do not read SQLite. Removal in the first January 2027 stable release. */
 export function statSessionEntrySync(
   absPath: string,
   opts: BuildSessionEntryOptions = {},
@@ -606,7 +588,7 @@ export async function buildSessionEntryFromSnapshot(
   const result = await renderSessionEntrySnapshot(
     absPath,
     {
-      ...structuredClone(options),
+      ...options,
       ...(onTranscriptMessage
         ? {
             onTranscriptMessage(message, observedAt) {
@@ -657,7 +639,7 @@ async function buildSessionEntryFromSource(
         absPath,
         mtimeMs: stat.mtimeMs,
         size: stat.size,
-        hash: hashText("\n\n"),
+        hash: sha256Hex("\n\n"),
         lineCount: 0,
         lineOriginClasses: [],
         sessionKind: opts.sessionKind ?? "unknown",
@@ -665,10 +647,10 @@ async function buildSessionEntryFromSource(
     }
     const raw = (
       await retryTransientMemoryRead(
-        async () =>
+        () =>
           readRegularFile({
             filePath: isUsageCountedSessionArchiveTranscriptPath(absPath)
-              ? await materializeSessionArchiveForRead(absPath)
+              ? materializeSessionArchiveForRead(absPath)
               : absPath,
           }),
         `read session transcript ${absPath}`,

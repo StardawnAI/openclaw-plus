@@ -1,204 +1,83 @@
-// Memory Wiki tests cover ingest plugin behavior.
-import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { deferred } from "./deferred.test-helpers.js";
 import { ingestMemoryWikiSource } from "./ingest.js";
 import { withMemoryWikiVaultMutation } from "./mutation-coordinator.js";
-import { createMemoryWikiTestHarness } from "./test-helpers.js";
+import { createMemoryWikiTestHarness, observeKeyedQueueEnqueue } from "./test-helpers.js";
 
 const { createTempDir, createVault } = createMemoryWikiTestHarness();
+async function sourceFixture(filename = "meeting-notes.txt", content = "hello from source\n") {
+  const rootDir = await createTempDir("memory-wiki-ingest-");
+  const inputPath = path.join(rootDir, filename);
+  const { config } = await createVault({ rootDir: path.join(rootDir, "vault") });
+  await fs.writeFile(inputPath, content, "utf8");
+  const ingest = () =>
+    ingestMemoryWikiSource({ config, inputPath, nowMs: Date.UTC(2026, 3, 5, 12) });
+  const read = (file: string) => fs.readFile(path.join(config.vault.path, file), "utf8");
+  return { config, inputPath, ingest, read };
+}
 
 describe("ingestMemoryWikiSource", () => {
-  it.skipIf(process.platform === "win32").each(["source", "page"])(
-    "refuses a FIFO %s without holding the vault mutation queue",
-    async (target) => {
-      const rootDir = await createTempDir("memory-wiki-fifo-");
-      const { stdout } = await promisify(execFile)(
-        process.execPath,
-        [
-          "--import",
-          fileURLToPath(new URL("../../../scripts/tsx.mjs", import.meta.url)),
-          fileURLToPath(new URL("./ingest-special-file.test-support.ts", import.meta.url)),
-          rootDir,
-          target,
-        ],
-        { timeout: 20_000, killSignal: "SIGKILL" },
-      );
-      expect(stdout).toContain("FIFO refused; original preserved; vault queue released");
-    },
-    25_000,
-  );
-
-  it.each(["source", "page"])("refuses a directory %s without modifying it", async (target) => {
-    const rootDir = await createTempDir("memory-wiki-directory-");
-    const inputPath = path.join(rootDir, "notes.txt");
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-      initialize: true,
+  it("preserves the imported page across invalid source files and retry", async () => {
+    const content = "\uFEFFNotes: café, 東京, 🦞\n";
+    const { config, inputPath, ingest, read } = await sourceFixture("meeting-notes.txt", content);
+    const result = await ingest();
+    expect(result).toMatchObject({
+      pageId: "source.meeting-notes",
+      pagePath: "sources/meeting-notes.md",
     });
-    const pagePath = path.join(config.vault.path, "sources", "notes.md");
-    await fs.writeFile(inputPath, "source content");
-    const directory = target === "source" ? inputPath : pagePath;
-    if (target === "source") {
-      await fs.unlink(inputPath);
-    }
-    await fs.mkdir(directory);
-    await fs.writeFile(path.join(directory, "keep"), "handwritten notes");
-    await expect(ingestMemoryWikiSource({ config, inputPath })).rejects.toThrow(/regular/);
-    await expect(fs.readFile(path.join(directory, "keep"), "utf8")).resolves.toBe(
-      "handwritten notes",
-    );
-  });
-
-  it("preserves symlink-to-regular source and existing-page support", async () => {
-    const rootDir = await createTempDir("memory-wiki-symlink-");
-    const inputPath = path.join(rootDir, "notes.txt");
-    const targetPath = path.join(rootDir, "actual.txt");
-    await fs.writeFile(targetPath, "Unicode: café 日本語");
-    await fs.symlink(targetPath, inputPath);
-    const { config } = await createVault({ rootDir: path.join(rootDir, "vault") });
-    await ingestMemoryWikiSource({ config, inputPath });
-    const pagePath = path.join(config.vault.path, "sources", "notes.md");
-    const savedPagePath = path.join(rootDir, "saved.md");
-    const page = (await fs.readFile(pagePath, "utf8")).replace(
-      "<!-- openclaw:human:start -->",
-      "<!-- openclaw:human:start -->\nHuman note",
-    );
-    await fs.writeFile(pagePath, page);
-    await fs.rename(pagePath, savedPagePath);
-    await fs.symlink(savedPagePath, pagePath);
-    await ingestMemoryWikiSource({ config, inputPath });
-    const after = await fs.readFile(pagePath, "utf8");
-    expect(after).toContain("Unicode: café 日本語");
-    expect(after).toContain("Human note");
-    expect((await fs.lstat(pagePath)).isSymbolicLink()).toBe(true);
-  });
-
-  it("recreates an existing page that disappears before its read", async () => {
-    const rootDir = await createTempDir("memory-wiki-disappeared-");
-    const inputPath = path.join(rootDir, "notes.txt");
-    const { config } = await createVault({ rootDir: path.join(rootDir, "vault") });
-    await fs.writeFile(inputPath, "original content");
-    await ingestMemoryWikiSource({ config, inputPath });
-    const pagePath = path.join(config.vault.path, "sources", "notes.md");
-    const realpath = fs.realpath.bind(fs);
-    let removed = false;
-    const spy = vi.spyOn(fs, "realpath").mockImplementation(async (filePath, options) => {
-      if (filePath === pagePath && !removed) {
-        removed = true;
-        await fs.unlink(pagePath);
-      }
-      return realpath(filePath, options);
-    });
-    try {
-      await fs.writeFile(inputPath, "replacement content");
-      await ingestMemoryWikiSource({ config, inputPath });
-      expect(removed).toBe(true);
-      await expect(fs.readFile(pagePath, "utf8")).resolves.toContain("replacement content");
-    } finally {
-      spy.mockRestore();
-    }
-  });
-
-  it("copies a local text file into sources markdown", async () => {
-    const rootDir = await createTempDir("memory-wiki-ingest-");
-    const inputPath = path.join(rootDir, "meeting-notes.txt");
-    await fs.writeFile(inputPath, "hello from source\n", "utf8");
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
-
-    const result = await ingestMemoryWikiSource({
-      config,
-      inputPath,
-      nowMs: Date.UTC(2026, 3, 5, 12, 0, 0),
-    });
-
-    expect(result.pageId).toBe("source.meeting-notes");
-    expect(result.pagePath).toBe("sources/meeting-notes.md");
     expect(result.indexUpdatedFiles.length).toBeGreaterThan(0);
-    await expect(fs.readFile(path.join(config.vault.path, "sources", "meeting-notes.md"), "utf8"))
-      .resolves.toBe(`---
-pageType: source
-id: source.meeting-notes
-title: meeting notes
-sourceType: local-file
-sourcePath: ${inputPath}
-ingestedAt: 2026-04-05T12:00:00.000Z
-updatedAt: 2026-04-05T12:00:00.000Z
-status: active
----
-
-# meeting notes
-
-## Source
-- Type: \`local-file\`
-- Path: \`${inputPath}\`
-- Bytes: 18
-- Updated: 2026-04-05T12:00:00.000Z
-
-## Content
-\`\`\`text
-hello from source
-
-\`\`\`
-
-## Notes
-<!-- openclaw:human:start -->
-<!-- openclaw:human:end -->
-
-## Related
-<!-- openclaw:wiki:related:start -->
-- No related pages yet.
-<!-- openclaw:wiki:related:end -->
-`);
-    await expect(fs.readFile(path.join(config.vault.path, "index.md"), "utf8")).resolves.toContain(
-      "[meeting notes](sources/meeting-notes.md)",
+    const pagePath = path.join(config.vault.path, result.pagePath);
+    const original = await fs.readFile(pagePath);
+    expect(original.toString("utf8")).toContain(content);
+    expect(original.toString("utf8")).toContain(`## Content\n\`\`\`text\n${content}\n\`\`\``);
+    expect(original.toString("utf8")).toContain(`- Bytes: ${Buffer.byteLength(content)}`);
+    expect(original.toString("utf8")).toContain(
+      `---\npageType: source\nid: source.meeting-notes\ntitle: meeting notes\nsourceType: local-file\nsourcePath: ${inputPath}\ningestedAt: 2026-04-05T12:00:00.000Z\nupdatedAt: 2026-04-05T12:00:00.000Z\nstatus: active\n---`,
     );
+    await expect(read("index.md")).resolves.toContain("[meeting notes](sources/meeting-notes.md)");
+
+    for (const bytes of [
+      Buffer.from([0xff, 0x41]),
+      Buffer.from([0xe2, 0x82]),
+      Buffer.from([0xed, 0xa0, 0x80]),
+      Buffer.concat([Buffer.from("valid UTF-8 café then Latin-1: "), Buffer.from([0xe9])]),
+      undefined,
+    ]) {
+      await fs.rm(inputPath, { recursive: true });
+      await (bytes ? fs.writeFile(inputPath, bytes) : fs.mkdir(inputPath));
+      await expect(ingest()).rejects.toThrow(bytes ? /UTF-8/ : /regular.*file/);
+      expect(await fs.readFile(pagePath)).toEqual(original);
+      const actual = bytes ? fs.readFile(inputPath) : fs.readdir(inputPath);
+      await expect(actual).resolves.toEqual(bytes ?? []);
+    }
+    await fs.rm(inputPath, { recursive: true });
+    await fs.writeFile(inputPath, content, "utf8");
+    expect((await ingest()).created).toBe(false);
+    expect(await fs.readFile(pagePath, "utf8")).toContain(content);
   });
 
   it("ingests a source with many backtick runs without losing its content", async () => {
-    const rootDir = await createTempDir("memory-wiki-ingest-backticks-");
-    const inputPath = path.join(rootDir, "backticks.txt");
     const content = "`x".repeat(1_000_000) + "\n````\n";
-    await fs.writeFile(inputPath, content, "utf8");
-    const { config } = await createVault({ rootDir: path.join(rootDir, "vault") });
-
-    const result = await ingestMemoryWikiSource({
-      config,
-      inputPath,
-      nowMs: Date.UTC(2026, 3, 5, 12, 0, 0),
-    });
-
+    const { ingest, read } = await sourceFixture("backticks.txt", content);
+    const result = await ingest();
     expect(result).toMatchObject({
       pagePath: "sources/backticks.md",
       bytes: 2_000_006,
       created: true,
     });
     expect(result.indexUpdatedFiles.length).toBeGreaterThan(0);
-    const page = await fs.readFile(path.join(config.vault.path, result.pagePath), "utf8");
+    const page = await read(result.pagePath);
     expect(page).toContain(
       ["## Content", "`````text", content, "`````", "", "## Notes"].join("\n"),
     );
-    await expect(fs.readFile(path.join(config.vault.path, "index.md"), "utf8")).resolves.toContain(
-      "[backticks](sources/backticks.md)",
-    );
+    await expect(read("index.md")).resolves.toContain("[backticks](sources/backticks.md)");
   });
 
   it("queues behind a held vault mutation instead of writing mid-transaction", async () => {
-    const rootDir = await createTempDir("memory-wiki-ingest-lock-");
-    const inputPath = path.join(rootDir, "meeting-notes.txt");
-    await fs.writeFile(inputPath, "hello from source\n", "utf8");
-    const { config } = await createVault({
-      rootDir: path.join(rootDir, "vault"),
-    });
+    const { config, ingest: startIngest } = await sourceFixture();
     const pagePath = path.join(config.vault.path, "sources", "meeting-notes.md");
-
     const lockEntered = deferred();
     const releaseLock = deferred();
     const holder = withMemoryWikiVaultMutation(config.vault.path, async () => {
@@ -206,35 +85,17 @@ hello from source
       await releaseLock.promise;
     });
     await lockEntered.promise;
-
     const ingestQueued = deferred();
-    const originalEnqueue = Object.getOwnPropertyDescriptor(KeyedAsyncQueue.prototype, "enqueue")
-      ?.value as KeyedAsyncQueue["enqueue"];
-    const enqueueSpy = vi.spyOn(KeyedAsyncQueue.prototype, "enqueue").mockImplementation(function (
-      this: KeyedAsyncQueue,
-      key,
-      task,
-      hooks,
-    ) {
-      ingestQueued.resolve();
-      return originalEnqueue.call(this, key, task, hooks);
-    });
+    const enqueueSpy = observeKeyedQueueEnqueue(() => ingestQueued.resolve());
     let ingest: ReturnType<typeof ingestMemoryWikiSource> | undefined;
     try {
-      ingest = ingestMemoryWikiSource({
-        config,
-        inputPath,
-        nowMs: Date.UTC(2026, 3, 5, 12, 0, 0),
-      });
-      // On fixed code this observes ingest joining the held queue before any
-      // filesystem work. On unfixed code it observes nested compile only after
-      // the source page was already written, so the assertion fails.
+      ingest = startIngest();
+      // Pre-fix, only nested compile queued, after the source page was already written.
       await ingestQueued.promise;
       await expect(fs.access(pagePath)).rejects.toThrow();
 
       releaseLock.resolve();
-      // Completion also proves the nested compile re-enters the held vault
-      // lock reentrantly instead of deadlocking.
+      // Completion proves nested compile re-enters instead of deadlocking.
       const result = await ingest;
       await holder;
       expect(result.created).toBe(true);

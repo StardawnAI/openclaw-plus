@@ -3,12 +3,7 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
 import { openNodeSqliteDatabase } from "../infra/node-sqlite.js";
 import { createUpdateErrorFact } from "../infra/update-failure-facts.js";
-import {
-  createUpdateRun,
-  finishUpdateRun,
-  getUpdateRun,
-  recordUpdateRunStep,
-} from "../infra/update-run-ledger.js";
+import { updateRunFixture } from "../infra/update-run-fixture.test-support.js";
 import { renderUpdateRunReport } from "../infra/update-run-report.js";
 import type { DB } from "./openclaw-state-db.generated.js";
 import {
@@ -103,14 +98,10 @@ it.each([
       new Error("x".repeat(400), { cause: hydrated }),
       env,
     );
-    const run = createUpdateRun({ trigger: "cli" }, options);
-    recordUpdateRunStep(
-      run.runId,
-      { step: "plugin-finalization", status: "failed", failureFacts: [fact] },
-      options,
-    );
-    finishUpdateRun(run.runId, { status: "failed", reason: "plugin-finalization-failed" }, options);
-    const record = getUpdateRun(run.runId, options);
+    const run = updateRunFixture(options);
+    run.step({ step: "plugin-finalization", status: "failed", failureFacts: [fact] });
+    run.finish({ status: "failed", reason: "plugin-finalization-failed" });
+    const record = run.read();
     expect(
       record?.steps.find((step) => step.step === "plugin-finalization")?.failureFacts?.[0],
     ).toMatchObject({ leaseLoss: loss });

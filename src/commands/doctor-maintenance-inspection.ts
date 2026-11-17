@@ -92,9 +92,6 @@ export async function readDoctorGatewayOwnerLease(
   if (!reply) {
     return undefined;
   }
-  if (!reply.ok || reply.type !== "gatewayOwnerLease.read") {
-    throw new Error("Unexpected Doctor Gateway owner lease read result");
-  }
   // The recorded process may have exited while the reader and its private snapshot settled.
   return reply.lease
     ? {
@@ -185,24 +182,6 @@ export async function assertDoctorMaintenanceReady(
   }
   const { assertConfiguredWorkspaceStateReady } = await import("../agents/workspace-state-dirs.js");
   await assertConfiguredWorkspaceStateReady({ cfg, operation: "doctor" });
-  const { readExecApprovalsPolicyReadOnlyAsync } = await import("../infra/exec-approvals-store.js");
-  try {
-    const policy = await readExecApprovalsPolicyReadOnlyAsync({ env });
-    if (!policy.revision) {
-      throw new Error("Exec approvals policy could not be verified for Doctor completion.");
-    }
-  } catch (error) {
-    if (!(error instanceof ExecApprovalsMigrationRequiredError)) {
-      throw error;
-    }
-    const { resolveExecApprovalsDisplayPath } = await import("../infra/exec-approvals-config.js");
-    throw new ExecApprovalsMigrationRequiredError(
-      resolveExecApprovalsDisplayPath(env),
-      "doctor",
-      "Exec approvals require reconciliation",
-      env,
-    );
-  }
   if (!schemaPublicationDeferred && databaseTargets) {
     const { completeDoctorMigrationBackups } =
       await import("./doctor-migration-backup-artifacts.js");
@@ -251,5 +230,6 @@ export function assertDoctorMaintenanceInspection(
   throw new DoctorMaintenanceRefusalError(
     `Doctor could not enter maintenance. Error: ${detail} ${guidance}`,
     { kind: "data-at-risk", reason: "gateway-state-unverified" },
+    { failureFacts: inspection.blockFailureFacts },
   );
 }

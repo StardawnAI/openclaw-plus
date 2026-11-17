@@ -138,8 +138,6 @@ export async function acquireRetainedAgentRuntimeCleanupRegistries(
       ) {
         continue;
       }
-      // Enumeration retains the physical donors. Cleanup invocation itself chooses
-      // its capabilities through the cleanup scope, not every installed instance.
       releases.push(retainPreparedPluginGeneration(generation));
       registries.add(registry);
     }

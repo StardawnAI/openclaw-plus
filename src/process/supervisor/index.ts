@@ -7,7 +7,7 @@ const holder = resolveGlobalSingleton(
   (): { current: ReturnType<typeof createProcessSupervisor> | null } => ({ current: null }),
   async (value) => {
     const supervisor = value.current;
-    await shutdownProcessSupervisor();
+    await supervisor?.shutdown();
     if (value.current === supervisor) {
       value.current = null;
     }
@@ -19,7 +19,7 @@ export function getProcessSupervisor(): ProcessSupervisor {
   return (holder.current ??= createProcessSupervisor());
 }
 
-/** Join the existing owner without creating a supervisor or retiring its admission fence. */
+/** Process shutdown owns idle background commands even when another runtime stays retained. */
 export async function shutdownProcessSupervisor(): Promise<void> {
   await holder.current?.shutdown();
 }

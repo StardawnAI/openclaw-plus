@@ -4,7 +4,6 @@ export { extractKeywords } from "./host/query-expansion.js";
 export {
   buildSessionEntry,
   buildSessionEntries,
-  matchesSessionEntryPrefixHash,
   listSessionTranscriptCorpusEntriesForAgent,
   parseCanonicalSessionSyncTargetFromPath,
   readTranscriptStatsBatchReadOnlyAsync,

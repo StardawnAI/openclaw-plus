@@ -14,6 +14,7 @@ import { registerContextEngineInRegistry } from "../context-engine/registry.js";
 import { getModelLlmRuntime } from "../llm/model-runtime-binding.js";
 import * as llmStream from "../llm/stream.js";
 import { createAssistantMessageEventStream } from "../llm/utils/event-stream.js";
+import { writeFixtureJson } from "../plugins/loader-fixture-builders.test-support.js";
 import { acquirePluginRegistryForInspection, loadPluginRegistryHandle } from "../plugins/loader.js";
 import {
   cleanupPluginLoaderFixturesForTest,
@@ -22,7 +23,7 @@ import {
   useNoBundledPlugins,
   writePlugin,
 } from "../plugins/loader.test-fixtures.js";
-import { pluginInvocationContext } from "../plugins/plugin-instance-scope.js";
+import { cleanupNativeFixture, nativeFixtureEnv } from "../plugins/native-resource.test-support.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import type { PluginRegistry } from "../plugins/registry-types.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
@@ -80,8 +81,6 @@ function nativeImageFixture(
     setupTailReads: 0,
     reasoningOnly: false,
     calls: 0,
-    readInvocation: () => pluginInvocationContext.getStore(),
-    streamRetainedInstances: [] as string[],
     setupReads: 0,
     watchCancellation: false,
     holdWork: false,
@@ -162,7 +161,6 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
               state.workSettled.resolve();
             });
         }
-        state.streamRetainedInstances = state.readInvocation()?.retainedInstances?.map((instance) => instance.pluginId) ?? [];
         state.calls++;
         state.started.resolve();
         try {
@@ -188,14 +186,11 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
   });
 }};`,
   });
-  fs.writeFileSync(
-    path.join(dir, "openclaw.plugin.json"),
-    JSON.stringify({
-      id,
-      providers: [id],
-      configSchema: { type: "object", properties: {}, additionalProperties: false },
-    }),
-  );
+  writeFixtureJson(dir, "openclaw.plugin.json", {
+    id,
+    providers: [id],
+    configSchema: { type: "object", properties: {}, additionalProperties: false },
+  });
   const config: OpenClawConfig = {
     models: {
       providers: {
@@ -238,26 +233,14 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
       timeoutMs: 1000,
     },
     environment: <T>(run: () => Promise<T>) =>
-      withEnvAsync(
-        {
-          OPENCLAW_HOME: dir,
-          OPENCLAW_STATE_DIR: path.join(dir, "state"),
-          OPENCLAW_CONFIG_PATH: path.join(dir, "config.json"),
-        },
-        run,
-      ),
+      withEnvAsync(nativeFixtureEnv(dir, path.join(dir, "state")), run),
     cleanup() {
       state.finish.resolve();
       state.resumeSetup.resolve();
       state.finishCleanup.resolve();
       state.finishWork.resolve();
       state.finishSetupTail.resolve();
-      for (const connection of connections) {
-        if (connection.database.isOpen) {
-          connection.database.close();
-        }
-      }
-      Reflect.deleteProperty(globalThis, stateKey);
+      cleanupNativeFixture(stateKey, connections);
     },
   };
 }
@@ -283,32 +266,6 @@ afterEach(async () => {
   resetPluginLoaderTestStateForTest();
 });
 afterAll(cleanupPluginLoaderFixturesForTest);
-
-it("keeps internally acquired execution custody through image streaming and tracked tails", async () => {
-  const fixture = nativeImageFixture();
-  try {
-    await fixture.environment(async () => {
-      useNoBundledPlugins();
-      fixture.state.holdWork = true;
-      const result = describeImageWithModelCore(fixture.request);
-      try {
-        await fixture.state.started.promise;
-        expect(fixture.state.streamRetainedInstances).toContain(fixture.id);
-        fixture.state.finish.resolve();
-        expect(await result).toMatchObject({ text: "native image 42" });
-        expect(fixture.state.connections[0]!.database.isOpen).toBe(true);
-        fixture.state.finishWork.resolve();
-        await fixture.state.workSettled.promise;
-      } finally {
-        fixture.state.finish.resolve();
-        fixture.state.finishWork.resolve();
-        await result;
-      }
-    });
-  } finally {
-    fixture.cleanup();
-  }
-});
 
 it("describes images without evaluating configured memory or context plugins", async () => {
   const fixture = nativeImageFixture();

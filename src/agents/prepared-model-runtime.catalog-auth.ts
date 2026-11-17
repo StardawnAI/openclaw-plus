@@ -1,6 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { PluginInvocationScope } from "../plugins/plugin-invocation-scope.js";
 import type { ProviderCatalogOutcome } from "../plugins/provider-catalog-outcome.js";
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import { listManifestSyntheticAuthProviderRefs } from "../plugins/synthetic-auth.runtime.js";
@@ -28,32 +27,12 @@ import type { PreparedModelRuntimeCatalogAccessParams } from "./prepared-model-r
 import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
 import { retainPreparedPluginGeneration } from "./prepared-model-runtime.plugin-lifetime.js";
 import { preparedSyntheticAuthProviderScope } from "./prepared-model-runtime.synthetic-auth.js";
-import type { PreparedModelRuntimePluginGeneration } from "./prepared-model-runtime.types.js";
-import { createRuntimePluginWork, releaseRuntimePluginWork } from "./runtime-plugin-work.js";
-
-/** Discovery keeps its physical generation, but only executing capabilities count as work. */
-export async function withPreparedModelCatalogPluginScope<T>(
-  generation: PreparedModelRuntimePluginGeneration,
-  run: () => T | Promise<T>,
-): Promise<T> {
-  const release = retainPreparedPluginGeneration(generation);
-  const work = createRuntimePluginWork();
-  const invocations = generation.pluginRegistry
-    ? new PluginInvocationScope(generation.pluginRegistry, [], { work })
-    : undefined;
-  try {
-    return await (invocations ? invocations.run(run) : run());
-  } finally {
-    invocations?.release();
-    // A final physical cleanup can still invoke a capability's native resources.
-    await releaseRuntimePluginWork(release, work.release);
-  }
-}
 
 // Startup captures each CLI login once; ordinary reads recheck it after this window.
 const NATIVE_LOGIN_RECHECK_MS = 60_000;
 
-const SERVICE_TIER_OBSERVATION_TTL_MS = 5 * 60_000;
+// A single honored response does not prove capacity recovered; retain the last downgrade for a minute.
+const SERVICE_TIER_OBSERVATION_TTL_MS = 60_000;
 function readDirectBinding(config: OpenClawConfig, provider: string) {
   const { providerConfig, ref } = resolveProviderConfigSecretInput(config, provider);
   return { apiKey: ref ?? providerConfig?.apiKey, auth: providerConfig?.auth };
@@ -144,7 +123,7 @@ export function createPreparedAccountCatalogAccess(
     return account;
   };
   const createAccount = (identityKey: string, credential: AccountCatalogCredential) => {
-    const account: AccountCatalogObservation = structuredClone(credential);
+    const account: AccountCatalogObservation = { ...credential };
     accounts.set(identityKey, account);
     for (const key of accounts.keys()) {
       if (accounts.size <= 64) {
@@ -189,9 +168,9 @@ export function createPreparedAccountCatalogAccess(
         }
       }
     },
-    readServiceTierObservation(params) {
+    readServiceTierObservations(params) {
       if (!ownerIsCurrent()) {
-        return undefined;
+        return [];
       }
       const route = {
         ...params,
@@ -201,12 +180,12 @@ export function createPreparedAccountCatalogAccess(
       if (account?.source === "direct") {
         account = readAccount(params.identityKey, readDirectBinding(config, account.provider));
       }
-      const observation = account?.serviceTierObservations?.find((candidate) =>
-        matchesServiceTierRoute(candidate, route),
-      );
-      return observation && observation.expiresAt > Date.now()
-        ? { requestedTier: observation.requestedTier, responseTier: observation.responseTier }
-        : undefined;
+      const now = Date.now();
+      return (account?.serviceTierObservations ?? [])
+        .filter(
+          (candidate) => candidate.expiresAt > now && matchesServiceTierRoute(candidate, route),
+        )
+        .map(({ requestedTier, responseTier }) => ({ requestedTier, responseTier }));
     },
     prepareServiceTierObserver(params) {
       const selected = params.selectedCredential;
@@ -245,9 +224,15 @@ export function createPreparedAccountCatalogAccess(
           ...observation,
           baseUrl: normalizeCatalogRouteBaseUrl(observation.baseUrl) ?? observation.baseUrl,
         };
+        if (observation.requestedTier === observation.responseTier) {
+          return false;
+        }
+        const matchesRequest = (candidate: ModelServiceTierObservation) =>
+          matchesServiceTierRoute(candidate, route) &&
+          candidate.requestedTier === route.requestedTier;
         const now = Date.now();
         const previous = captured.serviceTierObservations?.find(
-          (candidate) => candidate.expiresAt > now && matchesServiceTierRoute(candidate, route),
+          (candidate) => candidate.expiresAt > now && matchesRequest(candidate),
         );
         let changed = false;
         captured.serviceTierObservations = (captured.serviceTierObservations ?? []).filter(
@@ -256,20 +241,14 @@ export function createPreparedAccountCatalogAccess(
               changed = true;
               return false;
             }
-            return !matchesServiceTierRoute(candidate, route);
+            return !matchesRequest(candidate);
           },
         );
-        const matched = observation.requestedTier === observation.responseTier;
-        if (!matched) {
-          captured.serviceTierObservations = [
-            ...captured.serviceTierObservations.slice(-127),
-            { ...route, expiresAt: now + SERVICE_TIER_OBSERVATION_TTL_MS },
-          ];
-        }
-        changed ||= matched
-          ? Boolean(previous)
-          : previous?.requestedTier !== observation.requestedTier ||
-            previous?.responseTier !== observation.responseTier;
+        captured.serviceTierObservations = [
+          ...captured.serviceTierObservations.slice(-127),
+          { ...route, expiresAt: now + SERVICE_TIER_OBSERVATION_TTL_MS },
+        ];
+        changed ||= !previous || previous.responseTier !== observation.responseTier;
         scheduleExpiry();
         if (changed) {
           onChanged?.();
@@ -287,7 +266,11 @@ export function createPreparedAccountCatalogAccess(
       let observation = readAccount(identityKey, params.credential);
       if (!observation) {
         if (!params.allowDiscovery) {
-          return { outcomes: [], isCurrent: () => ownerIsCurrent() && !accounts.has(identityKey) };
+          return {
+            outcomes: [],
+            hasPublishedCatalog: false,
+            isCurrent: () => ownerIsCurrent() && !accounts.has(identityKey),
+          };
         }
         observation = createAccount(identityKey, {
           source: "profile",
@@ -319,9 +302,14 @@ export function createPreparedAccountCatalogAccess(
                 ? createAccount(identityKey, { source: "profile", credential: params.credential })
                 : captured;
               published.outcomes = outcomes;
-              if (pending.refresh && captured.serviceTierObservations?.length) {
+              if (pending.refresh) {
                 scheduleExpiry();
-                onChanged?.();
+                if (
+                  captured.serviceTierObservations?.length ||
+                  !isDeepStrictEqual(captured.outcomes, outcomes)
+                ) {
+                  onChanged?.();
+                }
               }
               return published;
             })
@@ -343,6 +331,7 @@ export function createPreparedAccountCatalogAccess(
       const outcomes = published.outcomes;
       return {
         outcomes: outcomes ?? [],
+        hasPublishedCatalog: outcomes !== undefined,
         isCurrent: () => current(published) && published.outcomes === outcomes,
       };
     },
@@ -434,7 +423,6 @@ export async function prepareInitialModelCatalogAuth(
     ...catalogFacts.modelCatalog.entries.map((entry) => entry.provider),
     ...Object.values(agentFacts.authStore.profiles).map((profile) => profile.provider),
   ];
-  // Initial labels run under the build's finite construction custody, before publication.
   const providerAuthLabels =
     providers.length === 0
       ? new Map()
@@ -483,12 +471,13 @@ async function refreshScopedModelCatalogAuth(
   { providerIds, profileIds }: PreparedModelRuntimeAuthScope,
 ): Promise<PreparedModelCatalogAuth> {
   owner.assertCurrent();
-  const refreshed = await withPreparedModelCatalogPluginScope(owner.pluginGeneration, () =>
-    owner.refreshAuth({
-      providerIds,
-      ...(profileIds?.length ? { profileIds } : {}),
-    }),
-  );
+  await using _ = {
+    [Symbol.asyncDispose]: retainPreparedPluginGeneration(owner.pluginGeneration),
+  };
+  const refreshed = await owner.refreshAuth({
+    providerIds,
+    ...(profileIds?.length ? { profileIds } : {}),
+  });
   owner.assertCurrent();
   const scope = preparedSyntheticAuthProviderScope(providerIds.map(owner.normalizeProvider));
   const includesProvider = (provider: string) => scope.has(owner.normalizeProvider(provider));
@@ -522,50 +511,52 @@ export function createNativeLoginRecheck(
   );
   let checkedAt = Date.now();
   let pending: Promise<void> | undefined;
-  const recheck = () =>
-    withPreparedModelCatalogPluginScope(owner.pluginGeneration, async () => {
-      owner.assertCurrent();
-      const { input, env } = params.agentFacts;
-      const signal = AbortSignal.any([params.retirementSignal, AbortSignal.timeout(180_000)]);
-      await withPluginRuntimeGenerationScope(
-        {
-          metadataSnapshot: owner.pluginGeneration.pluginMetadataSnapshot,
-          pluginRegistry: owner.pluginGeneration.pluginRegistry,
-        },
-        async () => {
-          const credentials = await prepareAmbientAgentCredentialsForDiscovery({
-            config: input.config,
-            env,
-            workspaceDir: input.workspaceDir,
-            authoritativeSyntheticAuthProviderRefs: providerIds,
-            syntheticAuthProviderRefs: providerIds,
-            preparationOwner: {},
-            signal,
-          });
-          signal.throwIfAborted();
-          owner.assertCurrent();
-          const current = owner.readAuth();
-          // Native availability changes independently of stored profiles; reuse their current owner.
-          Object.assign(
+  const recheck = async () => {
+    owner.assertCurrent();
+    await using _ = {
+      [Symbol.asyncDispose]: retainPreparedPluginGeneration(owner.pluginGeneration),
+    };
+    const { input, env } = params.agentFacts;
+    const signal = AbortSignal.any([params.retirementSignal, AbortSignal.timeout(180_000)]);
+    await withPluginRuntimeGenerationScope(
+      {
+        metadataSnapshot: owner.pluginGeneration.pluginMetadataSnapshot,
+        pluginRegistry: owner.pluginGeneration.pluginRegistry,
+      },
+      async () => {
+        const credentials = await prepareAmbientAgentCredentialsForDiscovery({
+          config: input.config,
+          env,
+          workspaceDir: input.workspaceDir,
+          authoritativeSyntheticAuthProviderRefs: providerIds,
+          syntheticAuthProviderRefs: providerIds,
+          preparationOwner: {},
+          signal,
+        });
+        signal.throwIfAborted();
+        owner.assertCurrent();
+        const current = owner.readAuth();
+        // Native availability changes independently of stored profiles; reuse their current owner.
+        Object.assign(
+          credentials,
+          resolveAgentCredentialMapFromStore(current.authStore, { config: input.config }),
+        );
+        const auth = replacePreparedModelCatalogAuth(
+          current,
+          {
+            authStore: current.authStore,
             credentials,
-            resolveAgentCredentialMapFromStore(current.authStore, { config: input.config }),
-          );
-          const auth = replacePreparedModelCatalogAuth(
-            current,
-            {
-              authStore: current.authStore,
-              credentials,
-              authModes: resolveUsableAgentCredentialModes(credentials),
-            },
-            (provider) => providerIds.includes(owner.normalizeProvider(provider)),
-          );
-          owner.assertCurrent();
-          if (!isDeepStrictEqual(current.authModes, auth.authModes)) {
-            publish(auth);
-          }
-        },
-      );
-    });
+            authModes: resolveUsableAgentCredentialModes(credentials),
+          },
+          (provider) => providerIds.includes(owner.normalizeProvider(provider)),
+        );
+        owner.assertCurrent();
+        if (!isDeepStrictEqual(current.authModes, auth.authModes)) {
+          publish(auth);
+        }
+      },
+    );
+  };
   return (options) => {
     const now = Date.now();
     if (pending) {

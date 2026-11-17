@@ -8,15 +8,14 @@ import {
 } from "./io.audit.js";
 import {
   captureConfigHealthStateStore,
-  supersedeConfigHealthObservations,
   readConfigHealthStateFromStore,
   patchConfigHealthEntryToStore,
 } from "./io.health-state.js";
 import type {
   ConfigHealthEntry,
   ConfigHealthFingerprint,
-  ConfigHealthState,
   ConfigHealthSnapshot,
+  ConfigHealthState,
   ConfigHealthUpdateResult,
 } from "./io.health-state.types.js";
 import {
@@ -108,23 +107,13 @@ export async function observeConfigSnapshot(
     return;
   }
   assertCurrent?.();
-  const superseded = new Error("Config audit observation was superseded");
   try {
-    using health = captureConfigHealthStateStore(deps, snapshot.path, assertCurrent);
-    const appendAudit = captureConfigAuditAppender(deps, () => {
-      if (!health.isCurrent()) {
-        throw superseded;
-      }
-    });
+    const health = captureConfigHealthStateStore(deps, snapshot.path, assertCurrent);
+    const appendAudit = captureConfigAuditAppender(deps, health.assertCurrent);
     const stat = await deps.fs.promises.stat(snapshot.path).catch(() => null);
-    if (!health.isCurrent()) {
-      return;
-    }
+    health.assertCurrent();
     const current = createObservedFingerprint(snapshot, stat);
     const healthSnapshot = await health.read();
-    if (!healthSnapshot) {
-      return;
-    }
     const healthState = healthSnapshot.state;
     const backupPath = `${snapshot.path}.bak`;
     const initialEntry = readConfigHealthEntry(healthState, snapshot.path);
@@ -132,9 +121,7 @@ export async function observeConfigSnapshot(
       initialEntry.lastKnownGood ??
       (await readConfigFingerprintForPath(deps, backupPath)) ??
       undefined;
-    if (!health.isCurrent()) {
-      return;
-    }
+    health.assertCurrent();
     const { entry, baseline, suspicious } = resolveObservation({
       snapshot,
       current,
@@ -154,9 +141,7 @@ export async function observeConfigSnapshot(
     }
     const backup =
       (baseline?.hash ? baseline : null) ?? (await readConfigFingerprintForPath(deps, backupPath));
-    if (!health.isCurrent()) {
-      return;
-    }
+    health.assertCurrent();
     deps.logger.warn(`Config observe anomaly: ${snapshot.path} (${suspicious.join(", ")})`);
     await appendAudit(
       createConfigObserveAuditRecord({
@@ -170,7 +155,7 @@ export async function observeConfigSnapshot(
     );
     await health.update({ lastObservedSuspiciousSignature: signature }, healthSnapshot);
   } catch (error) {
-    if (error === superseded || isStateDatabaseReadAdmissionInvalidatedError(error)) {
+    if (isStateDatabaseReadAdmissionInvalidatedError(error)) {
       return;
     }
     throw error;
@@ -210,14 +195,10 @@ async function settleConfigHealthTransition(
     store: ReturnType<typeof captureConfigHealthStateStore>,
     snapshot: ConfigHealthSnapshot,
   ) => Promise<ConfigHealthUpdateResult>,
-  assertCurrent?: () => void,
 ): Promise<boolean> {
   for (let attempt = 0; attempt < CONFIG_HEALTH_TRANSITION_ATTEMPTS; attempt += 1) {
-    using store = captureConfigHealthStateStore(deps, configPath, assertCurrent);
+    const store = captureConfigHealthStateStore(deps, configPath);
     const healthSnapshot = await store.read();
-    if (!healthSnapshot) {
-      continue;
-    }
     if (healthSnapshot.basis === null) {
       return false;
     }
@@ -233,28 +214,18 @@ async function settleConfigHealthTransition(
 export async function captureConfigHealthBaselineForWrite(
   deps: NormalizedConfigIoDeps,
   configPath: string,
-  assertCurrent?: () => void,
 ): Promise<ConfigHealthBaselineCapture | null> {
   try {
-    for (let attempt = 0; attempt < CONFIG_HEALTH_TRANSITION_ATTEMPTS; attempt += 1) {
-      using store = captureConfigHealthStateStore(deps, configPath, assertCurrent);
-      const snapshot = await store.read();
-      if (!snapshot) {
-        continue;
-      }
-      if (snapshot.basis === null) {
-        return null;
-      }
-      const entry = readConfigHealthEntry(snapshot.state, configPath);
-      return entry.lastKnownGood
-        ? {
-            configPath,
-            previousLastKnownGood: entry.lastKnownGood,
-            previousSuspiciousSignature: entry.lastObservedSuspiciousSignature ?? null,
-          }
-        : null;
-    }
-    return null;
+    const store = captureConfigHealthStateStore(deps, configPath);
+    const snapshot = await store.read();
+    const entry = readConfigHealthEntry(snapshot.state, configPath);
+    return entry.lastKnownGood
+      ? {
+          configPath,
+          previousLastKnownGood: entry.lastKnownGood,
+          previousSuspiciousSignature: entry.lastObservedSuspiciousSignature ?? null,
+        }
+      : null;
   } catch (error) {
     deps.logger.warn(
       `Config last-known-good baseline capture failed: ${formatErrorMessage(error)}`,
@@ -273,7 +244,6 @@ export async function advanceConfigHealthBaselineForAcceptedWrite(
     raw: string;
     parsed: unknown;
     resolved?: unknown;
-    assertCurrent?: () => void;
   },
 ): Promise<ConfigHealthBaselineCompensation | null> {
   if (!capture) {
@@ -334,16 +304,6 @@ export async function advanceConfigHealthBaselineForAcceptedWrite(
       async (store, healthSnapshot) => {
         const entry = readConfigHealthEntry(healthSnapshot.state, baseline.configPath);
         const persisted = entry.lastKnownGood;
-        const signature = entry.lastObservedSuspiciousSignature ?? null;
-        // A newer anomaly can retain the old baseline. Preserve that whole
-        // decision; only observations of this candidate may be superseded.
-        if (
-          signature !== null &&
-          signature !== baseline.previousSuspiciousSignature &&
-          !signature.startsWith(`${current.hash}:`)
-        ) {
-          return { status: "applied" };
-        }
         // A baseline that is neither the pre-write baseline nor this write's
         // candidate is a newer, valid decision: preserve it untouched.
         if (
@@ -364,7 +324,6 @@ export async function advanceConfigHealthBaselineForAcceptedWrite(
           healthSnapshot,
         );
       },
-      params.assertCurrent,
     );
     if (!settled) {
       deps.logger.warn(
@@ -384,7 +343,6 @@ export async function advanceConfigHealthBaselineForAcceptedWrite(
 export async function restoreConfigHealthBaselineForRolledBackWrite(
   deps: NormalizedConfigIoDeps,
   compensation: ConfigHealthBaselineCompensation | null,
-  assertCurrent?: () => void,
 ): Promise<void> {
   if (!compensation) {
     return;
@@ -419,7 +377,6 @@ export async function restoreConfigHealthBaselineForRolledBackWrite(
           healthSnapshot,
         );
       },
-      assertCurrent,
     );
     if (!settled) {
       deps.logger.warn(
@@ -440,7 +397,6 @@ export function observeConfigSnapshotSync(
   if (!snapshot.exists || typeof snapshot.raw !== "string") {
     return;
   }
-  supersedeConfigHealthObservations(deps, snapshot.path);
   const stat = deps.fs.statSync(snapshot.path, { throwIfNoEntry: false }) ?? null;
   const current = createObservedFingerprint(snapshot, stat);
   const healthState = readConfigHealthStateFromStore(deps);

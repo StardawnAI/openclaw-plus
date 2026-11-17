@@ -1,25 +1,11 @@
-import {
-  type BigIntStats,
-  closeSync,
-  constants as fsConstants,
-  existsSync,
-  fstatSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-} from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import path from "node:path";
-import { resolveStateDir } from "../config/state-dir.js";
 import { createDedupeCache } from "../infra/dedupe.js";
 import { hasErrnoCode } from "../infra/errno.js";
-import { applyPrivateModeSync, applyPrivateModeToFdSync } from "../infra/private-mode.js";
+import { applyPrivateModeSync } from "../infra/private-mode.js";
 import { resolveSqliteDatabaseFilePaths } from "../infra/sqlite-files.js";
-import { resolveUpdateCaptureRoot } from "../infra/update-capture-paths.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
-import {
-  resolveOpenClawStateSqliteDir,
-  resolveOpenClawStateSqlitePath,
-} from "./openclaw-state-db.paths.js";
+import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
 
 const OPENCLAW_STATE_DIR_MODE = 0o700;
 const OPENCLAW_STATE_FILE_MODE = 0o600;
@@ -35,9 +21,23 @@ const chmodWarnedTargets = createDedupeCache({
 // Permission hardening is best-effort only on filesystems that cannot apply
 // it: the database stays usable without the chmod, and crashing at open would
 // take the gateway down on Azure Files/NFS/Docker volumes (#91919). Unexpected
-// chmod failures still throw so credentials-adjacent hardening stays loud.
+// chmod failures on owned paths still throw so credentials-adjacent hardening stays loud.
 function bestEffortChmodSync(target: string, mode: number): void {
-  const result = applyPrivateModeSync(target, mode);
+  let result: ReturnType<typeof applyPrivateModeSync>;
+  try {
+    result = applyPrivateModeSync(target, mode);
+  } catch (error) {
+    if (
+      !hasErrnoCode(error, "EPERM") ||
+      !process.getuid ||
+      statSync(target).uid === process.getuid()
+    ) {
+      throw error;
+    }
+    // Group/ACL-writable shared volumes need not grant permission to chmod their owner's files.
+    // The actual database open/write still decides whether this process can use the store.
+    result = { applied: false, error };
+  }
   if (result.applied || chmodWarnedTargets.check(target)) {
     return;
   }
@@ -50,9 +50,9 @@ export function ensureOpenClawStatePermissions(
   options: { createDirectory?: boolean } = {},
 ): void {
   const dir = path.dirname(pathname);
-  const defaultDir = resolveOpenClawStateSqliteDir(env);
-  const isDefaultStateDatabase =
-    path.resolve(pathname) === path.resolve(resolveOpenClawStateSqlitePath(env));
+  const defaultPath = resolveOpenClawStateSqlitePath(env);
+  const defaultDir = path.dirname(defaultPath);
+  const isDefaultStateDatabase = path.resolve(pathname) === path.resolve(defaultPath);
   if (isDefaultStateDatabase && dir !== defaultDir) {
     throw new Error(`OpenClaw state database path resolved outside its state dir: ${pathname}`);
   }
@@ -79,64 +79,5 @@ export function ensureOpenClawStatePermissions(
         }
       }
     }
-  }
-}
-
-/** Restore only the existing capture root after Doctor has admitted its repair owner. */
-export function restorePrivateUpdateCaptureRootMode(env: NodeJS.ProcessEnv): void {
-  if (process.platform === "win32") {
-    return;
-  }
-  // Never traverse the state tree or change the shared state root. The snapshot
-  // owner still checks ancestors, aliases and ownership before capturing data.
-  const target = resolveUpdateCaptureRoot(path.resolve(resolveStateDir(env)));
-  let fd: number;
-  try {
-    fd = openSync(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
-  } catch (error) {
-    if (hasErrnoCode(error, "ENOENT") || hasErrnoCode(error, "ENOTDIR")) {
-      return;
-    }
-    if (
-      hasErrnoCode(error, "ELOOP") ||
-      hasErrnoCode(error, "EMLINK") ||
-      hasErrnoCode(error, "EACCES") ||
-      hasErrnoCode(error, "EPERM")
-    ) {
-      if (!chmodWarnedTargets.check(target)) {
-        stateDbLog.warn(`skipped permission restore for ${target}: ${String(error)}`);
-      }
-      return;
-    }
-    throw error;
-  }
-  try {
-    const opened = fstatSync(fd, { bigint: true });
-    let named: BigIntStats;
-    try {
-      named = lstatSync(target, { bigint: true });
-    } catch (error) {
-      if (hasErrnoCode(error, "ENOENT") || hasErrnoCode(error, "ENOTDIR")) {
-        return;
-      }
-      throw error;
-    }
-    const uid = process.getuid?.();
-    if (
-      !opened.isDirectory() ||
-      opened.dev !== named.dev ||
-      opened.ino !== named.ino ||
-      (uid !== undefined && opened.uid !== BigInt(uid)) ||
-      (opened.mode & 0o007n) !== 0n ||
-      (opened.mode & 0o7070n) === 0n
-    ) {
-      return;
-    }
-    const result = applyPrivateModeToFdSync(fd, target, OPENCLAW_STATE_DIR_MODE);
-    if (!result.applied && !chmodWarnedTargets.check(target)) {
-      stateDbLog.warn(`skipped permission hardening for ${target}: ${String(result.error)}`);
-    }
-  } finally {
-    closeSync(fd);
   }
 }

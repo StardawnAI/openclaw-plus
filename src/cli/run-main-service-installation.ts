@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import path from "node:path";
 import { mergeGatewayServiceEnv } from "../daemon/service-env-merge.js";
 import {
   inspectGatewayServiceInstallationDrift,
@@ -9,46 +8,13 @@ import {
 import type { GatewayServiceCommandConfig } from "../daemon/service-types.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { resolveIdentityPathViaExistingAncestorSync } from "../infra/boundary-path.js";
-import { hasErrnoCode } from "../infra/errno.js";
 import type { GatewayServiceInstallation } from "../infra/gateway-service-installation-context.js";
 import { compareOpenClawReleaseVersions } from "../infra/npm-registry-spec.js";
 import { resolveOpenClawPackageRoot } from "../infra/openclaw-root.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { VERSION } from "../version.js";
 import { isGatewayRunInvocationArgv } from "./gateway-run-argv.js";
-import { isValidProfileName } from "./profile-utils.js";
 import { applyCliProfileEnv, parseCliProfileArgs } from "./profile.js";
-
-/** Only definite absence permits climbing past a missing service database. */
-async function resolveInspectedServiceDatabasePath(databasePath: string): Promise<string> {
-  let current = databasePath;
-  const suffix: string[] = [];
-  for (;;) {
-    try {
-      return path.join(await fs.realpath(current), ...suffix.toReversed());
-    } catch (error) {
-      if (!hasErrnoCode(error, "ENOENT")) {
-        throw error;
-      }
-      // A dangling symlink is not a missing selector: its destination is unknown.
-      const entry = await fs.lstat(current).catch((statError: unknown) => {
-        if (!hasErrnoCode(statError, "ENOENT")) {
-          throw statError;
-        }
-        return undefined;
-      });
-      if (entry) {
-        throw error;
-      }
-      const parent = path.dirname(current);
-      if (parent === current) {
-        throw error;
-      }
-      suffix.push(path.basename(current));
-      current = parent;
-    }
-  }
-}
 
 /** Resolve this Gateway's own manager, never a same-named unit in another scope. */
 async function readOwnGatewayServiceCommand(
@@ -123,7 +89,7 @@ export async function inspectCliGatewayServiceInstallation(
   try {
     const service = resolveGatewayService();
     const ownCommand = await readOwnGatewayServiceCommand(env);
-    const command = ownCommand ?? (await service.readCommand(env, { inspectStateIdentity: true }));
+    const command = ownCommand ?? (await service.readCommand(env));
     const root = await resolveOpenClawPackageRoot({ moduleUrl: import.meta.url });
     const layout = await summarizeGatewayServiceLayout(command);
     const drift = root ? await inspectGatewayServiceInstallationDrift(layout, root) : undefined;
@@ -147,70 +113,26 @@ export async function inspectCliGatewayServiceInstallation(
           },
           command,
         );
-    let stateIdentityUnverified = command?.stateIdentityUnverified;
-    // Resolve installed argv and environment through the CLI profile owner.
-    if (!ownCommand && command) {
+    // The Windows service projection already applies command-line profiles.
+    if (!ownCommand && command && process.platform !== "win32") {
       const entrypoint = resolveServiceEntrypointIndex(command.programArguments);
       if (entrypoint !== undefined) {
         const profile = parseCliProfileArgs([
           "node",
           ...command.programArguments.slice(entrypoint),
         ]);
-        if (!profile.ok) {
-          stateIdentityUnverified = true;
+        if (profile.ok && profile.profile) {
+          applyCliProfileEnv({ profile: profile.profile, env: serviceEnv });
         }
-        const selectedProfile =
-          (profile.ok ? profile.profile : undefined) ?? serviceEnv.OPENCLAW_PROFILE;
-        if (selectedProfile) {
-          if (!isValidProfileName(selectedProfile)) {
-            stateIdentityUnverified = true;
-          } else {
-            applyCliProfileEnv({ profile: selectedProfile, env: serviceEnv });
-          }
-        }
-      }
-    }
-    const callerDatabasePath = resolveIdentityPathViaExistingAncestorSync(
-      resolveOpenClawStateSqlitePath(env),
-    );
-    // Known older installation + uncertain mapping still restricts the caller's database.
-    let databasePath = callerDatabasePath;
-    const relativeSelector = ["HOME", "USERPROFILE", "OPENCLAW_HOME", "OPENCLAW_STATE_DIR"].some(
-      (key) => {
-        const value = command?.environment?.[key]?.trim();
-        return value && !path.isAbsolute(value) && !/^~(?:$|[\\/])/u.test(value);
-      },
-    );
-    if (ownCommand || (!stateIdentityUnverified && !relativeSelector)) {
-      try {
-        const servicePath = await resolveInspectedServiceDatabasePath(
-          resolveOpenClawStateSqlitePath(serviceEnv),
-        );
-        const stat = async (pathname: string) =>
-          fs.stat(pathname).catch((error: unknown) => {
-            if (!hasErrnoCode(error, "ENOENT")) {
-              throw error;
-            }
-            return undefined;
-          });
-        const [caller, installed] = await Promise.all([
-          stat(callerDatabasePath),
-          stat(servicePath),
-        ]);
-        // realpath alone cannot identify hard links or host-visible bind mounts.
-        databasePath =
-          caller && installed && caller.dev === installed.dev && caller.ino === installed.ino
-            ? callerDatabasePath
-            : servicePath;
-      } catch {
-        // Inspection failure is not affirmative evidence of a separate database.
       }
     }
     return {
       root: drift.serviceRoot,
       version: drift.serviceVersion,
       cliVersion: VERSION,
-      databasePath,
+      databasePath: resolveIdentityPathViaExistingAncestorSync(
+        resolveOpenClawStateSqlitePath(serviceEnv),
+      ),
     };
   } catch {
     // Service inspection is best effort and must not make an uninspectable host unusable.

@@ -1,16 +1,22 @@
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { isPostgresSqlConnection } from "../../infra/sql-connection.js";
 import { hasPendingSqliteNativeExecution } from "../../infra/sqlite-native-observer.js";
 import {
   readSqliteNativeMutationRevision,
   registerSqliteSchemaMutationListener,
 } from "../../infra/sqlite-schema-facts.js";
-import { readDatabasePathIdentitySync } from "../../infra/sqlite-worker-identity.js";
+import {
+  assertDatabasePathIdentity,
+  readDatabasePathIdentitySync,
+  type DatabasePathIdentity,
+} from "../../infra/sqlite-worker-identity.js";
+import { isSessionMutationActive } from "../../sessions/session-controller.lifecycle.js";
 import { isCronRunSessionKey, isCronSessionKey } from "../../sessions/session-key-utils.js";
-import { isSessionLifecycleMutationActive } from "../../sessions/session-lifecycle-admission.js";
 import {
   isSessionStoreTopologyChange,
+  sessionChangeScopeAffectsStoredRows,
   sessionChanges,
   type SessionRowChange,
 } from "../../sessions/session-row-changes.js";
@@ -64,7 +70,6 @@ function isSessionGenerationFacts(value: unknown): value is SessionGenerationFac
       (typeof value.sessionId === "string" &&
         value.sessionId.length > 0 &&
         value.sessionId === value.sessionId.trim())) &&
-    (value.followConversation === undefined || value.followConversation === true) &&
     typeof value.storePath === "string" &&
     path.isAbsolute(value.storePath) &&
     (value.lifecycleRevision === null ||
@@ -79,7 +84,9 @@ async function prepareSessionGenerationLease(
 ): Promise<{
   assertCurrent: SessionSourceAssertion;
   assertDeliveryCurrent: () => void;
-  readSessionSettings: () => Pick<SessionSharingEntry, "permissionMode" | "toolOverrides">;
+  readSessionSettings: () =>
+    | Readonly<Pick<SessionSharingEntry, "permissionMode" | "toolOverrides">>
+    | undefined;
   prepareRead: () => Promise<void> | undefined;
   release: () => void;
   bindCreation: (
@@ -151,7 +158,7 @@ async function prepareSessionGenerationLease(
       revoked = true;
       throw new SessionDeliveryGenerationRevokedError();
     }
-    if (entry && committed && generation.followConversation) {
+    if (entry && committed) {
       generation.sessionId = entry.sessionId;
     }
     return entry;
@@ -171,18 +178,10 @@ async function prepareSessionGenerationLease(
           return;
         }
       } else if (
-        [
-          "profiles",
-          "catalog",
-          "acp",
-          "agent-runs",
-          "subagent-runs",
-          "worker-placements",
-          "worker-environments",
-          "config",
-          "config-presentation",
-          "config-profiles",
-        ].includes(change.scope)
+        // Runtime and automation still invalidate this retained authority.
+        !sessionChangeScopeAffectsStoredRows(change) &&
+        change.scope !== "runtime" &&
+        change.scope !== "automation"
       ) {
         return;
       }
@@ -248,7 +247,7 @@ async function prepareSessionGenerationLease(
         );
       }
     }
-    let source: { path: string; identity: string } | undefined;
+    let source: { path: string; identity: DatabasePathIdentity } | undefined;
     let assertNativeCurrent: (entry: SessionGenerationEntry | null) => void = () => {};
     while (!retained) {
       assertActive();
@@ -285,7 +284,7 @@ async function prepareSessionGenerationLease(
             ) {
               throw new SessionDeliveryGenerationUnavailableError();
             }
-            source = { path: sharing.source.path, identity: sharing.databaseIdentity };
+            source = { path: sharing.source.path, identity };
           } else {
             const pathname = path.resolve(read!.database.path);
             const original = originalSources.get(pathname);
@@ -298,12 +297,12 @@ async function prepareSessionGenerationLease(
             ) {
               throw new SessionDeliveryGenerationUnavailableError();
             }
-            source = { path: pathname, identity: original.key };
+            source = { path: pathname, identity: original };
           }
           paths.add(path.resolve(source.path));
-          databaseIdentity = source.identity;
+          databaseIdentity = source.identity.key;
           const prepared = retainPreparedSessionGenerationFacts({
-            databaseIdentity: source.identity,
+            databaseIdentity: source.identity.key,
             sessionKey: generation.sessionKey,
             entry: entry ? projectSessionSharingEntry(entry) : undefined,
           });
@@ -314,7 +313,7 @@ async function prepareSessionGenerationLease(
           const schemaChanged = () => {
             invalidated = true;
           };
-          if (native) {
+          if (native && !isPostgresSqlConnection(native.db)) {
             releases.push(registerSqliteSchemaMutationListener(native.db, schemaChanged));
           }
           assertNativeCurrent = (current) => {
@@ -322,7 +321,9 @@ async function prepareSessionGenerationLease(
             if (!native && opened) {
               native = opened;
               nativeRevision = undefined;
-              releases.push(registerSqliteSchemaMutationListener(native.db, schemaChanged));
+              if (!isPostgresSqlConnection(native.db)) {
+                releases.push(registerSqliteSchemaMutationListener(native.db, schemaChanged));
+              }
             } else if (opened !== native) {
               invalidated = true;
               throw new SessionDeliveryGenerationUnavailableError();
@@ -331,7 +332,7 @@ async function prepareSessionGenerationLease(
               return;
             }
             // Native callbacks and unfinished cursors cannot certify a committed write set.
-            if (hasPendingSqliteNativeExecution(native.db)) {
+            if (!isPostgresSqlConnection(native.db) && hasPendingSqliteNativeExecution(native.db)) {
               throw new SessionDeliveryGenerationUnavailableError();
             }
             const revision = readSqliteNativeMutationRevision(native.db);
@@ -370,21 +371,20 @@ async function prepareSessionGenerationLease(
         },
       );
     }
-    const assertSourceCurrent = () => {
+    const readCurrent = () => {
       assertActive();
-      if (!source || readDatabasePathIdentitySync(source.path).key !== source.identity) {
+      if (!source) {
         throw new SessionDeliveryGenerationUnavailableError();
       }
-    };
-    const readCurrent = () => {
-      assertSourceCurrent();
+      // External tool effects also use this guard, without entering a database writer.
+      assertDatabasePathIdentity(source.path, source.identity);
       const entry = checkEntry(retained?.readCurrent());
       assertNativeCurrent(entry);
       return entry;
     };
     const prepareRead = () => {
-      assertSourceCurrent();
-      return retained?.prepareRead()?.then(assertSourceCurrent);
+      assertActive();
+      return retained?.prepareRead()?.then(assertActive);
     };
     if (generation.sessionId !== null && source) {
       workerSource = captureSessionEntrySourceAssertion({
@@ -393,13 +393,13 @@ async function prepareSessionGenerationLease(
           sessionId: generation.sessionId,
           lifecycleRevision: generation.lifecycleRevision ?? undefined,
         },
-        fields: generation.followConversation
-          ? generation.lifecycleRevision === null
+        fields: generation.exactTranscript
+          ? ["sessionId", "lifecycleRevision"]
+          : generation.lifecycleRevision === null
             ? []
-            : ["lifecycleRevision"]
-          : ["sessionId", "lifecycleRevision"],
+            : ["lifecycleRevision"],
         assertCurrent: () => readCurrent(),
-        assertHostCurrent: assertSourceCurrent,
+        assertHostCurrent: assertActive,
         refuse: () => {
           revoked = true;
           throw new SessionDeliveryGenerationRevokedError();
@@ -412,7 +412,7 @@ async function prepareSessionGenerationLease(
         if (
           delivery &&
           [...paths].some((scope) =>
-            isSessionLifecycleMutationActive(
+            isSessionMutationActive(
               scope,
               generation.sessionId
                 ? [generation.sessionKey, generation.sessionId]
@@ -454,33 +454,30 @@ async function prepareSessionGenerationLease(
         }),
       );
     }
+    const assertGenerationCurrent = workerSource
+      ? composeSessionSourceAssertion([workerSource], (assertSource) => {
+          try {
+            assertActive();
+            assertSource();
+          } catch (error) {
+            const failure =
+              isSessionDeliveryGenerationRevokedError(error) ||
+              isSessionDeliveryGenerationUnavailableError(error)
+                ? error
+                : new SessionDeliveryGenerationUnavailableError({ cause: error });
+            onRevoked?.(failure);
+            throw failure;
+          }
+        })
+      : assertCurrent;
     return {
-      assertCurrent: workerSource
-        ? composeSessionSourceAssertion([workerSource], (assertSource) => {
-            try {
-              assertActive();
-              assertSource();
-            } catch (error) {
-              const failure =
-                isSessionDeliveryGenerationRevokedError(error) ||
-                isSessionDeliveryGenerationUnavailableError(error)
-                  ? error
-                  : new SessionDeliveryGenerationUnavailableError({ cause: error });
-              onRevoked?.(failure);
-              throw failure;
-            }
-          })
-        : assertCurrent,
+      assertCurrent: assertGenerationCurrent,
       assertDeliveryCurrent: () => assertCurrent(true),
       readSessionSettings: () => {
-        const current = assertCurrent();
+        assertGenerationCurrent();
         // Identity-preserving writes may bypass generation readiness, but a pending
         // policy publication cannot donate stale permissions to retained work.
-        const entry = retained ? checkEntry(retained.readSessionSettings()) : current;
-        return {
-          permissionMode: entry?.permissionMode,
-          toolOverrides: entry?.toolOverrides,
-        };
+        return checkEntry(retained?.readSessionSettings()) ?? undefined;
       },
       prepareRead,
       release,
@@ -556,6 +553,7 @@ export async function prepareCronRootSessionGeneration(
     {
       ...input,
       lifecycleRevision: input.lifecycleRevision ?? null,
+      exactTranscript: true,
     },
     onRevoked,
   );

@@ -6,8 +6,6 @@ export type SessionDeliveryGeneration = Readonly<{
   sessionKey: string;
   sessionId: string;
   lifecycleRevision: string | null;
-  /** Stored automation links follow the conversation; active writers remain exact by default. */
-  followConversation?: true;
 }>;
 
 export type SessionGenerationEntry = Pick<
@@ -18,4 +16,6 @@ export type SessionGenerationEntry = Pick<
 export type SessionGenerationFacts = Omit<SessionDeliveryGeneration, "sessionId"> & {
   sessionId: string | null;
   env?: NodeJS.ProcessEnv;
+  /** Live transcript writers pin the exact transcript; stored references follow edits. */
+  exactTranscript?: true;
 };

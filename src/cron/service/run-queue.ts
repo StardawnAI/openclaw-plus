@@ -10,8 +10,8 @@ import { captureOpenClawStateWorkerContext } from "../../state/openclaw-state-wo
 import { runOpenClawStateWorkerOperation } from "../../state/openclaw-state-worker-store.js";
 import { CronEventClaimInvalidatedError } from "../event-source.js";
 import { captureCronMutationCommit } from "../mutation-completion.js";
-import { noteCronJobsStoreCommit } from "../store.js";
-import { cronStoreKey } from "../store/key.js";
+import { currentPluginCommandHostProcessId } from "../plugin-command-schedule.js";
+import { getCronJobsStoreRevision } from "../store.js";
 import type {
   CronQueuedRun,
   CronRunQueueOperations,
@@ -41,11 +41,12 @@ import { preparingCronAgentIds } from "./scheduler-config.js";
 import {
   emit,
   isImmediateCronRunMode,
+  prepareCronServiceStore,
   type CronRunMode,
   type CronRunResult,
   type CronServiceState,
 } from "./state.js";
-import { captureCronServiceMutationSource } from "./store.js";
+import { captureCronServiceMutationSource, noteLoadedCronStoreCommit } from "./store.js";
 
 type LaunchState = {
   contexts: Map<string, CronLaunchContext>;
@@ -110,9 +111,12 @@ export function adoptCronRunRequests(
   const batch = { notified: false };
   return accepted.map((entry) => {
     const launch: CronLaunchContext = {
+      job: entry.job,
       receipt: entry.runReceipt,
       context,
       options: Object.assign({}, options, {
+        // Event ingress retains its claim until transfer; manual request custody ends here.
+        commitGuard: options.event ? options.commitGuard : undefined,
         scheduleOwnershipAtMs: options.scheduleOwnershipAtMs ?? entry.runReceipt.startedAtMs,
       }),
       generation,
@@ -139,6 +143,10 @@ export async function commitCronRunRequests(
   if (state.stopped || jobs.length === 0) {
     return [];
   }
+  const preparation = prepareCronServiceStore(state);
+  if (preparation) {
+    await preparation;
+  }
   const source = captureCronServiceMutationSource(state);
   const nowMs = state.deps.nowMs();
   const generation = state.lifecycleGeneration;
@@ -155,6 +163,7 @@ export async function commitCronRunRequests(
     options.commitGuard?.();
     source.assertCurrent();
   };
+  const observedRevision = getCronJobsStoreRevision(source.storeKey);
   const result = await runOpenClawStateWorkerOperation(
     source.context,
     (scope) =>
@@ -188,19 +197,18 @@ export async function commitCronRunRequests(
   );
   if (accepted.length > 0) {
     markCommitted?.();
-    noteCronJobsStoreCommit(source.storeKey);
     applyCronRuntimeRowsToState(
       state,
       accepted.map(({ job }) => job),
     );
+    noteLoadedCronStoreCommit(state, observedRevision);
     options.onExit?.onReserved();
   }
   return accepted;
 }
 
-async function publishSkipped(state: CronServiceState, skipped: CronSkippedRequest) {
+function publishSkipped(state: CronServiceState, skipped: CronSkippedRequest) {
   const pending = launchState(state).contexts.get(skipped.runReceipt.receiptId);
-  applyCronRuntimeRowsToState(state, skipped.job ? [skipped.job] : []);
   if (!pending) {
     return;
   }
@@ -209,17 +217,21 @@ async function publishSkipped(state: CronServiceState, skipped: CronSkippedReque
   pending.activation.resolve();
   launchState(state).contexts.delete(skipped.runReceipt.receiptId);
   // The worker writes skipped history with the same receipt; events are best effort.
-  emit(state, {
-    jobId: skipped.runReceipt.jobId,
-    job: skipped.job,
-    action: "finished",
-    status: "skipped",
-    error: skipped.error,
-    runId: pending.options.runId,
-    runAtMs: skipped.runReceipt.startedAtMs,
-    durationMs: 0,
-    nextRunAtMs: skipped.job?.state.nextRunAtMs,
-  });
+  emit(
+    state,
+    {
+      jobId: skipped.runReceipt.jobId,
+      job: skipped.job ?? pending.job,
+      action: "finished",
+      status: "skipped",
+      error: skipped.error,
+      runId: pending.options.runId,
+      runAtMs: skipped.runReceipt.startedAtMs,
+      durationMs: 0,
+      nextRunAtMs: skipped.job?.state.nextRunAtMs,
+    },
+    { runNotStarted: true },
+  );
   if (pending.options.terminalTracker) {
     pending.options.terminalTracker.emitted = true;
   }
@@ -252,20 +264,25 @@ async function cancelCronRunRequests(
   }
   const context =
     launchState(state).contexts.get(receiptIds[0]!)?.context ?? captureOpenClawStateWorkerContext();
+  const observedRevision = getCronJobsStoreRevision(state.deps.storeKey);
   const result = await runOpenClawStateWorkerOperation(context, (scope) =>
     scope.execute({
       type: "cron.cancelRequests",
       input: {
-        storeKey: cronStoreKey(state.deps.storePath),
+        storeKey: state.deps.storeKey,
         receiptIds,
         nowMs: state.deps.nowMs(),
         reason,
       },
     }),
   );
-  noteCronJobsStoreCommit(cronStoreKey(state.deps.storePath));
+  applyCronRuntimeRowsToState(
+    state,
+    result.skipped.flatMap(({ job }) => (job ? [job] : [])),
+  );
+  noteLoadedCronStoreCommit(state, observedRevision);
   for (const skipped of result.skipped) {
-    await publishSkipped(state, skipped);
+    publishSkipped(state, skipped);
   }
 }
 
@@ -286,8 +303,7 @@ export async function drainCronRunQueue(state: CronServiceState): Promise<void> 
     return;
   }
   if (launchState(state).drain) {
-    await launchState(state).drain;
-    return;
+    return await launchState(state).drain;
   }
   let retryAfterGuardRefusal = false;
   launchState(state).drain = locked(state, async () => {
@@ -306,19 +322,22 @@ export async function drainCronRunQueue(state: CronServiceState): Promise<void> 
         }
       }
     };
+    const observedRevision = getCronJobsStoreRevision(state.deps.storeKey);
     const result = await runOpenClawStateWorkerOperation(
       context,
       (scope) =>
         scope.execute({
           type: "cron.drainQueue",
           input: {
-            storeKey: cronStoreKey(state.deps.storePath),
+            storeKey: state.deps.storeKey,
             nowMs: state.deps.nowMs(),
             defaultAgentId: resolveCurrentDefaultAgentId(state),
             maxConcurrentRuns: DEFAULT_CRON_MAX_CONCURRENT_RUNS,
             schedulingPaused: state.schedulingPaused,
             preparingAgentIds: preparingCronAgentIds(state.deps.env),
             requests: getCronRunQueueRequests(state, { includePendingEvents: true }),
+            hostProcessId: currentPluginCommandHostProcessId(),
+            pluginCommandHosts: state.deps.resolvePluginCommandScheduleHosts?.(),
           },
         }),
       {
@@ -344,10 +363,7 @@ export async function drainCronRunQueue(state: CronServiceState): Promise<void> 
             normalizeCronRunErrorText(error),
           );
         } catch (cleanupError) {
-          state.deps.log.warn(
-            { err: String(cleanupError) },
-            "cron: refused event cleanup left for recovery",
-          );
+          state.deps.log.warn({ err: String(cleanupError) }, "cron: deferred event cleanup");
         } finally {
           // A missing cleanup row is already settled; uncertain cleanup stays
           // durable for recovery, never in the live source-admission loop.
@@ -379,10 +395,9 @@ export async function drainCronRunQueue(state: CronServiceState): Promise<void> 
       }
       throw error;
     });
-    if (!result) {
-      return;
+    if (result) {
+      await launchCronRunQueueResult(state, result, context, observedRevision);
     }
-    await launchCronRunQueueResult(state, result, context);
   }).finally(() => {
     launchState(state).drain = undefined;
     if (retryAfterGuardRefusal) {
@@ -397,19 +412,22 @@ export async function launchCronRunQueueResult(
   state: CronServiceState,
   result: CronRunQueueOperations["cron.drainQueue"]["output"],
   context = captureOpenClawStateWorkerContext(),
+  observedRevision = getCronJobsStoreRevision(state.deps.storeKey),
 ): Promise<void> {
   if (result.launches.length || result.skipped.length) {
-    noteCronJobsStoreCommit(cronStoreKey(state.deps.storePath));
+    const jobs = [...result.skipped, ...result.launches].flatMap(({ job }) => (job ? [job] : []));
+    applyCronRuntimeRowsToState(state, jobs);
+    noteLoadedCronStoreCommit(state, observedRevision);
   }
   for (const skipped of result.skipped) {
-    await publishSkipped(state, skipped);
+    publishSkipped(state, skipped);
   }
   for (const entry of [...result.preparing, ...result.launches]) {
     const preparing = result.preparing.includes(entry);
-    applyCronRuntimeRowsToState(state, [entry.job]);
     let pending = launchState(state).contexts.get(entry.runReceipt.receiptId);
     if (!pending) {
       pending = {
+        job: entry.job,
         receipt: entry.runReceipt,
         context,
         options: {},
@@ -507,7 +525,6 @@ export async function launchCronRunQueueResult(
           );
         } finally {
           launch.activation.resolve();
-          launch.completion.reject(error);
           launch.removeCancellation?.();
           launchState(state).contexts.delete(entry.runReceipt.receiptId);
         }

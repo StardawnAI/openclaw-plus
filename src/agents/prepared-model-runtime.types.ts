@@ -123,7 +123,9 @@ export type PreparedModelRuntimeSnapshot = Omit<PublishedModelCatalogOwnerCandid
     }>[];
     /** Inline provider projection prepared once for all resolutions owned by this snapshot. */
     inlineProviderModels: readonly InlineModelEntry[];
-    createStores: () => PreparedModelRuntimeStores;
+    createStores: (
+      publishedModels?: ReadonlyMap<string, readonly Model[]>,
+    ) => PreparedModelRuntimeStores;
     /** Bounded metadata shared by runs; replacing the model/auth generation drops the memo. */
     routeModelResolutionMemo?: Map<string, Promise<Model>>;
   }>;
@@ -134,7 +136,6 @@ export type PreparedReplyDispatchRuntime = Readonly<{
   agentDir: string;
   workspaceDir: string;
   config: OpenClawConfig;
-  readPolicyConfig?: () => OpenClawConfig;
   modelCatalog: ModelCatalogSnapshot;
   readFullModelCatalog?: () => ModelCatalogSnapshot | undefined;
   inboundPluginRegistry: PluginRegistry;
@@ -161,16 +162,12 @@ export type PreparedModelRuntimeInput = {
   env?: NodeJS.ProcessEnv;
   allowGatewaySubagentBinding?: boolean;
   runtimePluginSelections?: readonly AgentHarnessPluginSelection[];
-  /** Internal admission binding; never replaces the discovery/public config identities. */
-  readPolicyConfig?: () => OpenClawConfig;
   config: OpenClawConfig;
 };
 
 export type PreparedModelRuntimeLease = Readonly<{
   snapshot: PreparedModelRuntimeSnapshot;
   pluginGeneration: PreparedModelRuntimePluginGeneration;
-  /** Exact capability custody for execution; passive inventory leases omit this. */
-  run?: <T>(run: () => T) => T;
   [Symbol.asyncDispose](): Promise<void>;
 }>;
 
@@ -180,6 +177,12 @@ export type PreparedModelRuntimeLeaseOptions = {
   pluginGeneration?: PreparedModelRuntimePluginGeneration;
   pluginMetadataSnapshot?: PluginMetadataSnapshot;
   abortSignal?: AbortSignal;
+  /**
+   * A plugin-runtime refresh continuation already ran tools on
+   * the previous generation, so it waits for every pending reload to settle
+   * instead of failing after the usual three publication gates.
+   */
+  waitForReplacementPublication?: boolean;
   /** Pure planning against admitted facts; requested selections remain explicit and additive. */
   deriveRuntimePluginSelections?: (context: {
     config: OpenClawConfig;
@@ -241,11 +244,15 @@ export type PreparedModelCatalogProviderFacts = {
   expiresAt?: number;
   /** Consecutive failed discoveries; their backed-off retry deadline is `expiresAt`. */
   discoveryFailures?: number;
-  legacyRows?: ReadonlySet<string>;
+  /** Rows carried from another plugin generation; visible until this generation reacquires them. */
+  provisional?: true;
+  legacyAcquired?: boolean;
 };
 
 export type PreparedModelCatalogInventory = {
   catalog: ModelCatalogSnapshot;
+  /** An unscoped provider acquisition completed; retained across provider-local refreshes. */
+  fullProviderDiscovery?: true;
   runtimeModels: ReadonlyMap<string, readonly Model[]>;
   key: string;
   pluginFingerprint: string;

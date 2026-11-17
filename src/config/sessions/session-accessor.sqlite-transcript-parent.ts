@@ -1,14 +1,17 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { sql } from "kysely";
-import { jsonNativeFieldsValid, jsonPathValue } from "../../infra/database-engine/json-values.js";
+import {
+  jsonObjectFieldsForScan,
+  jsonScannedValue,
+} from "../../infra/database-engine/json-values.js";
 import {
   executeSqliteQueryTakeFirstSync,
   iterateSqliteQuerySync,
 } from "../../infra/kysely-sync.js";
 import type { UserTurnTranscriptAdmissionReceipt } from "../../sessions/user-turn-transcript.types.js";
 import {
-  scanJsonObjectFields,
   readJsonPredicateScalar,
+  scanJsonObjectFields,
 } from "../../state/json-predicate-fields.js";
 import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
 import type {
@@ -16,6 +19,7 @@ import type {
   TranscriptEventAppendOptions,
   TranscriptMessageAppendOptions,
 } from "./session-accessor.sqlite-contract.js";
+import { selectActiveTranscriptEventRows } from "./session-accessor.sqlite-projection-read.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import { readSessionActorTransactionState } from "./session-actor-transaction.js";
 import { projectTranscriptNavigationSql } from "./session-model-context-projection.js";
@@ -29,6 +33,7 @@ import {
   resolveTranscriptAppendParent,
 } from "./transcript-append-parent.js";
 import { transcriptEventNavigationSql } from "./transcript-payload.js";
+import { assertTranscriptNavigationValid } from "./transcript-predicate-fields.js";
 import {
   isSessionTranscriptLeafControl,
   parseSessionTranscriptTreeEntry,
@@ -123,12 +128,6 @@ export function canRebasePreparedAssistantInTransaction(
   if (newerMessageMetadata.length === 0) {
     return !admittedIsNewer;
   }
-  const navigation = transcriptEventNavigationSql(database.db, "event");
-  const native = jsonNativeFieldsValid(database.db, navigation);
-  const field = (path: string) =>
-    /* kysely-allow-raw: decode only native-readable metadata. */ sql<
-      string | null
-    >`CASE WHEN ${native} THEN ${jsonPathValue(database.db, navigation, sql.val(path))} END`;
   const newerRoles = Array.from(
     iterateSqliteQuerySync(
       database.db,
@@ -153,15 +152,14 @@ export function canRebasePreparedAssistantInTransaction(
           "identity.parent_id",
           "active.message_position",
           "rewrite.generation",
-          field("$.message.role").as("message_role"),
-          field("$.message.provenance.kind").as("provenance_kind"),
-          field("$.message.provenance.sourceChannel").as("provenance_source_channel"),
-          /* kysely-allow-raw: native booleans alone classify context-free commands. */
-          sql<number>`CASE WHEN ${native} THEN json_type(${navigation}, '$.message.excludeFromContext') = 'true' AND json_type(${navigation}, '$.message.__openclaw.contextFreeCommand') = 'true' ELSE 0 END`.as(
-            "context_free_command",
-          ),
-          /* kysely-allow-raw: exceptional rows are scanned once with first-member semantics. */
-          sql<string | null>`CASE WHEN NOT ${native} THEN ${navigation} END`.as("exceptional_json"),
+          jsonObjectFieldsForScan(database.db, transcriptEventNavigationSql(database.db, "event"), {
+            message: {
+              role: true,
+              excludeFromContext: true,
+              __openclaw: { contextFreeCommand: true },
+              provenance: { kind: true, sourceChannel: true },
+            },
+          }).as("message_json"),
         ])
         .where("identity.session_id", "=", sessionId)
         .where("identity.seq", ">=", newerMessageMetadata[0]!.seq)
@@ -171,44 +169,43 @@ export function canRebasePreparedAssistantInTransaction(
         .limit(PREPARED_ASSISTANT_MAX_NEWER_MESSAGES),
     ),
   );
-  const facts = newerRoles.map((row) => {
-    if (row.exceptional_json === null) {
-      return row;
-    }
-    const root = scanJsonObjectFields(row.exceptional_json, ["message"]);
-    if (!root.valid) {
-      throw new Error("malformed JSON in transcript navigation");
-    }
-    const messageToken = root.first.get("message");
-    const message = scanJsonObjectFields(
-      messageToken?.kind === "object" ? messageToken.text : "{}",
-      ["role", "excludeFromContext", "__openclaw", "provenance"],
-    );
-    const internal = message.first.get("__openclaw");
-    const flags = scanJsonObjectFields(internal?.kind === "object" ? internal.text : "{}", [
+  const newerFacts = newerRoles.map((row) => {
+    const event = scanJsonObjectFields(row.message_json, ["message"]);
+    // SQLite's depth limit does not make a valid navigation envelope corrupt.
+    assertTranscriptNavigationValid(event.valid ? 1 : 0);
+    const message = event.first.get("message");
+    const fields = scanJsonObjectFields(message?.kind === "object" ? message.text : "{}", [
+      "role",
+      "excludeFromContext",
+      "__openclaw",
+      "provenance",
+    ]).first;
+    const internal = fields.get("__openclaw");
+    const command = scanJsonObjectFields(internal?.kind === "object" ? internal.text : "{}", [
       "contextFreeCommand",
-    ]);
-    const provenance = message.first.get("provenance");
+    ]).first.get("contextFreeCommand");
+    const provenance = fields.get("provenance");
     const source = scanJsonObjectFields(provenance?.kind === "object" ? provenance.text : "{}", [
       "kind",
       "sourceChannel",
-    ]);
-    const text = (token: Parameters<typeof readJsonPredicateScalar>[0]) => {
-      const value = readJsonPredicateScalar(token);
-      return typeof value === "string" ? value : null;
-    };
-    return Object.assign(row, {
-      message_role: text(message.first.get("role")),
+    ]).first;
+    return {
+      event_id: row.event_id,
+      seq: row.seq,
+      parent_id: row.parent_id,
+      message_position: row.message_position,
+      generation: row.generation,
+      message_role: jsonScannedValue(fields.get("role")),
       context_free_command:
-        readJsonPredicateScalar(message.first.get("excludeFromContext")) === true &&
-        readJsonPredicateScalar(flags.first.get("contextFreeCommand")) === true
+        readJsonPredicateScalar(fields.get("excludeFromContext")) === true &&
+        readJsonPredicateScalar(command) === true
           ? 1
           : 0,
-      provenance_kind: text(source.first.get("kind")),
-      provenance_source_channel: text(source.first.get("sourceChannel")),
-    });
+      provenance_kind: jsonScannedValue(source.get("kind")),
+      provenance_source_channel: jsonScannedValue(source.get("sourceChannel")),
+    };
   });
-  return preparedAssistantMessagesPreserveTurn(facts, admittedUserId, (row) => {
+  return preparedAssistantMessagesPreserveTurn(newerFacts, admittedUserId, (row) => {
     const answer = questionAnswers.find((input) => input.entryId === row.event_id);
     return (
       answer !== undefined &&
@@ -345,13 +342,7 @@ export function readTranscriptVisibleTailEntryIdInTransaction(
   if (!sessionTranscriptIndexNeedsReconcile(database.db, sessionId)) {
     const tail = executeSqliteQueryTakeFirstSync(
       database.db,
-      db
-        .selectFrom("session_transcript_active_events as active")
-        .innerJoin("transcript_events as event", (join) =>
-          join
-            .onRef("event.session_id", "=", "active.session_id")
-            .onRef("event.seq", "=", "active.event_seq"),
-        )
+      selectActiveTranscriptEventRows(database)
         .select(
           projectTranscriptNavigationSql(
             database.db,

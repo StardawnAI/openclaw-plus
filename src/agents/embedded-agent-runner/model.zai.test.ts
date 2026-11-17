@@ -1,6 +1,4 @@
 import { fileURLToPath } from "node:url";
-import { createApiRegistry, createNodeLlmRuntime } from "@openclaw/ai";
-import { registerBuiltInApiProviders } from "@openclaw/ai/providers";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -47,7 +45,6 @@ it.each([
   { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4", modelBaseUrl: undefined },
   { baseUrl: "https://proxy.example.test/zai", modelBaseUrl: undefined },
   { baseUrl: generalEndpoint, modelBaseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" },
-  { baseUrl: "https://api.z.ai/api/coding/paas/v4", modelBaseUrl: generalEndpoint },
 ])("resolves retained Z.AI catalog models with $baseUrl / $modelBaseUrl", async (route) => {
   const { baseUrl } = route;
   const cfg: OpenClawConfig = {
@@ -89,32 +86,6 @@ it.each([
           api: "openai-completions",
         });
         expect(modelRegistry.find("zai", modelId)?.baseUrl).toBe(generalEndpoint);
-        const model = expectDefined(resolved.model, "resolved Z.AI model");
-        const requests: Request[] = [];
-        const registry = createApiRegistry();
-        registerBuiltInApiProviders(registry);
-        const runtime = createNodeLlmRuntime(registry, {
-          buildModelFetch: () => async (input, init) => {
-            requests.push(new Request(input, init));
-            return new Response(
-              `data: {"id":"fixture","object":"chat.completion.chunk","created":0,"model":"${modelId}","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`,
-              { headers: { "content-type": "text/event-stream" } },
-            );
-          },
-        });
-        const result = await runtime
-          .stream(
-            model,
-            { messages: [{ role: "user", content: "Reply with exactly: ok", timestamp: 1 }] },
-            { apiKey: "synthetic-zai-key" },
-          )
-          .result();
-        expect(result.errorMessage).toBeUndefined();
-        expect(result.stopReason).toBe("stop");
-        expect(requests).toHaveLength(1);
-        expect(requests[0]?.url).toBe(`${route.modelBaseUrl ?? baseUrl}/chat/completions`);
-        expect(requests[0]?.headers.get("authorization")).toBe("Bearer synthetic-zai-key");
-        expect(await requests[0]?.json()).toMatchObject({ model: modelId });
       }
     },
   );

@@ -10,7 +10,6 @@ import {
 } from "../config/runtime-write-application.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
-import { redactToolDetail } from "../logging/redact.js";
 import { captureGatewayRootWorkAdmissionContinuationScope } from "../process/gateway-work-admission.js";
 import { SetupInferenceOwnerDriftError } from "./setup-inference-core.js";
 import type { SetupCredentialActivationReceipt } from "./setup-inference-credential-access.js";
@@ -70,7 +69,7 @@ export function restoreSetupInferenceConfig(
   return { config: applyMergePatch(current, reverse) as OpenClawConfig, written: true };
 }
 
-/** Captures only this file writer's effects, before its guarded commit can start. */
+/** Captures only this file writer's effects for conditional recovery. */
 export function captureSetupInferenceFileUndo(
   snapshot: ConfigFileSnapshot,
   candidate: OpenClawConfig,
@@ -111,7 +110,10 @@ export async function commitSetupInferenceActivation(params: {
   requireApplied?: true;
   configTarget: SetupInferenceConfigTarget;
   config: OpenClawConfig;
-  activate: (assertCurrent: () => void) => Promise<SetupCredentialActivationReceipt | undefined>;
+  activate: (
+    assertCurrent: () => void,
+    config: OpenClawConfig,
+  ) => Promise<SetupCredentialActivationReceipt | undefined>;
   assertCurrent: () => void;
   deferCompletion?: (complete: () => Promise<boolean>) => void;
 }): Promise<OpenClawConfig> {
@@ -121,12 +123,13 @@ export async function commitSetupInferenceActivation(params: {
   let assertApplicationCurrent = params.assertCurrent;
   let activated = false;
   let configCommitted = false;
+  let config = params.config;
   const activate = async (assertCurrent: () => void) => {
     assertApplicationCurrent = assertCurrent;
     params.assertCurrent();
     assertCurrent();
     if (!activated) {
-      credential = await params.activate(assertCurrent);
+      credential = await params.activate(assertCurrent, config);
       activated = true;
     }
   };
@@ -157,14 +160,9 @@ export async function commitSetupInferenceActivation(params: {
         : { config: (await params.configTarget.read()).config, written: false };
     await rollbackCredential();
     if (restoredApplication && restored.written) {
-      const status = restoredApplication.claimed ? await restoredApplication.result : "unclaimed";
-      if (status !== "applied") {
-        const reason =
-          typeof status === "object"
-            ? ` ${redactToolDetail(status.reason)} ${redactToolDetail(status.appliesWhen)}`
-            : "";
+      if (!restoredApplication.claimed || (await restoredApplication.result) !== "applied") {
         throw new Error(
-          `The previous connection was restored on disk, but the Gateway could not apply it.${reason} Restart the Gateway before chatting.`,
+          "The previous connection was restored on disk, but the Gateway could not apply it. Restart the Gateway before chatting.",
         );
       }
     }
@@ -181,7 +179,6 @@ export async function commitSetupInferenceActivation(params: {
     }
     throw error;
   };
-  let config: OpenClawConfig;
   try {
     config = await params.configTarget.write(params.config, {
       captureUndo: (undo) => {
@@ -228,7 +225,7 @@ export async function commitSetupInferenceActivation(params: {
         }
         if (status !== "applied") {
           throw new Error(
-            `The Gateway did not complete activation (${typeof status === "object" ? `deferred: ${redactToolDetail(status.reason)} ${redactToolDetail(status.appliesWhen)}` : status}). Resolve the reported problem, then retry the saved sign-in.`,
+            `The Gateway did not complete activation (${status}). Resolve the reported problem, then retry the saved sign-in.`,
           );
         }
       } else {

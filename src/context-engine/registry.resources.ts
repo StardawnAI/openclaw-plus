@@ -1,7 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { sanitizeForLog } from "../../packages/terminal-core/src/ansi.js";
 import { getPluginValueInstance } from "../plugins/plugin-instance-scope.js";
-import { PluginInvocationScope } from "../plugins/plugin-invocation-scope.js";
+import {
+  collectRegistryInvocationInstances,
+  PluginInvocationScope,
+} from "../plugins/plugin-invocation-scope.js";
 import type { ContextEngineRegistration } from "../plugins/registry-contribution-types.js";
 import {
   getPluginRegistryInspectionResources,
@@ -10,6 +13,7 @@ import {
 import type { PluginRegistry } from "../plugins/registry-types.js";
 import {
   AsyncWorkScope,
+  AsyncWorkScopeClosedError,
   captureAsyncWorkTracker,
   getAsyncWorkSignal,
 } from "../shared/async-work-scope.js";
@@ -35,42 +39,63 @@ export function recordContextEngineRegistrationSource(
 
 export class ContextEngineFactoryResources {
   private cleanupInvocations?: ReturnType<PluginInvocationScope["beginCleanup"]>;
-  readonly work = new AsyncWorkScope();
-  readonly context = this.work.run(() => AsyncLocalStorage.snapshot());
-  readonly cleanupWork = new AsyncWorkScope();
-  readonly cleanupContext = this.cleanupWork.run(() => AsyncLocalStorage.snapshot());
-  private readonly parentSignal = getAsyncWorkSignal();
+  private execution?: {
+    work: AsyncWorkScope;
+    context: ReturnType<typeof AsyncLocalStorage.snapshot>;
+    cleanupWork: AsyncWorkScope;
+    cleanupContext: ReturnType<typeof AsyncLocalStorage.snapshot>;
+    parentSignal: AbortSignal | undefined;
+  };
   private readonly abort = () => {
-    this.context(() => this.work.beginClose(this.parentSignal?.reason));
-    this.cleanupContext(() => this.cleanupWork.beginClose(this.parentSignal?.reason));
+    const { work, context, cleanupWork, cleanupContext, parentSignal } = this.active;
+    context(() => work.beginClose(parentSignal?.reason));
+    cleanupContext(() => cleanupWork.beginClose(parentSignal?.reason));
   };
 
   constructor(
     private readonly claims: readonly { release: () => Promise<void> }[],
     private readonly invocations?: PluginInvocationScope,
   ) {
-    this.parentSignal?.addEventListener("abort", this.abort, { once: true });
-    if (this.parentSignal?.aborted) {
+    const work = new AsyncWorkScope();
+    const context = work.run(() => AsyncLocalStorage.snapshot());
+    const cleanupWork = new AsyncWorkScope();
+    const cleanupContext = cleanupWork.run(() => AsyncLocalStorage.snapshot());
+    const parentSignal = getAsyncWorkSignal();
+    this.execution = { work, context, cleanupWork, cleanupContext, parentSignal };
+    parentSignal?.addEventListener("abort", this.abort, { once: true });
+    if (parentSignal?.aborted) {
       this.abort();
     }
   }
 
+  get active() {
+    if (!this.execution) {
+      throw new AsyncWorkScopeClosedError();
+    }
+    return this.execution;
+  }
+
   run<T>(operation: () => T | Promise<T>): Promise<T> {
-    return this.work.track(() =>
-      this.context(() => (this.invocations ? this.invocations.run(operation) : operation())),
+    if (!this.execution) {
+      return Promise.reject(new AsyncWorkScopeClosedError());
+    }
+    const { work, context } = this.execution;
+    return work.track(() =>
+      context(() => (this.invocations ? this.invocations.run(operation) : operation())),
     );
   }
 
   runCleanup<T>(operation: () => T): T {
+    const { work, context, cleanupWork, cleanupContext } = this.active;
     this.beginCleanup();
     try {
-      return this.cleanupWork.run(() =>
-        this.cleanupContext(() =>
+      return cleanupWork.run(() =>
+        cleanupContext(() =>
           this.cleanupInvocations ? this.cleanupInvocations.scope.run(operation) : operation(),
         ),
       );
     } finally {
-      this.context(() => this.work.beginClose());
+      context(() => work.beginClose());
     }
   }
 
@@ -83,7 +108,7 @@ export class ContextEngineFactoryResources {
   }
 
   async release(): Promise<void> {
-    this.parentSignal?.removeEventListener("abort", this.abort);
+    this.execution?.parentSignal?.removeEventListener("abort", this.abort);
     this.invocations?.release();
     let failure: { error: unknown } | undefined;
     try {
@@ -99,6 +124,8 @@ export class ContextEngineFactoryResources {
         failure ??= { error };
       }
     }
+    // Scopes' abort reasons can retain snapshot frames too; release the whole drained execution.
+    this.execution = undefined;
     if (failure) {
       throw failure.error;
     }
@@ -120,18 +147,17 @@ function retainContextEngineFactorySource(
     if (source && !primary?.coversSource(source)) {
       claims.push(source.retain());
     }
-    // The selected factory may be borrowed from another registry (including the fallback).
-    // Physical source claims above remain broad enough for cleanup, but work is exact.
-    const instance = registration && getPluginValueInstance(registration.factory);
-    const instances = instance ? [instance] : [];
-    if (claims.length === 0 && instances.length === 0) {
+    const instances = collectRegistryInvocationInstances(registry);
+    if (claims.length === 0 && instances.size === 0) {
       return undefined;
     }
     const invocations = primary
-      ? primary.createInvocationScope(registry, instances)
+      ? primary.createInvocationScope(registry)
       : new PluginInvocationScope(registry, instances, {
           // A managed factory owns a logical consumer even on a caller-owned root view.
-          retained: instance !== undefined,
+          retained:
+            registration !== undefined &&
+            getPluginValueInstance(registration.factory) !== undefined,
         });
     return new ContextEngineFactoryResources(claims, invocations);
   } catch (error) {
@@ -156,17 +182,19 @@ export async function disposeContextEngineSources(
     source.beginCleanup();
   }
   // Start instance cleanup before retiring the factory lifetime that it may need to stop.
-  const cleanup = sources[0]!.cleanupWork.track(() => sources[0]!.runCleanup(dispose));
+  const cleanup = sources[0]!.active.cleanupWork.track(() => sources[0]!.runCleanup(dispose));
   for (const source of sources) {
-    source.context(() => source.work.beginClose());
+    const { work, context } = source.active;
+    context(() => work.beginClose());
   }
   const [engineResult] = await Promise.allSettled([cleanup]);
-  const scopes = sources.flatMap((source) => [source.work, source.cleanupWork]);
+  const scopes = sources.flatMap(({ active }) => [active.work, active.cleanupWork]);
   await AsyncWorkScope.runWhenAllIdle(
     () => scopes,
     () => {
       for (const source of sources) {
-        source.cleanupContext(() => source.cleanupWork.beginClose());
+        const { cleanupWork, cleanupContext } = source.active;
+        cleanupContext(() => cleanupWork.beginClose());
       }
     },
   );
@@ -174,9 +202,9 @@ export async function disposeContextEngineSources(
     () => scopes,
     () =>
       Promise.all(
-        sources.flatMap((source) => [
-          source.context(() => source.work.drain()),
-          source.cleanupContext(() => source.cleanupWork.drain()),
+        sources.flatMap(({ active: { work, context, cleanupWork, cleanupContext } }) => [
+          context(() => work.drain()),
+          cleanupContext(() => cleanupWork.drain()),
         ]),
       ),
   );

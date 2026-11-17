@@ -7,6 +7,7 @@ import { resolveModelAgentRuntimeMetadata } from "../agents/agent-runtime-metada
 import {
   listAgentEntries,
   listAgentIds,
+  resolveAgentConfig,
   resolveAgentModelFallbacksOverride,
   resolveAgentWorkspaceDir,
 } from "../agents/agent-scope.js";
@@ -15,6 +16,7 @@ import { isConversationToolAllowed } from "../agents/conversation-tool-policy-pi
 import { resolveRunEntryCliRuntime } from "../agents/embedded-agent-runner/run-entry-runtime.js";
 import { resolveExecDefaults } from "../agents/exec-defaults.js";
 import { hasUnrestrictedGatewayExecution } from "../agents/execution-authority.js";
+import { isGatewayToolAllowedWithoutAction } from "../agents/gateway-tool-policy.js";
 import { resolveAgentHarnessSelectionDecision } from "../agents/harness/selection-decision.js";
 import { resolveAgentAvatarUrlFromSource } from "../agents/identity-avatar-file.js";
 import { splitTrailingAuthProfile } from "../agents/model-ref-profile.js";
@@ -23,7 +25,7 @@ import {
   resolveDefaultModelForAgent,
   resolveModelRefFromString,
 } from "../agents/model-selection.js";
-import { resolveSandboxConfigForAgent } from "../agents/sandbox/config.js";
+import { resolveSandboxRuntimeSettings } from "../agents/sandbox/config.js";
 import { SESSION_PERMISSION_BY_EXEC_MODE } from "../agents/session-permission-exec-mode.js";
 import { resolveEffectiveToolFsWorkspaceOnly } from "../agents/tool-fs-policy.js";
 import { readUtilityModelSetting } from "../agents/utility-model-setting.js";
@@ -41,7 +43,8 @@ import type {
   SessionEntryReadScope,
 } from "../config/sessions/session-accessor.types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveExecPolicyForMode, type ExecApprovalsFile } from "../infra/exec-approvals-core.js";
+import type { ExecApprovalsFile } from "../infra/exec-approvals-core.js";
+import { resolveExecPolicyForMode } from "../infra/exec-approvals-core.js";
 import { loadExecApprovalsReadOnlyAsync } from "../infra/exec-approvals-store.js";
 import {
   isIncognitoSessionKey,
@@ -124,7 +127,7 @@ export function prepareDeletedAgentSessionCheck(params: {
   params.assertCurrent?.();
   return readAcpSessionMetaForEntries({
     cfg: params.cfg,
-    entries: [...keys].map((sessionKey) => ({
+    entries: Array.from(keys, (sessionKey) => ({
       sessionKey,
       agentId:
         parseAgentSessionKey(sessionKey)?.agentId ??
@@ -141,7 +144,6 @@ export function prepareDeletedAgentSessionCheck(params: {
 export function loadIncognitoGatewaySessionEntryReadOnly(
   sessionKey: string,
   opts?: Pick<SessionEntryReadScope, "agentId" | "clone" | "projection" | "env"> & {
-    includeStoreChildEntries?: boolean;
     targetDiscoveryCache?: GatewaySessionStoreDiscoveryCache;
   },
   cfg: OpenClawConfig = getRuntimeConfig(),
@@ -158,7 +160,6 @@ export function loadIncognitoGatewaySessionEntryReadOnly(
     projection: opts?.projection,
     env: opts?.env,
     targetDiscoveryCache: opts?.targetDiscoveryCache,
-    includeStoreChildEntries: opts?.includeStoreChildEntries,
     ...(opts?.clone === false ? { clone: false } : {}),
     ...(opts?.agentId ? { agentId: opts.agentId } : {}),
   });
@@ -249,7 +250,6 @@ export async function withQualifiedGatewaySessionEntry<T>(params: {
   cfg: OpenClawConfig;
   target: QualifiedSessionEntryAccessTarget;
   logicalStorePath: string;
-  env?: NodeJS.ProcessEnv;
   includeMembership: boolean;
   transcript?: import("../config/sessions/session-entry-read.types.js").SessionExactEntriesWorkerRequest["transcript"];
   includeLifecycle?: boolean;
@@ -421,9 +421,11 @@ function resolveAgentDefaultPermissionLabel(params: {
     modelId: model.model,
   });
   return hasUnrestrictedGatewayExecution({
-    execAuthority: isConversationToolAllowed(capabilityProfile, "exec")
-      ? "gateway-host"
-      : undefined,
+    execAuthority:
+      isConversationToolAllowed(capabilityProfile, "exec") &&
+      isGatewayToolAllowedWithoutAction("exec", cfg)
+        ? "gateway-host"
+        : undefined,
     execPolicy: policy,
     workspaceOnly: resolveEffectiveToolFsWorkspaceOnly({ cfg, agentId }),
   })
@@ -437,6 +439,8 @@ export async function listAgentsForGateway(
     modelCatalogByAgentId?: SessionListModelCatalog;
     includeSystem?: boolean;
     httpAvatarBasePath?: string;
+    /** Limit enrichment while retaining the Gateway's canonical routing metadata. */
+    agentIds?: ReadonlySet<string>;
   },
 ): Promise<{
   defaultId: string;
@@ -451,12 +455,21 @@ export async function listAgentsForGateway(
     listAgentProvenance(),
     loadExecApprovalsReadOnlyAsync(),
   ]);
+  const roster = basic.agents.filter(
+    (entry) =>
+      (options?.includeSystem || entry.kind !== "system") &&
+      (!options?.agentIds || options.agentIds.has(entry.id)),
+  );
+  const rosterIds = new Set(roster.map((entry) => entry.id));
   const identityById = new Map<string, GatewayAgentRow["identity"]>();
   for (const entry of listAgentEntries(cfg)) {
     if (!entry?.id) {
       continue;
     }
     const agentId = normalizeAgentId(entry.id);
+    if (!rosterIds.has(agentId)) {
+      continue;
+    }
     const avatar = normalizeOptionalString(entry.identity?.avatar);
     const httpAvatar =
       avatar && options?.httpAvatarBasePath !== undefined
@@ -480,9 +493,6 @@ export async function listAgentsForGateway(
       : undefined;
     identityById.set(agentId, identity);
   }
-  const roster = options?.includeSystem
-    ? basic.agents
-    : basic.agents.filter((entry) => entry.kind !== "system");
   const provenanceById = new Map(
     provenanceRecords.map((record) => [record.agentId, record] as const),
   );
@@ -492,7 +502,10 @@ export async function listAgentsForGateway(
     // This label must never overstate permissiveness. When sandbox policy can vary
     // by session, the effective policy is unknowable at agent scope: omit the label.
     const defaultPermissionMode =
-      resolveSandboxConfigForAgent(cfg, id).mode === "off"
+      resolveSandboxRuntimeSettings(
+        cfg.agents?.defaults?.sandbox,
+        resolveAgentConfig(cfg, id)?.sandbox,
+      ).mode === "off"
         ? resolveAgentDefaultPermissionLabel({
             cfg,
             agentId: id,

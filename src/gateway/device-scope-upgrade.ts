@@ -41,19 +41,18 @@ export class ScopeUpgradeCoordinator {
   private readonly work = new AsyncWorkScope();
   private readonly scheduler: GatewaySchedulerScope;
   private lifetimeBound = false;
-  private closePromise?: Promise<void>;
 
   constructor(scheduler: GatewayScheduler) {
     this.scheduler = scheduler.scope();
-    // Observer reads end at the scheduler fence; received execution can retain
-    // its authority until restart recovery has been recorded.
+    // Scheduler retirement is a fallback; the Gateway close prelude fences
+    // observers earlier while received execution retains recovery authority.
     if (this.scheduler.signal.aborted) {
-      this.beginClose();
+      void this.close();
     } else {
       this.scheduler.signal.addEventListener(
         "abort",
         () => {
-          this.beginClose();
+          void this.close();
         },
         { once: true },
       );
@@ -72,7 +71,7 @@ export class ScopeUpgradeCoordinator {
       return;
     }
     if (gatewaySignal.aborted) {
-      this.beginClose();
+      void this.close();
       return;
     }
     const signal = AbortSignal.any([gatewaySignal, this.work.signal]);
@@ -92,21 +91,14 @@ export class ScopeUpgradeCoordinator {
     );
   }
 
-  beginClose(): void {
-    if (this.work.isClosing) {
-      return;
-    }
+  async close(): Promise<void> {
     this.work.beginClose();
     this.scheduler.beginClose();
     for (const entry of this.entries.values()) {
       entry.wake.resolve();
     }
     this.entries.clear();
-  }
-
-  close(): Promise<void> {
-    this.beginClose();
-    return (this.closePromise ??= this.work.drain());
+    await this.work.drain();
   }
 
   register(params: {

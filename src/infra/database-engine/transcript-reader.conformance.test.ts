@@ -1,19 +1,21 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { getEnvironmentData } from "node:worker_threads";
-import type { SessionTreeEntry } from "@openclaw/agent-core";
-import { sql } from "kysely";
+import { sql, type Compilable } from "kysely";
 import { expect, it } from "vitest";
 import {
   LEGACY_MISSING_TOOL_RESULT_TEXT,
   SYNTHETIC_MISSING_TOOL_RESULT_DETAIL_KEY,
 } from "../../../packages/agent-core/src/harness/session/tool-result-pairing.js";
-import { projectSessionModelContextEntry } from "../../config/sessions/session-model-context-entry.js";
-import { projectSessionModelContextNavigation } from "../../config/sessions/session-model-context-navigation.js";
+import {
+  legacyModelContextEventSql,
+  legacyModelNavigationSql,
+} from "../../config/sessions/session-model-context-legacy.test-support.js";
 import {
   projectModelContextEventSql,
   projectModelContextNavigationSql,
   projectResetBoundaryNavigationSql,
+  projectPostgresModelContextRowsSql,
 } from "../../config/sessions/session-model-context-projection.js";
 import {
   copyRetainedTranscriptPayload,
@@ -26,21 +28,14 @@ import { openNodeSqliteDatabase } from "../node-sqlite.js";
 import { PostgresSyncConnection } from "../postgres-sync/connection.js";
 import { admitSqliteSchema } from "../sqlite-schema-facts.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
-import { jsonNativeFieldsValid } from "./json-values.js";
-
-function projectCanonicalContext(raw: string, navigation: boolean, omitCheckpoint = false): string {
-  // SAFETY: The input is a canonical SessionTreeEntry serialized by this fixture or the transcript reader.
-  const entry = JSON.parse(raw) as SessionTreeEntry;
-  return JSON.stringify(
-    navigation
-      ? projectSessionModelContextNavigation(entry)
-      : projectSessionModelContextEntry(entry, { entry, omitCheckpoint }),
-  );
-}
 
 const configured = getEnvironmentData("openclaw.test.workboard.connection");
 const connection = typeof configured === "string" ? configured : undefined;
 const messageEvent = (message: Record<string, unknown>) => ({ type: "message", message });
+const readRows = <Row>(db: DatabaseSync, query: Compilable<Row>) =>
+  executeSqliteQuerySync(db, query).rows;
+const decodeViews = (views: Record<string, string>) =>
+  Object.fromEntries(Object.entries(views).map(([key, value]) => [key, JSON.parse(value)]));
 const fixtures = [
   messageEvent({
     role: "user",
@@ -84,26 +79,20 @@ const fixtures = [
   { type: "custom", id: "retained", data: { opaque: "λ🦞", nested: [true, null] } },
   { type: "compaction", summary: "private summary", firstKeptEntryId: "kept" },
   { type: "branch_summary", summary: "private branch summary", fromId: "from" },
+  { type: "reset", firstKeptEntryId: "kept", reason: "reset" },
+  { type: "unknown", unknown: { content: "preserved" }, timestamp: null },
+  messageEvent({ role: null, content: null, providerReplay: null }),
+  messageEvent({ content: [{ type: "toolCall" }], providerReplay: {} }),
+  messageEvent({ role: "unknown", content: [null, 17, "text", { type: "unknown" }] }),
 ].map((event, index) => Object.assign({ id: `entry-${index}`, parentId: "old-parent" }, event));
-const exceptional = [
-  messageEvent({
-    role: "toolResult",
-    toolCallId: "deep",
-    toolName: "probe",
-    content: [{ type: "text", text: "complete" }],
-    details: JSON.parse("[".repeat(1100) + "1" + "]".repeat(1100)),
-    __openclaw: { upstreamUserText: "private" },
-  }),
-  messageEvent({
-    role: "user",
-    content: "before" + String.fromCharCode(0, 0xd800, 0xdc00, 0xdc00) + "after",
-  }),
-  messageEvent({
-    role: "assistant",
-    content: [{ type: "text", text: String.fromCharCode(0xd800) }],
-    providerReplay: { type: "fixture" },
-  }),
-].map((event, index) => Object.assign({ id: `exceptional-${index}`, parentId: null }, event));
+const exactJsonFixtures = [
+  '{"type":"reset","timestamp":1.00}',
+  '{"type":"reset","timestamp":1e-7}',
+  '{"type":"reset","reason":"\\uD83E\\uDD9E \\u03bb \\n \\\""}',
+  '{"type":"message","message":{"role":"user","content":"日本語 🦞","__openclaw":{"upstreamUserText":"private","runId":"kept"}}}',
+  '{"type":"message","message":{"role":"toolResult","details":{"openclawSyntheticMissingToolResult":1.00},"content":[],"providerReplay":{"type":"checkpoint","number":1e20}}}',
+  '{"type":"message","message":{"role":"assistant","content":[{"type":"toolCall","id":null,"name":{"unknown":1.00}}],"unknown":null}}',
+];
 const passthrough = ["{ malformed", "null", "true", "17", '"text"', "[]"];
 const schema = `CREATE TABLE transcript_events (
   session_id TEXT NOT NULL, seq INTEGER PRIMARY KEY, event_json TEXT, event_zstd BYTEA,
@@ -125,7 +114,11 @@ it.skipIf(typeof connection !== "string")(
       const postgres: DatabaseSync = remote;
       const databases = [sqlite, postgres];
       const table = (db: DatabaseSync) =>
-        getNodeSqliteKysely<DB>(db).selectFrom("transcript_events");
+        getNodeSqliteKysely<DB>(db).selectFrom("transcript_events").orderBy("seq");
+      const setEnvelope = (navigation: string | null, eventJson: string) =>
+        remote
+          .prepare("UPDATE transcript_events SET navigation_json = ?, event_json = ? WHERE seq = 0")
+          .run(navigation, eventJson);
       try {
         remote.exec(`CREATE SCHEMA "${namespace}"`);
         for (const db of databases) {
@@ -136,18 +129,67 @@ it.skipIf(typeof connection !== "string")(
           const insert = createTranscriptEventInserter(db, "conformance");
           [
             ...fixtures.map((event) => JSON.stringify(event)),
-            ...exceptional.map((event) => JSON.stringify(event)),
             ...passthrough,
+            ...exactJsonFixtures,
           ].forEach((eventJson, seq) => insert({ seq, eventJson, createdAt: 1 }));
         }
         const event =
           /* kysely-allow-raw: The fixture table owns this fixed JSON column. */ sql.ref<string>(
             "event_json",
           );
+        const validRows = table(postgres).where((eb) =>
+          eb.or([
+            eb("seq", "<", fixtures.length),
+            eb("seq", ">=", fixtures.length + passthrough.length),
+          ]),
+        );
+        const legacy = readRows(
+          postgres,
+          validRows.select([
+            "seq",
+            legacyModelNavigationSql(
+              postgres,
+              event,
+              /* kysely-allow-raw: The original query extracted its discriminant from JSONB. */ sql`${event}::jsonb ->> 'type'`,
+            ).as("navigation_json"),
+            /* kysely-allow-raw: Frozen legacy model-byte expression is the independent oracle. */ sql<number>`octet_length(${legacyModelContextEventSql(postgres, event, sql.lit(0))})`.as(
+              "model_bytes",
+            ),
+            /* kysely-allow-raw: Frozen legacy retained-byte expression is the independent oracle. */ sql<number>`octet_length(${legacyModelContextEventSql(postgres, event, sql.lit(1))})`.as(
+              "retained_bytes",
+            ),
+          ]),
+        );
+        const native = () =>
+          readRows(
+            postgres,
+            getNodeSqliteKysely(postgres)
+              .selectFrom(
+                projectPostgresModelContextRowsSql(
+                  validRows.select(["seq", "event_json", "navigation_json"]),
+                ).as("context"),
+              )
+              .selectAll(),
+          );
+        expect(native()).toEqual(legacy);
+        // Existing stored envelopes bypass canonical JSON parsing even when its text is unavailable.
+        setEnvelope(
+          JSON.stringify({
+            model: JSON.parse(legacy[0]!.navigation_json),
+            modelBytes: legacy[0]!.model_bytes,
+            modelWithoutCheckpointBytes: legacy[0]!.retained_bytes,
+          }),
+          "{ unavailable",
+        );
+        try {
+          expect(native()).toEqual(legacy);
+        } finally {
+          setEnvelope(null, JSON.stringify(fixtures[0]));
+        }
         for (const omit of [0, 1]) {
           for (const notice of [false, true]) {
             const projections = databases.map((db) =>
-              executeSqliteQuerySync(
+              readRows(
                 db,
                 table(db)
                   .select([
@@ -162,16 +204,8 @@ it.skipIf(typeof connection !== "string")(
                     projectResetBoundaryNavigationSql(db, event).as("reset"),
                     projectTranscriptRetainedDataSql(db, event, ["retained"]).as("retained"),
                   ])
-                  .where("seq", "<", fixtures.length)
-                  .orderBy("seq"),
-              ).rows.map(({ seq, ...views }) =>
-                Object.assign(
-                  { seq },
-                  Object.fromEntries(
-                    Object.entries(views).map(([key, value]) => [key, JSON.parse(value)]),
-                  ),
-                ),
-              ),
+                  .where("seq", "<", fixtures.length),
+              ).map(({ seq, ...views }) => Object.assign({ seq }, decodeViews(views))),
             );
             expect(projections[0]).toHaveLength(fixtures.length);
             expect(projections[1], `omit=${omit}, notice=${String(notice)}`).toEqual(
@@ -180,57 +214,16 @@ it.skipIf(typeof connection !== "string")(
           }
         }
         for (const db of databases) {
-          const canonical = exceptional.map((entry) => JSON.stringify(entry));
-          for (const omit of [0, 1]) {
-            const rows = executeSqliteQuerySync(
-              db,
-              table(db)
-                .select([
-                  "event_json",
-                  jsonNativeFieldsValid(db, event).as("native"),
-                  projectModelContextEventSql(db, event, sql.lit(omit)).as("model"),
-                  projectModelContextNavigationSql(db, event).as("navigation"),
-                  projectResetBoundaryNavigationSql(db, event).as("reset"),
-                  projectTranscriptRetainedDataSql(db, event, ["retained"]).as("retained"),
-                ])
-                .where("seq", ">=", fixtures.length)
-                .where("seq", "<", fixtures.length + exceptional.length)
-                .orderBy("seq"),
-            ).rows;
-            expect(rows.map((row) => row.event_json)).toEqual(canonical);
-            for (const [index, row] of rows.entries()) {
-              // PostgreSQL returns exceptional canonical text to the existing reader's JS decoder.
-              const model =
-                db === postgres && !row.native
-                  ? projectCanonicalContext(row.model, false, omit === 1)
-                  : row.model;
-              const navigation =
-                db === postgres && !row.native
-                  ? projectCanonicalContext(row.navigation, true)
-                  : row.navigation;
-              expect(JSON.parse(model)).toEqual(
-                JSON.parse(projectCanonicalContext(canonical[index]!, false, omit === 1)),
-              );
-              expect(JSON.parse(navigation)).toEqual(
-                JSON.parse(projectCanonicalContext(canonical[index]!, true)),
-              );
-              expect(row.retained).toBe(canonical[index]);
-              if (!row.native) {
-                expect(row.reset).toBe(canonical[index]);
-              }
-            }
-          }
-        }
-        for (const db of databases) {
-          const rows = executeSqliteQuerySync(
+          const rows = readRows(
             db,
             table(db)
               .select(projectResetBoundaryNavigationSql(db, event).as("reset"))
-              .where("seq", ">=", fixtures.length + exceptional.length)
-              .orderBy("seq"),
-          ).rows;
+              .where("seq", ">=", fixtures.length)
+              .where("seq", "<", fixtures.length + passthrough.length),
+          );
           expect(rows.map((row) => row.reset)).toEqual(passthrough);
         }
+        const source = fixtures.findIndex((row) => row.id === "retained");
         const unused = (): never => {
           throw new Error("Copy must not access unrelated WAL maintenance");
         };
@@ -240,34 +233,28 @@ it.skipIf(typeof connection !== "string")(
           stop: unused,
           close: unused,
         };
-        for (const source of [
-          fixtures.findIndex((row) => row.id === "retained"),
-          fixtures.length,
-          fixtures.length + 1,
-        ]) {
-          for (const parentId of [null, "repaired-parent"]) {
-            const copies = databases.map((db) => {
-              const destination = 1000 + source * 2 + (parentId === null ? 0 : 1);
-              const owner = { db, agentId: "conformance", path: ":memory:", walMaintenance };
-              copyRetainedTranscriptPayload(owner, "conformance", source, destination, parentId);
-              const row = executeSqliteQuerySync(
-                db,
-                table(db)
-                  .select(["event_json", "event_utf8_bytes"])
-                  .select((eb) =>
-                    eb.fn<number>("octet_length", [eb.ref("event_json")]).as("actual_bytes"),
-                  )
-                  .where("seq", "=", destination),
-              ).rows[0]!;
-              if (db === postgres) {
-                expect(row.event_utf8_bytes).toBe(row.actual_bytes);
-                expect(row.event_utf8_bytes).toBe(Buffer.byteLength(row.event_json!, "utf8"));
-              }
-              return JSON.parse(row.event_json!);
-            });
-            expect(copies[1]).toEqual(copies[0]);
-            expect(copies[1]).toEqual({ ...[...fixtures, ...exceptional][source], parentId });
-          }
+        for (const parentId of [null, "repaired-parent"]) {
+          const copies = databases.map((db) => {
+            const destination = parentId === null ? 1000 : 1001;
+            const owner = { db, agentId: "conformance", path: ":memory:", walMaintenance };
+            copyRetainedTranscriptPayload(owner, "conformance", source, destination, parentId);
+            const row = readRows(
+              db,
+              table(db)
+                .select(["event_json", "event_utf8_bytes"])
+                .select((eb) =>
+                  eb.fn<number>("octet_length", [eb.ref("event_json")]).as("actual_bytes"),
+                )
+                .where("seq", "=", destination),
+            )[0]!;
+            if (db === postgres) {
+              expect(row.event_utf8_bytes).toBe(row.actual_bytes);
+              expect(row.event_utf8_bytes).toBe(Buffer.byteLength(row.event_json!, "utf8"));
+            }
+            return JSON.parse(row.event_json!);
+          });
+          expect(copies[1]).toEqual(copies[0]);
+          expect(copies[1]).toEqual({ ...fixtures[source], parentId });
         }
       } finally {
         try {

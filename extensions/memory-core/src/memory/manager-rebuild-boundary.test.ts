@@ -20,7 +20,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "./test-runtime-mocks.js";
 import { runInMemoryTestBackgroundContext } from "./background-context.test-support.js";
 import { MemoryIndexDatabase } from "./manager-database-context.js";
-import type { ReindexHarness } from "./manager-reindex-harness.test-support.js";
 import type { MemoryIndexManager } from "./manager.js";
 import { isolateMemoryManagerTestConfig } from "./test-config-helpers.js";
 
@@ -115,7 +114,7 @@ describe("large memory rebuild boundary", () => {
   it.each([true, false])(
     "rebuilds multipage vectors through real workers (cache=%s)",
     async (cacheEnabled) => {
-      // Separate long lines yield >256 unique chunks, crossing the 8 MiB/4096-dimension read page.
+      // Separate long lines yield >256 unique chunks, crossing multiple bounded read pages.
       await fs.writeFile(
         path.join(root, "memory", "large.md"),
         Array.from(
@@ -128,7 +127,7 @@ describe("large memory rebuild boundary", () => {
         ).join("\n"),
       );
       const m = await open(cacheEnabled);
-      const harness = m as unknown as ReindexHarness;
+      const harness = m as unknown as { db: DatabaseSync };
       const pages: number[] = [];
       const reads = vi.spyOn(MemoryIndexDatabase.prototype, "read");
       const before = process.memoryUsage();
@@ -161,13 +160,10 @@ describe("large memory rebuild boundary", () => {
       }
       expect(largestRead).toBeLessThan(12 * 1024 * 1024);
       expect(fingerprint(harness.db)).toEqual(first);
-      expect(calls).toBe(cacheEnabled ? 0 : first.count);
-      if (cacheEnabled) {
-        expect(pages.length).toBeGreaterThan(1);
-        expect(Math.max(...pages)).toBeLessThanOrEqual(256);
-      } else {
-        expect(pages).toEqual([]);
-      }
+      expect(calls).toBe(0);
+      // This release can reuse published vectors even when the embedding cache is disabled.
+      expect(pages.length).toBeGreaterThan(1);
+      expect(Math.max(...pages)).toBeLessThanOrEqual(128);
       console.log(
         "REBUILD_BOUNDARY",
         JSON.stringify({

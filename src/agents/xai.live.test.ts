@@ -152,19 +152,10 @@ describeLive("xai live", () => {
             },
           );
 
-          const textLength = extractNonEmptyAssistantText(res.content).length;
-          if (textLength === 0) {
-            console.error(
-              "[xai:live] empty completion",
-              JSON.stringify({
-                stopReason: res.stopReason,
-                contentTypes: res.content.map((block) => block.type),
-                usage: res.usage,
-                hasErrorMessage: Boolean(res.errorMessage),
-              }),
-            );
-          }
-          expect(textLength, res.errorMessage).toBeGreaterThan(0);
+          expect(
+            extractNonEmptyAssistantText(res.content).length,
+            res.errorMessage,
+          ).toBeGreaterThan(0);
         });
       },
       XAI_COMPLETE_LIVE_TIMEOUT_MS,

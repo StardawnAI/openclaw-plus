@@ -112,27 +112,6 @@ export function createSessionEntryHasher(prefixLineCount?: number) {
   };
 }
 
-export function hashSessionEntrySnapshot(params: {
-  content: string;
-  lineMap: readonly number[];
-  messageTimestampsMs: readonly number[];
-  lineProvenance: readonly MemoryEntryProvenance[];
-  resetRecallCutoff: SessionResetRecallCutoff;
-}): string {
-  // Preserve persisted hash bytes without flattening another full export string.
-  return createHash("sha256")
-    .update(params.content)
-    .update("\n")
-    .update(params.lineMap.join(","))
-    .update("\n")
-    .update(params.messageTimestampsMs.join(","))
-    .update("\n")
-    .update(JSON.stringify(params.lineProvenance))
-    .update("\n")
-    .update(JSON.stringify(params.resetRecallCutoff))
-    .digest("hex");
-}
-
 export function collectRawSessionText(content: unknown): string | null {
   if (typeof content === "string") {
     return content;
@@ -151,7 +130,10 @@ export function collectRawSessionText(content: unknown): string | null {
 }
 
 /** Retain memory's input facts, not tool results, attachments, or provider replay payloads. */
-export function projectSessionEntryRecord(value: unknown): unknown {
+export function projectSessionEntryRecord(
+  value: unknown,
+  prepareTranscriptText: (message: unknown, text: string | undefined) => string | undefined,
+): unknown {
   const record = asOptionalRecord(value);
   if (!record) {
     return null;
@@ -177,10 +159,19 @@ export function projectSessionEntryRecord(value: unknown): unknown {
     message: message
       ? {
           role: readStringValue(message.role),
+          display:
+            message.display === false
+              ? false
+              : message.role === "assistant" || message.display === true
+                ? true
+                : undefined,
           timestamp: timestamp(message.timestamp),
           content:
             message.role === "user" || message.role === "assistant"
-              ? collectRawSessionText(message.content)
+              ? (prepareTranscriptText(
+                  message,
+                  collectRawSessionText(message.content) ?? undefined,
+                ) ?? null)
               : null,
           provenance: {
             kind: readStringValue(provenance?.kind),

@@ -1,9 +1,8 @@
 import { listAgentDatabaseAdmissionRefusals } from "../../state/agent-database-admission.js";
 import { tryResolveCronJobEffectiveAgentId } from "../agent-id.js";
+import { currentPluginCommandHostProcessId } from "../plugin-command-schedule.js";
 import type { CronSchedulerSnapshot } from "../store/scheduler-actor.types.js";
 import type { CronServiceState } from "./state.js";
-
-let snapshotVersion = 0;
 
 export function preparingCronAgentIds(env: NodeJS.ProcessEnv): string[] {
   return listAgentDatabaseAdmissionRefusals({ env })
@@ -21,10 +20,9 @@ export async function captureCronSchedulerSnapshot(
   const needsDefault =
     !state.store || state.store.jobs.some((job) => !tryResolveCronJobEffectiveAgentId(job));
   return {
-    version: ++snapshotVersion,
-    config: structuredClone({
-      preparingAgentIds: preparingCronAgentIds(state.deps.env),
+    config: {
       cronEnabled: state.deps.cronEnabled,
+      preparingAgentIds: preparingCronAgentIds(state.deps.env),
       cronConfig: state.deps.cronConfig,
       defaultAgentId: preparedOwner
         ? preparedOwner.defaultAgentId
@@ -35,6 +33,8 @@ export async function captureCronSchedulerSnapshot(
       maxMissedJobsPerRestart: state.deps.maxMissedJobsPerRestart,
       missedJobStaggerMs: state.deps.missedJobStaggerMs,
       startupDeferredMissedAgentJobDelayMs: state.deps.startupDeferredMissedAgentJobDelayMs,
-    }),
+      hostProcessId: currentPluginCommandHostProcessId(),
+      pluginCommandHosts: state.deps.resolvePluginCommandScheduleHosts?.(),
+    },
   };
 }

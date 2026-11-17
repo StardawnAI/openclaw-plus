@@ -15,8 +15,7 @@ import type {
   UpdateRunReconciliationResult,
 } from "./update-run-reconciliation.types.js";
 import { finishUpdateRunRecord, type UpdateRunRecord } from "./update-run-record.js";
-import { upsertStep } from "./update-run-step-upsert.js";
-import { persistRun, updateRunLedgerSchema as schema } from "./update-run-write.js";
+import { persistRun, updateRunLedgerSchema as schema, upsertStep } from "./update-run-write.js";
 
 type LedgerDatabase = Pick<DB, "update_runs">;
 
@@ -72,18 +71,31 @@ export function reconcileUpdateRunCandidatesInWorker(
       }
       const reconciled: UpdateRunRecord[] = [];
       for (const [index, { record, rule }] of selected.entries()) {
-        if (!rule || (input.legacyOnly && rule !== LEGACY_UPDATE_RUN_EXPIRED_REASON)) {
+        if (
+          !rule ||
+          (input.legacyOnly && rule !== LEGACY_UPDATE_RUN_EXPIRED_REASON) ||
+          (input.statusOnly &&
+            rule !== LEGACY_UPDATE_RUN_EXPIRED_REASON &&
+            rule !== "handoff-terminated")
+        ) {
           continue;
         }
         upsertStep(record, {
           step: "reconcile:abandoned",
           status: "failed",
           endedAtMs: Date.now(),
-          detail: rule,
+          detail:
+            rule === "handoff-terminated"
+              ? `Managed handoff terminated during ${record.phase}; last recorded phase: ${record.phase}. Check the handoff log and systemd journal for termination or OOM diagnostics.`
+              : rule,
         });
         finishUpdateRunRecord(record, {
           status: "failed",
-          reason: rule === LEGACY_UPDATE_RUN_EXPIRED_REASON ? rule : "abandoned",
+          reason:
+            rule === LEGACY_UPDATE_RUN_EXPIRED_REASON || rule === "handoff-terminated"
+              ? rule
+              : "abandoned",
+          nextAction: "Run `openclaw update repair` before retrying the update.",
         });
         const saved = persistRun(db, record, options);
         current[index] = saved;

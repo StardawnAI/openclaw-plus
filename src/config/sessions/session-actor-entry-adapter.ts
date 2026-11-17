@@ -12,8 +12,8 @@ import type {
   SessionEntryCreateWithTranscriptPrepareResult,
   SessionEntryCreateWithTranscriptResult,
 } from "./session-accessor.types.js";
+import { acquireSessionActorStorage } from "./session-actor-storage-acquisition.js";
 import {
-  acquireSessionActorStorage,
   captureSessionActorStorageOwner,
   getSessionActorStorageBinding,
   type SessionActorStorageBinding,
@@ -28,7 +28,6 @@ import {
   releaseSessionSourceAuthorities,
   type SessionSourceValidation,
 } from "./session-source-authority.js";
-import { assertMaintenancePreservationCompatible } from "./store-maintenance-preserve-snapshot.js";
 import { prepareSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
@@ -132,7 +131,6 @@ async function patchSessionActorEntry(
     if (config && config.mode !== "warn") {
       maintenancePreservation = await prepareSessionMaintenancePreservation(binding.path);
     }
-    const maintenanceSnapshot = maintenancePreservation?.capture();
     const result = await actor.storage!.mutate(
       {
         type: "session.entry.patch",
@@ -140,8 +138,8 @@ async function patchSessionActorEntry(
           ...input,
           operation: input.operation,
           expected,
-          ...(config && maintenanceSnapshot
-            ? { maintenance: { config, preservation: maintenanceSnapshot } }
+          ...(config && maintenancePreservation
+            ? { maintenance: { config, preservation: maintenancePreservation.capture() } }
             : {}),
         },
       },
@@ -164,52 +162,32 @@ async function patchSessionActorEntry(
         assertCurrent() {
           authority.assertCurrent();
           source.assertCurrent();
+          maintenancePreservation?.capture();
           options.workerGuard?.assertCurrent?.();
           options.workerGuard?.assertMutationAllowed?.();
           options.assertCommitAllowed?.();
         },
       },
       {
-        beforeCommit({ changes }) {
-          if (maintenanceSnapshot && maintenancePreservation) {
-            // The caller's patch is explicit; only sibling maintenance is automatic.
-            const automatic = changes.filter((change) => change.sessionKey !== sessionKey);
-            assertMaintenancePreservationCompatible(
-              maintenanceSnapshot,
-              maintenancePreservation.refreshCandidates(
-                automatic.map((change) => change.sessionKey),
-              ),
-              [
-                {
-                  archivedEntries: automatic.flatMap(({ sessionKey: changedKey, before, after }) =>
-                    before?.entry?.archivedAt === undefined &&
-                    after?.entry?.archivedAt !== undefined
-                      ? [{ sessionKey: changedKey, sessionId: after.entry.sessionId }]
-                      : [],
-                  ),
-                  entryRemovals: automatic.flatMap(({ sessionKey: changedKey, before, after }) =>
-                    before?.entry && !after?.entry
-                      ? [{ sessionKey: changedKey, expectedEntry: before.entry }]
-                      : [],
-                  ),
-                  stateDeletePlans: [],
-                },
-              ],
-            );
-          }
-        },
         committed(outcome) {
           const change = outcome.changes.find((value) => value.sessionKey === sessionKey);
-          if (!outcome.value || isDeepStrictEqual(change?.before?.entry, change?.after?.entry)) {
+          if (
+            !outcome.value ||
+            (!outcome.entryPatchEffects &&
+              isDeepStrictEqual(change?.before?.entry, change?.after?.entry))
+          ) {
             return;
           }
           const predicate = options.workerGuard?.shouldCommitIf;
-          options.onCommitted?.(
-            outcome.value,
+          const transcriptPredicate =
             predicate && change?.before?.entry?.sessionId === outcome.value.sessionId
               ? { sessionId: predicate.sessionId, watermark: change.before.transcript.watermark }
-              : undefined,
-          );
+              : undefined;
+          if (outcome.entryPatchEffects) {
+            options.onCommitted?.(outcome.value, transcriptPredicate, outcome.entryPatchEffects);
+          } else {
+            options.onCommitted?.(outcome.value, transcriptPredicate);
+          }
           const database = actor.target.database;
           if (database.kind !== "memory") {
             throw new Error("Memory patch lost its owner");

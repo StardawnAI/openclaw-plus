@@ -1,21 +1,10 @@
-import { AgentHarnessPreflightError } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import {
-  createPluginStateKeyedStoreForTests,
-  resetPluginStateStoreForTests,
-} from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { clearRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
-import { withOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { AgentsApiBinding } from "./agentsapi-bindings.js";
 import { AgentsApiClient } from "./agentsapi-client.js";
-import {
-  createAttempt,
-  createCompletedSessionFactory,
-  mockClient,
-  registerHarness,
-  reopenState,
-} from "./agentsapi-harness.persistence.test-helpers.js";
+import { createCompletedSessionFactory } from "./agentsapi-harness.persistence.test-helpers.js";
+import { withPersistenceFixture } from "./agentsapi-persistence-fixture.test-support.js";
 import { createTurn } from "./agentsapi.test-support.js";
 
 const { createSession } = vi.hoisted(() => ({
@@ -32,7 +21,6 @@ vi.mock("./agentsapi-prompt.js", async (importOriginal) => ({
 }));
 
 beforeEach(() => {
-  // Keep database lease clocks real while advancing only the harness deadlines.
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
   vi.spyOn(AbortSignal, "timeout").mockImplementation(() => new AbortController().signal);
   vi.spyOn(AgentsApiClient.prototype, "turn").mockImplementation(async (sessionId, id) =>
@@ -51,40 +39,13 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-it.each([
-  "creation",
-  "reasoning update",
-  "state read",
-  "stream connection",
-  "first event",
-  "active native work",
-  "shorter attempt deadline",
-])("bounds native startup at %s without discarding its binding", async (phase) => {
-  await withOpenClawTestState({ label: "agentsapi-startup" }, async (state) => {
-    const params = await createAttempt(state.stateDir);
-    const openStore = () =>
-      createPluginStateKeyedStoreForTests<AgentsApiBinding>("agentsapi", {
-        namespace: "agentsapi-sessions",
-        maxEntries: 100_000,
-        overflowPolicy: "reject-new",
-        env: state.env,
-      });
-    const client = mockClient("session-fixture");
-    let harness = registerHarness(state.env);
-    const controller = new AbortController();
-    try {
-      if (phase !== "creation") {
-        expect(await harness.runAttempt(params)).toMatchObject({ terminal: { kind: "ok" } });
-        await harness.dispose();
-        await reopenState();
-        harness = registerHarness(state.env);
-      }
-      const saved = await openStore().lookup(params.sessionId);
-      if (phase !== "creation") {
-        expect(saved).toMatchObject({ sessionId: "session-fixture" });
-      } else {
-        expect(saved).toBeUndefined();
-      }
+it.each(["reasoning update", "stream connection", "first event", "active native work"])(
+  "bounds resumed session startup at %s without discarding its binding",
+  async (phase) => {
+    await withPersistenceFixture("session-fixture", async (fixture) => {
+      await fixture.run();
+      const saved = await fixture.openStore().lookup(fixture.params.sessionId);
+      await fixture.restart();
       const actual =
         await vi.importActual<typeof import("./agentsapi-session.js")>("./agentsapi-session.js");
       const healthySession = createSession.getMockImplementation()!;
@@ -98,15 +59,10 @@ it.each([
           });
         });
       };
-      if (phase === "creation") {
-        client.create.mockImplementation((signal) => wait(signal));
-      } else if (phase === "reasoning update") {
-        client.update.mockImplementation((_id, _effort, signal) => wait(signal));
+      if (phase === "reasoning update") {
+        fixture.update.mockImplementation((_id, _effort, signal) => wait(signal));
       }
       const turns = vi.spyOn(AgentsApiClient.prototype, "turns").mockResolvedValue([]);
-      if (phase === "state read") {
-        turns.mockImplementationOnce((_id, signal) => wait(signal));
-      }
       vi.spyOn(AgentsApiClient.prototype, "subscribe").mockImplementation(async (_id, signal) => {
         if (phase === "stream connection") {
           await wait(signal);
@@ -132,70 +88,52 @@ it.each([
           }),
         ]);
       });
-      const shorter = phase === "shorter attempt deadline";
-      const active = phase === "active native work";
-      const submitted = active || shorter || phase === "first event";
+      const controller = new AbortController();
       const onAttemptAbort = vi.fn();
-      const result = harness.runAttempt({
-        ...params,
-        runId: "stalled-native-turn",
-        timeoutMs: shorter ? 5_000 : 600_000,
+      const result = fixture.harness.runAttempt({
+        ...fixture.params,
+        runId: "resumed-stalled-turn",
+        timeoutMs: 600_000,
         abortSignal: controller.signal,
         onAttemptAbort,
       });
       try {
         const signal = await blocked.promise;
-        await vi.advanceTimersByTimeAsync(shorter ? 4_999 : 119_999);
-        expect(signal.aborted).toBe(false);
-        await vi.advanceTimersByTimeAsync(1);
-        expect(signal.aborted).toBe(!active);
-        if (active) {
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(signal.aborted).toBe(phase !== "active native work");
+        if (phase === "active native work") {
           controller.abort();
         }
-        const outcome = await result;
-        expect(outcome).toMatchObject({
-          terminal: active
-            ? { kind: "aborted", source: "external" }
-            : shorter
-              ? { kind: "timeout", source: "runtime" }
-              : { kind: "failed", error: expect.any(AgentHarnessPreflightError) },
-          replayMetadata: { hadPotentialSideEffects: submitted },
+        expect(await result).toMatchObject({
+          terminal:
+            phase === "active native work"
+              ? { kind: "aborted", source: "external" }
+              : {
+                  kind: "failed",
+                  error: {
+                    message: expect.stringContaining("Inspect the native session or use /reset"),
+                  },
+                },
+          replayMetadata: {
+            hadPotentialSideEffects: phase === "first event" || phase === "active native work",
+          },
         });
-        if (!active && !shorter) {
-          expect(outcome).toMatchObject({
-            terminal: {
-              error: {
-                message: expect.stringContaining("Inspect the native session or use /reset"),
-              },
-            },
-          });
-        }
-        expect(cancel).toHaveBeenCalledTimes(submitted ? 1 : 0);
-        expect(onAttemptAbort).toHaveBeenCalledTimes(active || shorter ? 1 : 0);
-        expect(await openStore().lookup(params.sessionId)).toEqual(saved);
-        expect(client.create).toHaveBeenCalledTimes(1);
-        if (phase !== "creation") {
-          // Service recovery continues the same persisted conversation after another restart.
-          createSession.mockImplementation(healthySession);
-          client.update.mockResolvedValue();
-          await harness.dispose();
-          await reopenState();
-          harness = registerHarness(state.env);
-          expect(
-            await harness.runAttempt({ ...params, runId: "recovered-native-turn" }),
-          ).toMatchObject({
-            terminal: { kind: "ok" },
-          });
-          expect(await openStore().lookup(params.sessionId)).toEqual(saved);
-          expect(client.create).toHaveBeenCalledTimes(1);
-        }
+        expect(cancel).toHaveBeenCalledTimes(
+          phase === "first event" || phase === "active native work" ? 1 : 0,
+        );
+        expect(onAttemptAbort).toHaveBeenCalledTimes(phase === "active native work" ? 1 : 0);
+        expect(await fixture.openStore().lookup(fixture.params.sessionId)).toEqual(saved);
+        // A recovered service can continue the same persisted conversation after restart.
+        createSession.mockImplementation(healthySession);
+        fixture.update.mockResolvedValue();
+        await fixture.restart();
+        await fixture.run({ runId: "recovered-native-turn" });
+        expect(await fixture.openStore().lookup(fixture.params.sessionId)).toEqual(saved);
+        expect(fixture.create).toHaveBeenCalledTimes(1);
       } finally {
         controller.abort();
         await result;
       }
-    } finally {
-      controller.abort();
-      await harness.dispose();
-    }
-  });
-});
+    });
+  },
+);

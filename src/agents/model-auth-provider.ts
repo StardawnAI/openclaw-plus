@@ -6,13 +6,16 @@ import { resolveMergedModelProviderConfig } from "../config/model-provider-confi
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { resolveProviderAuthScope } from "../plugins/provider-auth-scope.js";
 import {
   buildProviderMissingAuthMessageWithPlugin,
+  resolvePluginOwnedProviderAuth,
   resolveProviderDeprecatedAuthProfileIds,
   shouldDeferProviderSyntheticProfileAuthWithPlugin,
 } from "../plugins/provider-runtime.js";
 import { resolveOwningPluginIdsForProviderRef } from "../plugins/providers.js";
 import { SecretSurfaceUnavailableError } from "../secrets/runtime-degraded-state.js";
+import { looksLikeSecretSentinel, mintSecretSentinel } from "../secrets/sentinel.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveDefaultAgentDir } from "./agent-scope-config.js";
 import {
@@ -28,7 +31,7 @@ import { assertAuthProfileMigrationReady } from "./auth-profiles/legacy-source-d
 import { OAuthRefreshFailureError } from "./auth-profiles/oauth-refresh-failure.js";
 import { isStoredCredentialCompatibleWithAuthProvider } from "./auth-profiles/order.js";
 import { resolveAuthStorePathForDisplayAsync } from "./auth-profiles/paths.js";
-import { isNonSecretApiKeyMarker } from "./model-auth-markers.js";
+import { isNonSecretApiKeyMarker, resolveExplicitProviderNoAuth } from "./model-auth-markers.js";
 import { assertAuthModeAllowedForModel, isAuthModeAllowedForModel } from "./model-auth-policy.js";
 import * as authConfig from "./model-auth-provider-config.js";
 import { resolveModelProviderAuthConfig } from "./model-auth-provider-route.js";
@@ -84,16 +87,12 @@ function shouldDeferSyntheticProfileAuth(params: {
 
 /** @deprecated Use resolveScopedAuthProfileStoreAsync to read through the auth owner worker. */
 export function resolveScopedAuthProfileStore(params: {
-  agentDir?: string;
   cfg?: OpenClawConfig;
   provider: string;
-  profileId?: string;
-  preferredProfile?: string;
 }): AuthProfileStore {
-  return ensureAuthProfileStore(params.agentDir, {
+  return ensureAuthProfileStore(undefined, {
     migrationProvider: params.provider,
     config: params.cfg,
-    profileId: params.profileId,
     externalCli: externalCliDiscoveryForProviderAuth(params),
   });
 }
@@ -165,7 +164,6 @@ export async function resolveProviderEntryApiKeyAuth(params: {
       mode: binding.auth.mode,
       authFlow: binding.auth.authFlow,
     });
-    assertProviderAuthSupportsHttp(binding.auth, provider);
     return binding.auth;
   }
   if (binding.kind === "profile-incompatible") {
@@ -207,6 +205,11 @@ export async function resolveApiKeyForProviderCore(input: {
    *  silently replaced by another profile or env/config credentials. */
   lockedProfile?: boolean;
   forceRefresh?: boolean;
+  /** Gates a new native refresh claim, not independently owned settlement. */
+  assertRefreshAdmission?: () => void;
+  validateOAuthCredential?: Parameters<
+    typeof resolveApiKeyForProfile
+  >[0]["validateOAuthCredential"];
   credentialPrecedence?: ProviderCredentialPrecedence;
   /** Skip implicit profile discovery for a prepared env/config fallback attempt. */
   allowAuthProfileFallback?: boolean;
@@ -220,6 +223,36 @@ export async function resolveApiKeyForProviderCore(input: {
   secretSentinels?: boolean;
 }): Promise<ResolvedProviderAuth> {
   input.signal?.throwIfAborted();
+  const ownership = {
+    provider: input.provider,
+    config: input.cfg,
+    workspaceDir: input.workspaceDir,
+  };
+  if (resolveProviderAuthScope(ownership) === "plugin") {
+    const auth = resolvePluginOwnedProviderAuth({
+      ...ownership,
+      profileId: input.profileId,
+      preferredProfile: input.preferredProfile,
+    });
+    input.signal?.throwIfAborted();
+    assertProviderAuthSupportsHttp(auth, input.provider);
+    assertAuthModeAllowedForModel({
+      provider: input.provider,
+      modelApi: input.modelApi,
+      modelBaseUrl: input.modelBaseUrl,
+      capability: input.capability,
+      mode: auth.mode,
+      profileId: auth.source,
+    });
+    return input.secretSentinels &&
+      !isNonSecretApiKeyMarker(auth.apiKey) &&
+      !looksLikeSecretSentinel(auth.apiKey)
+      ? {
+          ...auth,
+          apiKey: mintSecretSentinel(auth.apiKey, { label: `model-auth:${input.provider}` }),
+        }
+      : auth;
+  }
   const modelAuthConfig = resolveModelProviderAuthConfig({
     provider: input.provider,
     config: input.cfg,
@@ -228,6 +261,14 @@ export async function resolveApiKeyForProviderCore(input: {
   });
   const params = { ...input, cfg: modelAuthConfig };
   const { provider, cfg, profileId, preferredProfile } = params;
+  const noAuth = resolveExplicitProviderNoAuth({
+    provider,
+    providerConfig: resolveMergedModelProviderConfig(cfg, provider),
+    modelApi: params.modelApi,
+  });
+  if (noAuth) {
+    return noAuth;
+  }
   const modelPolicy = {
     provider,
     modelApi: params.modelApi,
@@ -319,6 +360,8 @@ export async function resolveApiKeyForProviderCore(input: {
       signal: params.signal,
       forceRefresh: params.forceRefresh,
       allowProfileFallback: !params.lockedProfile,
+      validateOAuthCredential: params.validateOAuthCredential,
+      assertRefreshAdmission: params.assertRefreshAdmission,
     });
     params.signal?.throwIfAborted();
     if (!resolved) {
@@ -633,8 +676,7 @@ export async function resolveApiKeyForProviderCore(input: {
     return syntheticLocalAuth;
   }
 
-  const hasInlineConfiguredModels =
-    Array.isArray(providerConfig?.models) && providerConfig.models.length > 0;
+  const hasInlineConfiguredModels = (providerConfig?.models?.length ?? 0) > 0;
   const owningPluginIds =
     params.allowAuthProfileFallback !== false && !hasInlineConfiguredModels
       ? resolveOwningPluginIdsForProviderRef({

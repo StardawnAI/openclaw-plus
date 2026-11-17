@@ -232,10 +232,23 @@ export const UpdateRunRecordSchema = z.object({
   reason: text.nullable(),
   admission: admission.optional(),
   origin: z.object({
+    windowsUserSid: z
+      .string()
+      .max(184)
+      .regex(/^S-1-\d+(?:-\d+)+$/)
+      .optional(),
     admission: admission.optional(),
     candidateAdmission: candidateAdmission.optional(),
     updateRecoveryCapture: updateRecoveryCaptureStateSchema.optional(),
     driver: driver.optional(),
+    managedHandoff: z.object({ parent: driver, helper: driver }).optional(),
+    packageStage: z
+      .object({
+        prefix: z.string().max(4096),
+        packageRoot: z.string().max(4096),
+        identity: z.object({ dev: z.number(), ino: z.number(), birthtimeMs: z.number() }),
+      })
+      .optional(),
     previousDrivers: z
       .array(driver)
       .max(UPDATE_RUN_DRIVER_LIMIT - 1)

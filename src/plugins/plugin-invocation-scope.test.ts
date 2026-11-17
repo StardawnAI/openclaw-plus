@@ -2,8 +2,48 @@ import { expect, it, vi } from "vitest";
 import { createDeferredCore } from "../shared/deferred.js";
 import { PluginInstanceUnavailableError } from "./plugin-instance-error.js";
 import { PluginInstance } from "./plugin-instance.js";
+import { createOwnedTestInstance } from "./plugin-instance.test-support.js";
 import { PluginInvocationScope, runPluginCleanupScope } from "./plugin-invocation-scope.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
+import { getPluginRuntimeGatewayRequestScope } from "./runtime/gateway-request-scope.js";
+
+it("creates only final teardown views while fencing each retained owner's callbacks", async () => {
+  const instance = createOwnedTestInstance("retained-siblings");
+  const registry = instance.owner!.registry!;
+  const first = new PluginInvocationScope(registry, [instance], { retained: true });
+  const second = new PluginInvocationScope(registry, [instance], { retained: true });
+  const callback = instance.wrap(() => {
+    expect(getPluginRuntimeGatewayRequestScope()?.pluginId).toBe(instance.pluginId);
+    expect(getPluginRuntimeGatewayRequestScope()?.pluginRegistry).toBe(registry);
+    return "owner";
+  });
+  const firstCallback = first.wrap(callback);
+  const secondCallback = second.wrap(callback);
+  expect(first.wrap(callback)).toBe(firstCallback);
+  expect(secondCallback).not.toBe(firstCallback);
+  expect(firstCallback()).toBe("owner");
+  expect(secondCallback()).toBe("owner");
+  const views = vi.spyOn(instance, "createRegistryView");
+  const cleanup = first.beginCleanup();
+  try {
+    // One final view, with no throwaway ordinary view before teardown admission.
+    expect(views).toHaveBeenCalledTimes(1);
+    instance.quiesce();
+    expect(() => firstCallback()).toThrow(/closed/);
+    expect(secondCallback()).toBe("owner");
+    expect(cleanup.scope.run(callback)).toBe("owner");
+    const cleanupCallback = cleanup.scope.wrap(callback);
+    expect(cleanupCallback()).toBe("owner");
+    await cleanup.release();
+    expect(() => cleanupCallback()).toThrow(/closed/);
+    expect(() => firstCallback()).toThrow(/closed/);
+    expect(secondCallback()).toBe("owner");
+  } finally {
+    views.mockRestore();
+    second.release();
+    await cleanup.release();
+  }
+});
 
 it("finishes plugin and module disposal after its caller scope closes", async () => {
   const instance = new PluginInstance("closed-caller-cleanup");
@@ -21,34 +61,6 @@ it("finishes plugin and module disposal after its caller scope closes", async ()
   });
   expect(result.errors).toEqual([]);
   expect(completed).toEqual(["plugin", "module"]);
-});
-
-it("keeps exact retained work callable after its admitting parent closes", async () => {
-  const registry = createEmptyPluginRegistry();
-  const instance = new PluginInstance("retained-capture");
-  const sibling = new PluginInstance("unretained-capture");
-  const parent = new PluginInvocationScope(registry, [instance, sibling], { retained: true });
-  const capture = parent.run(
-    () => new PluginInvocationScope(registry, [instance], { retained: true }),
-  );
-  const called = vi.fn();
-  const callback = capture.wrap(instance.wrap(called));
-  const unrelated = sibling.wrap(called);
-  try {
-    parent.release();
-    expect(instance.retainedWorkCount).toBe(1);
-    expect(sibling.retainedWorkCount).toBe(0);
-    callback();
-    expect(called).toHaveBeenCalledOnce();
-    expect(() => capture.run(unrelated)).toThrow("Plugin invocation scope is closed");
-    capture.release();
-    expect(() => callback()).toThrow("Plugin retained-capture consumer is closed");
-    expect(instance.retainedWorkCount).toBe(0);
-  } finally {
-    parent.release();
-    capture.release();
-    await Promise.all([instance.dispose(), sibling.dispose()]);
-  }
 });
 
 it.each(["idle", "active"])(

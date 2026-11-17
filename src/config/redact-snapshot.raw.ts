@@ -21,15 +21,17 @@ export function replaceSensitiveValuesInRaw(params: {
   return result;
 }
 
-/** Rejects raw output unless it matches the independently redacted structured view. */
+/** Returns whether raw string redaction changed semantics and structured redaction is needed. */
 export function shouldFallbackToStructuredRawRedaction(params: {
   redactedRaw: string;
-  redactedConfig: unknown;
+  originalConfig: unknown;
+  restoreParsed: (parsed: unknown) => { ok: boolean; result?: unknown };
 }): boolean {
   try {
     const parsed = JSON5.parse(params.redactedRaw);
-    // Restoration alone would also accept an escaped secret that was never replaced.
-    return !isDeepStrictEqual(parsed, params.redactedConfig);
+    const restored = params.restoreParsed(parsed);
+    // Raw replacement is only safe when parsing and restoring produces the original config shape.
+    return !restored.ok || !isDeepStrictEqual(restored.result, params.originalConfig);
   } catch {
     return true;
   }

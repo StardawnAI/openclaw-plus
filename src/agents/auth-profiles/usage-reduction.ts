@@ -99,22 +99,6 @@ function applyWhamCooldownResult(params: {
   };
 }
 
-export function matchesWhamBlockGeneration(
-  stats: ProfileUsageStats | undefined,
-  generation: ProfileUsageStats | undefined,
-): boolean {
-  return (
-    stats?.blockedUntil === generation?.blockedUntil &&
-    stats?.blockedReason === generation?.blockedReason &&
-    stats?.blockedSource === generation?.blockedSource &&
-    stats?.blockedModel === generation?.blockedModel &&
-    stats?.blockedScope === generation?.blockedScope &&
-    stats?.lastProbeAt === generation?.lastProbeAt &&
-    stats?.lastFailureAt === generation?.lastFailureAt &&
-    stats?.lastRateLimitAt === generation?.lastRateLimitAt
-  );
-}
-
 export function reconcileWhamBlock(
   stats: ProfileUsageStats,
   result: WhamCooldownProbeResult,
@@ -147,19 +131,11 @@ export type AuthProfileFailureReduction = {
   retryAfterMs?: number;
   whamResult: WhamCooldownProbeResult | null;
   probeEligible: boolean;
-  observedProfile?: AuthProfileCredential;
-  blockGeneration?: ProfileUsageStats;
 };
 
 export type PersonalAuthProfileUsageReduction =
   | { kind: "success"; expectedProfile: AuthProfileCredential; lastUsed: number; modelId?: string }
   | ({ kind: "failure" } & AuthProfileFailureReduction);
-
-export type PersonalAuthProfileUsageResult = {
-  previous: ProfileUsageStats | undefined;
-  next: ProfileUsageStats;
-  now: number;
-};
 
 /** Both writers reduce their current row using the same prepared provider observation. */
 export function reduceAuthProfileFailure(
@@ -171,32 +147,19 @@ export function reduceAuthProfileFailure(
   if (!profile || profile.setup?.replacement) {
     return undefined;
   }
-  const {
-    expectedProfile,
-    reason,
-    modelId,
-    retryAfterMs,
-    whamResult,
-    observedProfile,
-    blockGeneration,
-  } = input;
+  const { expectedProfile, reason, modelId, retryAfterMs, whamResult } = input;
   const currentWhamResult =
     whamResult &&
     input.probeEligible &&
     profile.type === "oauth" &&
     isFutureDateTimestampMs(profile.expires, { nowMs: now }) &&
-    isSameWhamCredential(expectedProfile, profile) &&
-    ((!whamResult.available && !whamResult.blockedUntil) ||
-      (observedProfile &&
-        isSameWhamCredential(expectedProfile, observedProfile) &&
-        matchesWhamBlockGeneration(previousStats, blockGeneration)))
+    isSameWhamCredential(expectedProfile, profile)
       ? whamResult
       : null;
   // Successful use also advances lastProbeAt, including inherited profiles.
   if (currentWhamResult && (previousStats?.lastProbeAt ?? 0) > input.observedAt) {
     return undefined;
   }
-  // The probe can only release the credential and block generation it observed.
   if (reason === "no_error_details" && !currentWhamResult) {
     return undefined;
   }

@@ -13,7 +13,6 @@ import {
   resolveDispatchWrapperTrustPlan,
   unwrapDispatchWrappersForResolution,
 } from "./dispatch-wrapper-resolution.js";
-import { addAllowAlwaysPattern, resolveCandidateTrustPath } from "./exec-allow-always-targets.js";
 import {
   isWindowsPlatform,
   matchAllowlist,
@@ -33,6 +32,7 @@ import {
 import type { AllowAlwaysPattern, ExecAllowlistEntry } from "./exec-approvals.types.js";
 import {
   canUseReusableWrapperPayloadCandidates,
+  isPathScopedExecutableToken,
   planShellAuthorization,
   type ExecAuthorizationPlan,
 } from "./exec-authorization-plan.js";
@@ -66,6 +66,7 @@ import {
   resolveInlineCommandMatch,
   resolvePowerShellInlineCommandMatch,
 } from "./shell-inline-command.js";
+import { POSIX_SHELLS_WITH_PLUS_OPTIONS } from "./shell-wrapper-resolution.js";
 import { analyzeWindowsShellCommand } from "./windows-shell-command.js";
 
 function hasShellLineContinuation(command: string): boolean {
@@ -160,10 +161,6 @@ function isSafeBinUsage(params: {
     return false;
   }
   return validateSafeBinArgv(argv, profile, { binName: execName });
-}
-
-function isPathScopedExecutableToken(token: string): boolean {
-  return token.includes("/") || token.includes("\\");
 }
 
 export type ExecAllowlistEvaluation = {
@@ -350,7 +347,7 @@ function resolveShellWrapperScriptArgv(params: {
   const scriptBase = normalizeLowercaseStringOrEmpty(
     path.basename(params.shellScriptCandidatePath),
   );
-  const cwdBase = params.cwd && params.cwd.trim() ? params.cwd.trim() : process.cwd();
+  const cwdBase = params.cwd && params.cwd.trim() ? params.cwd : process.cwd();
   const resolveArgPath = (a: string): string => (path.isAbsolute(a) ? a : path.resolve(cwdBase, a));
   let idx = params.effectiveArgv.findIndex(
     (a) => resolveArgPath(a) === params.shellScriptCandidatePath,
@@ -776,17 +773,6 @@ function isOpaquePosixShellWrapperSegment(segment: ExecCommandSegment): boolean 
 }
 
 const SHELL_WRAPPER_OPTIONS_WITH_VALUE = new Set(["-c", "--command", "-o", "-O", "+O", "+o"]);
-const POSIX_SHELLS_WITH_PLUS_OPTIONS = new Set([
-  "ash",
-  "bash",
-  "dash",
-  "ksh",
-  "mksh",
-  "osh",
-  "sh",
-  "yash",
-  "zsh",
-]);
 
 const SHELL_WRAPPER_DISQUALIFYING_SCRIPT_OPTIONS = [
   "--rcfile",
@@ -976,6 +962,31 @@ function resolveShellWrapperPositionalArgvCandidate(params: {
   };
 }
 
+function addAllowAlwaysPattern(
+  out: AllowAlwaysPattern[],
+  pattern: string,
+  argPattern?: string,
+): void {
+  const exists = out.some(
+    (p) => p.pattern === pattern && (p.argPattern ?? undefined) === (argPattern ?? undefined),
+  );
+  if (!exists) {
+    out.push({ pattern, argPattern });
+  }
+}
+
+function resolveCandidateTrustPath(candidatePath: string | undefined): string | undefined {
+  if (!candidatePath) {
+    return undefined;
+  }
+  return resolveExecutableTrustPath({
+    kind: "executable",
+    rawExecutable: candidatePath,
+    resolvedPath: candidatePath,
+    executableName: path.basename(candidatePath),
+  });
+}
+
 function collectAllowAlwaysPatterns(
   inputSegment: ExecCommandSegment,
   params: Omit<Parameters<typeof resolveAllowAlwaysPatternEntries>[0], "segments">,
@@ -1082,18 +1093,14 @@ function collectAllowAlwaysPatterns(
       });
       const argPattern = buildCwdBoundHashedArgPattern(
         scriptArgv,
-        params.cwd && params.cwd.trim() ? params.cwd.trim() : process.cwd(),
+        params.cwd && params.cwd.trim() ? params.cwd : process.cwd(),
         params.platform,
       );
       addAllowAlwaysPattern(out, scriptTrustPath, argPattern);
     }
     return;
   }
-  // POSIX inline payloads cannot use the Windows parser to mint reusable grants.
-  if (
-    !isWindowsPlatform(params.platform) ||
-    POSIX_SHELL_WRAPPERS.has(normalizeExecutableToken(segment.argv[0] ?? ""))
-  ) {
+  if (!isWindowsPlatform(params.platform)) {
     return;
   }
   const nested = analyzeWindowsShellCommand({
@@ -1110,7 +1117,11 @@ function collectAllowAlwaysPatterns(
   }
 }
 
-/** Derive persisted allowlist patterns for an "allow always" decision. */
+/**
+ * Derive persisted allowlist patterns for an "allow always" decision.
+ * When a command is wrapped in a shell (for example `zsh -lc "<cmd>"`),
+ * persist the inner executable(s) rather than the shell binary.
+ */
 export function resolveAllowAlwaysPatternEntries(params: {
   segments: ExecCommandSegment[];
   cwd?: string;

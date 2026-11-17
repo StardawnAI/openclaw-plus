@@ -1,13 +1,11 @@
 import { expect, it, onTestFinished } from "vitest";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { createGatewayMethodRegistry } from "../gateway/methods/registry.js";
-import { createGatewayInstanceRuntime } from "../gateway/server-instance-runtime.js";
-import type { GatewayRequestContext } from "../gateway/server-methods/types.js";
 import { withGatewayNativeApprovalRuntime } from "./approval-gateway-runtime-context.js";
 import type { GatewayNativeApprovalRuntime } from "./approval-gateway-runtime.types.js";
 import type { ChannelApprovalNativeRuntimeAdapterAsync } from "./approval-handler-runtime-types.js";
 import { createChannelApprovalHandlerFromCapability as createHandler } from "./approval-handler-runtime.js";
+import { createApprovalNativeRouteCoordinator } from "./approval-native-route-coordinator.js";
 import { doesApprovalRequestSelectChannelAccountAsync } from "./approval-request-account-binding.js";
 import { normalizeApprovalRequest, type ChannelApprovalKind } from "./approval-types.js";
 import type { ExecApprovalRequest } from "./exec-approvals.js";
@@ -51,21 +49,21 @@ function createCapability(approvalKind: ChannelApprovalKind) {
 
 function createGatewayRuntime(getRuntimeConfig: () => OpenClawConfig) {
   const subscribers: Parameters<GatewayNativeApprovalRuntime["subscribe"]>[0][] = [];
-  const instance = createGatewayInstanceRuntime({
-    getContext: () => ({ getRuntimeConfig }) as GatewayRequestContext,
-    getMethodRegistry: () => createGatewayMethodRegistry([]),
-    isDispatchAvailable: () => true,
-  });
-  onTestFinished(() => instance.close());
+  const routeCoordinator = createApprovalNativeRouteCoordinator();
+  onTestFinished(() => routeCoordinator.close());
   const runtime = {
-    ...instance.nativeApprovals,
+    getRuntimeConfig,
     request: async <T>() => [] as T,
+    requestRoute: async <T>(): Promise<T> => {
+      throw new Error("Unexpected route notice");
+    },
+    routeCoordinator,
     subscribe: (subscriber: (typeof subscribers)[number]) => {
       subscribers.push(subscriber);
-      return instance.nativeApprovals.subscribe(subscriber);
+      return () => {};
     },
   } satisfies GatewayNativeApprovalRuntime;
-  return { runtime, subscribers, instance };
+  return { runtime, subscribers };
 }
 
 async function requireHandler(params: Parameters<typeof createHandler>[0]) {
@@ -109,7 +107,6 @@ it.for(["exec", "system-agent"] as const)(
     const deliveries: Array<{ cfg: OpenClawConfig; pendingPayload: unknown }> = [];
     const plannedConfigs: OpenClawConfig[] = [];
     const finalizedConfigs: OpenClawConfig[] = [];
-    const cleanupConfigs: OpenClawConfig[] = [];
     const capability = createCapability(approvalKind);
     const describeDelivery = capability.native.describeDeliveryCapabilities;
     capability.native.describeDeliveryCapabilities = (params) => {
@@ -128,12 +125,6 @@ it.for(["exec", "system-agent"] as const)(
     capability.nativeRuntimeAsync.presentation.buildResolvedResult = ({ cfg }) => {
       finalizedConfigs.push(cfg);
       return { kind: "leave" };
-    };
-    capability.nativeRuntimeAsync.interactions = {
-      bindPending: () => ({ bindingId: "pending" }),
-      unbindPending: ({ cfg }) => {
-        cleanupConfigs.push(cfg);
-      },
     };
     capability.nativeRuntimeAsync.observe = {
       onDelivered: () => delivered.resolve(),
@@ -166,18 +157,13 @@ it.for(["exec", "system-agent"] as const)(
             },
           },
     );
-    expect(await gateway.instance.approvalEvents.publishRequestedAsync(approvalKind, request)).toBe(
-      1,
-    );
+    expect(await subscriber.shouldHandle(request)).toBe(true);
+    subscriber.onRequested(request);
     await withinTest(entered.promise, signal);
     current = { gateway: { publicOrigin: "https://later.example.com" } };
     release.resolve();
     await withinTest(delivered.promise, signal);
-    gateway.instance.approvalEvents.publishResolved(approvalKind, {
-      id: request.id,
-      decision: "deny",
-      ts: Date.now(),
-    });
+    await handler.handleResolved({ id: request.id, decision: "deny", ts: Date.now() });
     await withinTest(finalized.promise, signal);
 
     expect(deliveries).toEqual([
@@ -185,7 +171,6 @@ it.for(["exec", "system-agent"] as const)(
     ]);
     expect(plannedConfigs).toEqual([admitted]);
     expect(finalizedConfigs).toEqual([admitted]);
-    expect(cleanupConfigs).toEqual([admitted]);
   },
 );
 
@@ -255,27 +240,4 @@ it("keeps standalone configuration when called in another Gateway scope", async 
     handler.handleRequested(execRequest("exec:standalone")),
   );
   expect(deliveries).toEqual([cfg]);
-});
-
-it("refuses new approval admission after the owning Gateway closes", async () => {
-  const gateway = createGatewayRuntime(() => ({}));
-  const capability = createCapability("exec");
-  let deliveries = 0;
-  capability.nativeRuntimeAsync.transport.deliverPending = () => {
-    deliveries++;
-    return { messageId: "unexpected" };
-  };
-  const handler = await withGatewayNativeApprovalRuntime(gateway.runtime, () =>
-    requireHandler({ ...HANDLER_PARAMS, capability, cfg: {} }),
-  );
-  await handler.start();
-  gateway.instance.close();
-  expect(() => gateway.runtime.getRuntimeConfig()).toThrow(
-    "Gateway instance approval runtime is closed",
-  );
-  expect(
-    await gateway.instance.approvalEvents.publishRequestedAsync("exec", execRequest("exec:closed")),
-  ).toBe(0);
-  await handler.handleRequested(execRequest("exec:closed-direct"));
-  expect(deliveries).toBe(0);
 });

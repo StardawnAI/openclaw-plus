@@ -157,7 +157,6 @@ export function executeSessionActorMemoryEntryCommand(
       planSessionEntryMaintenance({
         maintenance: maintenance.config,
         initialUnarchivedCount: countUnarchivedSessionEntries(store),
-        deferArchiving: maintenance.preservation.deferArchiving === true,
         readPreserveKeys: () =>
           resolveSessionMaintenancePreserveKeys({
             store,
@@ -267,6 +266,9 @@ export function executeSessionActorMemoryEntryCommand(
         writeBase,
         sessionKey,
         operation: command.input.operation,
+        onLifecycleProjection: (effects) => {
+          context.entryPatchEffects = effects;
+        },
         preserveActivity: command.input.preserveActivity,
         replaceEntry: command.input.replaceEntry,
       });

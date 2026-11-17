@@ -2,12 +2,8 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import path from "node:path";
 import { cloneEnvWithPlatformSemantics } from "../config/config-env-vars.js";
 import { resolveStateDir } from "../config/state-dir.js";
-import { assertExistingDatabaseIdentity } from "../infra/sqlite-worker-identity.js";
 import { isStateDatabaseReadAdmissionInvalidatedError } from "./openclaw-state-db-async-lifecycle.js";
-import {
-  captureOpenClawStateDatabaseReadAdmission,
-  openClawStateDatabaseCache,
-} from "./openclaw-state-db-cache.js";
+import { captureOpenClawStateDatabaseReadAdmission } from "./openclaw-state-db-cache.js";
 import { resolveOpenClawStateSqlitePath } from "./openclaw-state-db.paths.js";
 import {
   captureOpenClawStateReadContextWithAdmission,
@@ -27,7 +23,6 @@ export function captureOpenClawStateReadContext(
   return captureOpenClawStateReadContextWithAdmission(
     pathname,
     captureOpenClawStateDatabaseReadAdmission,
-    openClawStateDatabaseCache.getKnownOpenClawStateDatabaseIdentity,
   );
 }
 
@@ -38,7 +33,6 @@ export function captureOpenClawStateReadWorkerContext(
   return captureOpenClawStateReadWorkerContextWithAdmission(
     options,
     captureOpenClawStateDatabaseReadAdmission,
-    openClawStateDatabaseCache.getKnownOpenClawStateDatabaseIdentity,
   );
 }
 
@@ -54,10 +48,7 @@ export function prepareOpenClawStateReadSource(input: { path: string; env?: Node
 
   const refresh = () => {
     original.maintenanceScope?.assertAdmission();
-    const identity = original.admission.identity;
-    if (identity.key.startsWith("file:")) {
-      assertExistingDatabaseIdentity(options.path, identity.key, identity.birthtime);
-    } else {
+    if (!original.admission.identity.key.startsWith("file:")) {
       original.admission.assertCurrent();
     }
     const next = captureOpenClawStateReadContext(options.path);
@@ -88,7 +79,6 @@ export function prepareOpenClawStateReadSource(input: { path: string; env?: Node
     return inSourceContext(refresh);
   };
   const prepareWorker = () => {
-    // Actual reads verify the file even when no local publication revoked its admission.
     const next = refresh();
     worker ??= captureOpenClawStateWorkerContext(options);
     if (worker.admission !== next.admission) {
@@ -111,6 +101,5 @@ export function captureOpenClawStateWorkerContext(
   return captureOpenClawStateWorkerContextWithAdmission(
     options,
     captureOpenClawStateDatabaseReadAdmission,
-    openClawStateDatabaseCache.getKnownOpenClawStateDatabaseIdentity,
   );
 }

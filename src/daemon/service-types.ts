@@ -205,8 +205,6 @@ export type SystemdGatewayInstallation =
 
 /** Bounded service inspection; strict reads reject unverified commands/environments and return null only for proven absence. */
 export type GatewayServiceReadOptions = {
-  /** Inspect state selectors and filesystem mapping before claiming separate state. */
-  inspectStateIdentity?: boolean;
   systemdReadTarget?: SystemdServiceReadTarget;
   systemdReadBinding?: SystemdServiceReadBinding;
   timeoutMs?: number;
@@ -216,6 +214,8 @@ export type GatewayServiceReadOptions = {
   /** Carry the command reader's verdict into runtime inspection without repeating it. */
   commandInspection?: GatewayServiceCommandInspection;
   onCommandInspection?: (inspection: GatewayServiceCommandInspection) => void;
+  /** Same-read native executable; separate from persisted argv and command fingerprints. */
+  onEffectiveExecutable?: (executable: string) => void;
   /** Command inspection must not load an unloaded native unit. */
   requireLoaded?: boolean;
   loadForInspection?: GatewayServiceUnitInspection;
@@ -298,8 +298,6 @@ export function assertServiceDefinitionWritable(capability: ServiceDefinitionMut
 }
 
 export type GatewayServiceCommandSnapshot = {
-  /** Missing environment or namespace facts cannot prove separate state. */
-  stateIdentityUnverified?: true;
   programArguments: string[];
   workingDirectory?: string;
   environment?: Record<string, string>;
@@ -335,6 +333,21 @@ export function hasGatewayServiceDefinitionOverrides(
   return command?.managedOverrides
     ? Object.keys(command.managedOverrides).length > 0
     : Boolean(command?.managedDefinition);
+}
+
+/** Rebinding and compensation rewrite the base, leaving inspected named overrides in place. */
+export function canPreserveGatewayServiceDefinitionOverrides(
+  command: GatewayServiceCommandConfig | null | undefined,
+): boolean {
+  return (
+    !hasGatewayServiceDefinitionOverrides(command) ||
+    Boolean(
+      command?.managedDefinition &&
+      command.managedOverrides &&
+      !hasGatewayServiceLauncherOverride(command) &&
+      resolveManagedGatewayServiceProcessEnv(command, {}) !== null,
+    )
+  );
 }
 
 /** Operator-owned launcher overrides cannot be repaired by rewriting the managed base. */
@@ -442,12 +455,13 @@ export type GatewayServiceState = {
   running: boolean;
   env: GatewayServiceEnv;
   command: GatewayServiceCommandConfig | null;
+  /** Operation-local observation, never persisted as service or recovery configuration. */
+  effectiveExecutable?: string;
   definitionMutationCapability?: ServiceDefinitionMutationCapability;
   runtime?: GatewayServiceRuntime;
 };
 
 export type GatewayServiceStartRepairIssue = {
-  code: "missing-program" | "port-mismatch" | "temporary-program";
   message: string;
 };
 

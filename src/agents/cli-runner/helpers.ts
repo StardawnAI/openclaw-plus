@@ -40,29 +40,9 @@ import { formatTomlConfigOverride } from "./toml-inline.js";
 
 const CLI_IMAGE_SWEEP_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 const sweptCliImageRoots = new Set<string>();
-const CALLER_SURFACE_TOOL_NAMES = new Set([
-  // This release line serves ordinary Claude file tools natively but mediates the
-  // same logical capabilities through loopback on internal completion turns.
-  "read",
-  "write",
-  "edit",
-  "ls",
-  "apply_patch",
-  "screen",
-  "show_widget",
-  "suggest_task",
-  "dismiss_task",
-]);
 
 export function isClaudeCliBackendId(providerId: string): boolean {
   return normalizeOptionalLowercaseString(providerId) === "claude-cli";
-}
-
-/** Exclude client-bound tools whose turn-to-turn availability must not reset the native CLI session. */
-export function cliSessionToolNames(tools: Iterable<{ name: string }>): string[] {
-  return Array.from(tools, (tool) => tool.name)
-    .filter((name) => !CALLER_SURFACE_TOOL_NAMES.has(name))
-    .toSorted();
 }
 
 export function resolveCliRunQueueKey(params: {
@@ -108,6 +88,7 @@ export function buildCliAgentSystemPrompt(params: {
     typeof buildConfiguredAgentSystemPrompt
   >[0]["preparedModelRuntime"];
   preparedGitCoauthorPrompt?: string;
+  preparedSessionEntry?: Parameters<typeof buildSystemPromptParams>[0]["preparedSessionEntry"];
   extraSystemPrompt?: string;
   sourceReplyDeliveryMode?: SourceReplyDeliveryMode;
   requireExplicitMessageTarget?: boolean;
@@ -142,6 +123,7 @@ export function buildCliAgentSystemPrompt(params: {
     workspaceDir: runtimeCwd,
     cwd: runtimeCwd,
     preparedGitCoauthorPrompt: params.preparedGitCoauthorPrompt,
+    preparedSessionEntry: params.preparedSessionEntry,
     requesterProfileId: params.requesterProfileId,
     runtime: {
       sessionKey: params.sessionKey,
@@ -157,6 +139,7 @@ export function buildCliAgentSystemPrompt(params: {
       chatType: params.runtimeChatType,
       capabilities: params.runtimeCapabilities,
       customInlineButtonHint: params.customInlineButtonHint,
+      blind: params.preparedSessionEntry?.blindPrompt,
     },
   });
   return buildConfiguredAgentSystemPrompt({
@@ -286,7 +269,7 @@ async function writeCliImages(params: {
   for (const image of params.images) {
     const fileName = resolveCliImageFileName(image);
     const buffer = Buffer.from(image.data, "base64");
-    await store.writeText(fileName, buffer);
+    await store.writeText(fileName, buffer, { durable: false });
     paths.push(store.path(fileName));
   }
   // Keep content-addressed image paths stable across Claude CLI runs so prompt
@@ -308,9 +291,10 @@ export async function writeCliSystemPromptFile(params: {
     rootDir: resolvePreferredOpenClawTmpDir(),
     prefix: "openclaw-cli-system-prompt-",
   });
-  const filePath = await workspace.write(
+  const filePath = await workspace.store.write(
     "system-prompt.md",
     stripSystemPromptCacheBoundary(params.systemPrompt),
+    { durable: false },
   );
   return {
     filePath,

@@ -16,7 +16,6 @@ import {
 } from "openclaw/plugin-sdk/provider-catalog-shared";
 import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-entry";
 import {
-  isReleasedAdaptiveClaudeGeneration,
   buildProviderReplayFamilyHooks,
   cloneFirstTemplateModel,
   modelCostsEqual,
@@ -30,6 +29,7 @@ import {
   resolveClaudeSonnet55ModelIdentity,
   resolveClaudeSonnet5ModelIdentity,
   supportsClaude1MContext,
+  supportsClaudeAdaptiveThinking,
   supportsClaudeNativeMaxEffort,
   supportsClaudeNativeXhighEffort,
 } from "openclaw/plugin-sdk/provider-model-shared";
@@ -48,7 +48,6 @@ import {
   normalizeAnthropicProviderConfigForProvider,
 } from "./config-defaults.js";
 import { resolveFastModeSupport } from "./fast-mode-policy.js";
-import { anthropicMediaUnderstandingProvider } from "./media-understanding-provider.js";
 import manifest from "./openclaw.plugin.json" with { type: "json" };
 import { createAnthropicAuthMethods, createAnthropicProvider } from "./provider-contract-api.js";
 import anthropicProviderDiscovery from "./provider-discovery.js";
@@ -312,16 +311,6 @@ function buildAnthropicForwardCompatModel(
   };
 }
 
-function resolveAnthropicForwardCompatModel(
-  ctx: ProviderResolveDynamicModelContext,
-): ProviderRuntimeModel | undefined {
-  return (
-    resolveAnthropicSnapshotModel(ctx) ??
-    resolveAnthropic4xForwardCompatModel(ctx) ??
-    buildAnthropicForwardCompatModel(ctx)
-  );
-}
-
 function isAnthropicMandatoryClaude5Model(modelId: string): boolean {
   return (
     resolveClaudeFable5ModelIdentity({ id: modelId }) !== undefined ||
@@ -369,7 +358,7 @@ function hasConfiguredModelOverride(
   override: "context" | "cost",
 ): boolean {
   const providers = config?.models?.providers;
-  if (!providers || typeof providers !== "object") {
+  if (!providers) {
     return false;
   }
   const normalizedProvider = normalizeLowercaseStringOrEmpty(provider);
@@ -377,22 +366,18 @@ function hasConfiguredModelOverride(
   return Object.entries(providers).some(
     ([providerId, providerConfig]) =>
       normalizeLowercaseStringOrEmpty(providerId) === normalizedProvider &&
-      Array.isArray(providerConfig?.models) &&
-      providerConfig.models.some(
+      providerConfig.models?.some(
         (model) =>
           normalizeLowercaseStringOrEmpty(model?.id) === normalizedModelId &&
           (override === "cost"
             ? model?.cost !== undefined
-            : (typeof model?.contextTokens === "number" && model.contextTokens > 0) ||
-              (typeof model?.contextWindow === "number" && model.contextWindow > 0)),
+            : (model.contextTokens ?? 0) > 0 || (model.contextWindow ?? 0) > 0),
       ),
   );
 }
 
 function matchesAnthropicModernModel(modelId: string): boolean {
-  return (
-    isReleasedAdaptiveClaudeGeneration({ id: modelId }) || isAnthropicMythosPreviewModel(modelId)
-  );
+  return supportsClaudeAdaptiveThinking({ id: modelId }) || isAnthropicMythosPreviewModel(modelId);
 }
 
 function normalizeAnthropicResolvedModel(
@@ -409,11 +394,9 @@ function normalizeAnthropicResolvedModel(
   if (exactContextWindow && !model.reasoning) {
     patch.reasoning = true;
   }
-  const imageRefs = [contractModelId, model.name].filter(
-    (value): value is string => typeof value === "string",
-  );
+  const imageRefs = [contractModelId, model.name];
   if (imageRefs.some(matchesAnthropicModernModel)) {
-    if (!Array.isArray(model.input) || !model.input.includes("image")) {
+    if (!model.input.includes("image")) {
       patch.input = ["text", "image"];
     }
     const sidePx = imageRefs.some((id) => supportsClaudeNativeXhighEffort({ id })) ? 2576 : 1568;
@@ -431,7 +414,7 @@ function normalizeAnthropicResolvedModel(
   if (
     model.maxTokensSource !== "configured" &&
     isAnthropic128kOutputModel(contractModelId) &&
-    !((model.maxTokens ?? 0) >= ANTHROPIC_MODERN_MAX_OUTPUT_TOKENS)
+    !(model.maxTokens >= ANTHROPIC_MODERN_MAX_OUTPUT_TOKENS)
   ) {
     patch.maxTokens = ANTHROPIC_MODERN_MAX_OUTPUT_TOKENS;
   }
@@ -473,9 +456,7 @@ function normalizeAnthropicResolvedModel(
       : Math.max(model.contextWindow ?? 0, fixedContextWindow);
     const contextTokens = exactContextWindow
       ? fixedContextWindow
-      : typeof model.contextTokens === "number"
-        ? Math.max(model.contextTokens, fixedContextWindow)
-        : fixedContextWindow;
+      : Math.max(model.contextTokens ?? fixedContextWindow, fixedContextWindow);
     if (contextWindow !== model.contextWindow || contextTokens !== model.contextTokens) {
       patch.contextWindow = contextWindow;
       patch.contextTokens = contextTokens;
@@ -610,7 +591,10 @@ export function buildAnthropicProvider(): ProviderPlugin {
       normalizeAnthropicProviderConfigForProvider({ provider, providerConfig }),
     applyConfigDefaults: ({ config, env }) => applyAnthropicConfigDefaults({ config, env }),
     resolveDynamicModel: (ctx) => {
-      const model = resolveAnthropicForwardCompatModel(ctx);
+      const model =
+        resolveAnthropicSnapshotModel(ctx) ??
+        resolveAnthropic4xForwardCompatModel(ctx) ??
+        buildAnthropicForwardCompatModel(ctx);
       if (!model) {
         return undefined;
       }
@@ -680,7 +664,15 @@ export function registerAnthropicPlugin(api: OpenClawPluginApi): void {
       return async (...args) => (await loadStream())(...args);
     },
   });
-  api.registerMediaUnderstandingProvider(anthropicMediaUnderstandingProvider);
+  api.registerMediaUnderstandingProvider({
+    id: "anthropic",
+    capabilities: ["image"],
+    defaultModels: { image: "claude-opus-5-5" },
+    autoPriority: { image: 20 },
+    nativeDocumentInputs: ["pdf"],
+    describeImage: undefined,
+    describeImages: undefined,
+  });
   registerClaudeSessionDiscovery(api);
   for (const policy of createClaudeSessionNodeInvokePolicies()) {
     api.registerNodeInvokePolicy(policy);

@@ -17,13 +17,6 @@ available from the package root and focused subpaths such as
 `@openclaw/ai/event-stream`, `@openclaw/ai/transports`, and
 `@openclaw/ai/validation`. No second OpenClaw runtime package is required.
 
-The Node package bundles the reachable OpenAI and `ws` runtime code to reduce
-startup module-file loading. Their licenses ship in `dist/openai.LICENSE` and
-`dist/ws.LICENSE`. Other provider SDKs and TypeBox retain their existing external
-dependency identities.
-OpenAI types resolve through the declared `openai` dependency, preserving its
-namespace aliases without flattening them into the bundled declarations.
-
 Provider ids, credentials, model catalogs, retries, and failover remain
 application concerns. OpenClaw supplies those policies around this package.
 Host policy (request fetch guarding, secret redaction, strict-tool defaults,
@@ -31,8 +24,11 @@ provider plugin hooks, and diagnostics logging) can be injected with
 `configureAiTransportHost`; the defaults are inert. Node callers that need
 runtime-local policy can use `createNodeLlmRuntime`; it preserves that host across
 provider work without replacing the process default. `createLlmRuntime` continues
-to use the process-default host. The default host and its asynchronous scope are
-shared across duplicate package module instances, including native plugins.
+to use the process-default host.
+
+Embedding hosts can implement optional `isLogEnabled(subsystem, level)` to skip
+diagnostic preparation for disabled sinks. Hosts without it retain emission-time
+filtering.
 
 OpenAI HTTP adapters report rejected response status and headers through
 `onResponse` before consuming the error body. Successful streaming responses
@@ -51,7 +47,13 @@ supports input progress; completed tool calls retain only parsed `arguments`.
 It is the live block, not a per-event snapshot: a consumer that lags behind the
 producer reads the latest value, or none once the call has finished.
 
-The explicit `@openclaw/ai/internal/anthropic`, `google-model-family`, `openai`,
+The Anthropic and Mistral adapters report unreadable tool descriptors as
+a stream error before sending a model request rather than silently omitting them.
+The pinned Mistral SDK chat client is bundled into the adapter; consumers do not
+need the SDK's full package tree. The SDK's Apache-2.0 license ships as
+`dist/mistral.LICENSE`.
+
+The explicit `@openclaw/ai/internal/anthropic`, `google`, `google-model-family`, `openai`,
 `openai-completions-compat`, `openai-responses-payload-policy`, `retry-after`, `runtime`, `shared`, and
 `tool-schema` subpaths exist for the OpenClaw application itself.
 They carry no semver guarantee and can change or disappear in any release; do

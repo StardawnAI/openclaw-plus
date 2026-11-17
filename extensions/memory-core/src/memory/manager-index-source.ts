@@ -15,13 +15,11 @@ export async function readMemoryIndexSource({
   absolutePath,
   workspaceDir,
   source,
-  suppliedContent,
   memoryFiles,
 }: {
   absolutePath: string;
   workspaceDir: string;
   source: MemorySource;
-  suppliedContent?: string;
   memoryFiles?: MemoryWorkspaceFiles;
 }) {
   const remoteRead =
@@ -46,7 +44,6 @@ export async function readMemoryIndexSource({
     readSource: remoteRead,
   });
   const content =
-    suppliedContent ??
     remoteRead?.content ??
     (await retryTransientMemoryRead(
       () => fs.readFile(absolutePath, "utf-8"),

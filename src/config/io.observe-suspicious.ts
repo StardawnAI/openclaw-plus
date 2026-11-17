@@ -24,7 +24,7 @@ function isUpdateChannelOnlyRoot(value: unknown): boolean {
 const inheritedAnomalyReason = "inherited-config-anomaly";
 
 export function createInheritedConfigAnomalySignature(hash: string): string {
-  return hash + ":" + inheritedAnomalyReason;
+  return `${hash}:${inheritedAnomalyReason}`;
 }
 
 export function resolveConfigObserveSuspiciousReasons(params: {
@@ -50,7 +50,7 @@ export function resolveConfigObserveSuspiciousReasons(params: {
   if (baseline.gatewayMode && isUpdateChannelOnlyRoot(params.parsed)) {
     reasons.push("update-channel-only-root");
   }
-  // Accepted edits do not repair input data loss merely by restoring its shape.
+  // Metadata stamping can conceal the original loss without restoring user data.
   if (
     reasons.length === 0 &&
     params.hash &&

@@ -4,6 +4,7 @@ import { resolveStateDir } from "../config/paths.js";
 import { formatErrorMessage, toErrorObject } from "../infra/errors.js";
 import { createSqliteReadOnlyWorkerScope } from "../infra/sqlite-readonly-worker.js";
 import type { AgentDatabaseMigrationTarget } from "../infra/state-migrations.media-persistence-targets.js";
+import { runWithDoctorMigrationBackup } from "../infra/update-doctor-migration-attribution.js";
 import {
   createUpdateDoctorDatabaseWriteCapture,
   DoctorMaintenanceRefusalError,
@@ -15,11 +16,13 @@ import {
   type OpenClawDatabaseMaintenanceScope,
 } from "../state/openclaw-state-db-async-lifecycle.js";
 import { closeOpenClawStateDatabaseByPathAsync } from "../state/openclaw-state-db-cache.js";
+import { isStatePostgres } from "../state/openclaw-state-db-engine.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { admitOpenClawMaintenanceLiveAuthorityReads } from "../state/openclaw-state-maintenance-context.js";
 import { assertDoctorAgentLeaseAdmission } from "./doctor-agent-lease-refusal.js";
 import { acquireDoctorGatewayMaintenanceOwner } from "./doctor-maintenance-foreground.js";
 import type { DoctorMaintenanceParams } from "./doctor-maintenance-types.js";
+import { captureFreshDoctorMigrationTables } from "./doctor-migration-backup.js";
 import { sanitizeDoctorNote } from "./doctor/emit-notes.js";
 
 /** Database custody can change paths while stopped-service custody remains with Doctor. */
@@ -54,6 +57,7 @@ export async function createDoctorMaintenanceState(options: {
     params.databaseWriteCapture ??
     createUpdateDoctorDatabaseWriteCapture(params.databaseGenerations, {
       env: selectedEnv,
+      pluginOwners: params.databasePluginOwners,
       root: params.root ?? undefined,
       signal: options.signal,
       assertCurrent: () => owner!.assertCurrent(options.assertCurrent),
@@ -136,9 +140,11 @@ export async function createDoctorMaintenanceState(options: {
   const settleCapture = async () => {
     if (owner && capture && captureAdmitted) {
       // Settle the original receipt keys before their canonical path can change.
-      owner.assertCurrent(options.assertCurrent);
-      await settle(() => capture.settle());
-      owner.assertCurrent(options.assertCurrent);
+      await settle(async () => {
+        owner!.assertCurrent(options.assertCurrent);
+        await capture.settle();
+        owner!.assertCurrent(options.assertCurrent);
+      });
       captureAdmitted = false;
     }
   };
@@ -154,6 +160,7 @@ export async function createDoctorMaintenanceState(options: {
       resourcesParent = getOpenClawDatabaseMaintenanceScope();
       resources = createOpenClawDatabaseMaintenanceScope({
         schemaMaintenance: true,
+        sqliteIntegrityCheck: params.options.fullIntegrityCheck ? "full" : "quick",
         assertDatabaseAccess: acquired.assertDatabaseAccess,
         assertOwnerCurrent: (access) => {
           acquired.assertCurrent(() => {
@@ -177,9 +184,10 @@ export async function createDoctorMaintenanceState(options: {
       throw error;
     }
     if (capture && !captureAdmitted) {
-      acquired.assertCurrent(options.assertCurrent);
-      await settle(() => resources!.run(() => capture.admit()));
-      acquired.assertCurrent(options.assertCurrent);
+      await settle(async () => {
+        await resources!.run(() => capture.admit());
+        acquired.assertCurrent(options.assertCurrent);
+      });
       captureAdmitted = true;
     }
   };
@@ -213,7 +221,13 @@ export async function createDoctorMaintenanceState(options: {
     },
     run<T>(operation: () => T): T {
       // Cancellation stops read-only inspections; admitted writers retain their resource scope.
-      return resources!.run(() => inspections!.run(operation));
+      return resources!.run(() =>
+        inspections!.run(() =>
+          runWithDoctorMigrationBackup(captureFreshDoctorMigrationTables, () =>
+            capture ? capture.run(operation) : operation(),
+          ),
+        ),
+      );
     },
     async acquire(assertAdmission?: () => void) {
       assertAdmission?.();
@@ -233,6 +247,7 @@ export async function createDoctorMaintenanceState(options: {
           assertCurrent: options.assertCurrent,
           assertAdmission,
           deadlineMs: options.deadline(),
+          signal: options.signal,
         },
       );
       await enterResources(acquired, assertAdmission);
@@ -247,10 +262,14 @@ export async function createDoctorMaintenanceState(options: {
         assertAdmission?.();
         resources!.assertAdmission();
       }
-      resources!.run(() =>
-        admitOpenClawMaintenanceLiveAuthorityReads(resolveOpenClawStateSqlitePath(selectedEnv)),
-      );
-      liveAuthorityReadsAdmitted = true;
+      // An idle captured WAL must retain its commit header until native migration
+      // custody. Current authority stays on fresh private snapshots before then.
+      if (!capture || isStatePostgres()) {
+        resources!.run(() =>
+          admitOpenClawMaintenanceLiveAuthorityReads(resolveOpenClawStateSqlitePath(selectedEnv)),
+        );
+        liveAuthorityReadsAdmitted = true;
+      }
       const { prepareLegacyStateDirMigration } =
         await import("../infra/state-migrations.state-dir.js");
       const pending = resolvePendingLegacyStateDirMigrationPaths({ env });
@@ -283,7 +302,7 @@ export async function createDoctorMaintenanceState(options: {
       await state.acquire(assertAdmission);
       if (migration) {
         const { loadDotEnv } = await import("../infra/dotenv.js");
-        loadDotEnv({ quiet: true });
+        loadDotEnv();
         const result = migration.result;
         for (const change of [...result.changes, ...(result.notices ?? [])]) {
           params.runtime.log(sanitizeDoctorNote(change));
@@ -311,6 +330,7 @@ export async function createDoctorMaintenanceState(options: {
             paths,
             stateDir,
             env: selectedEnv,
+            log: (message) => params.runtime.log(sanitizeDoctorNote(message)),
             assertCurrent: () => assertOwnerCurrent(databasePath),
           });
         });

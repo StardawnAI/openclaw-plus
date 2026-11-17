@@ -10,8 +10,7 @@ import WebKit
 @MainActor
 struct DashboardSameEndpointHTTPRecoveryTests {
     @Test func `successful same endpoint reconnect clears failed HTTP document`() async throws {
-        // This control channel resets the shared work store on reconnect and disconnect.
-        // Hold the same isolation scope as activity tests through transport cleanup.
+        // ControlChannel resets process-wide primary activity, including on disconnect.
         try await TestIsolation.withIsolatedState {
             _ = AppKitTestSupport.application
             let httpRecovered = LockIsolated(false)

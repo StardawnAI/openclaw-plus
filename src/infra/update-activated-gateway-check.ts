@@ -108,7 +108,7 @@ export async function checkActivatedGatewayStartup(params: {
   };
   const startup = observeUpdateCandidateStartup({ env: childEnv, stateDir });
   const running = launchCanary({
-    entry,
+    target: { kind: "cli", entryPath: entry },
     args: [
       "gateway",
       "run",

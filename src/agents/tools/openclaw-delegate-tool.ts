@@ -62,7 +62,6 @@ type DelegateToolOptions = Pick<
   | "currentThreadTs"
   | "agentThreadId"
   | "config"
-  | "readDelegationConfig"
   | "execSession"
   | "execOverrides"
   | "fsPolicy"
@@ -122,11 +121,10 @@ export function createOpenClawDelegateToolsForRun(
   const sessionKey = options.runSessionKey ?? options.agentSessionKey;
   const defaultSessionId = stableDelegationSessionId(sessionKey, options.sessionAgentId);
   const execPolicy = preparedExecDefaults ?? resolveExecDefaultsLegacy(execDefaultsParams(options));
-  const readConfig =
-    options.readDelegationConfig ??
-    (options.config ? createRuntimeConfigReader(options.config) : () => selectLiveRuntimeConfig());
-  // Containment is compared to the admitted tool projection, not a newer live policy snapshot.
-  const capturedConfig = options.config ?? readConfig();
+  const readConfig = options.config
+    ? createRuntimeConfigReader(options.config)
+    : () => selectLiveRuntimeConfig();
+  const capturedConfig = readConfig();
   const assertAutoApproveChangesCurrent = () => {
     options.abortSignal?.throwIfAborted();
     options.assertInvocationCurrent?.();
@@ -183,7 +181,7 @@ export function createOpenClawDelegateToolsForRun(
     if (permissionMode === "full" && execPolicy.security === "full" && execPolicy.ask === "off") {
       return;
     }
-    // Exec retains this admitted turn's configured surface and model ceilings.
+    // Exec retains this admitted turn's configured surface and restrictions.
     // Recheck its live host floors without retiring a write on its own config publication.
     if (
       !hasUnrestrictedGatewayExecution({
@@ -217,6 +215,7 @@ export function createOpenClawDelegateToolsForRun(
       "Delegate system setup or repair to a separate model turn. " +
       "Prefer your available tools for routine status and session/workspace checks. " +
       "Gateway restart, config, channels, plugins, agents, models/providers, API keys. " +
+      "Supports multiple named custom/local model endpoints; provider IDs can be user-defined, while api selects the protocol. " +
       "Setup flows use masked entry, which keeps keys out of model context; if the user already gave a key or token in chat, pass it along and OpenClaw stores it without echoing it. " +
       `Changes wait for the user to approve ${approvalLocation} unless current Full Access or a standing delegation grant permits application without asking for approval. Returns the final outcome.`,
     parameters: OpenClawDelegateSchema,

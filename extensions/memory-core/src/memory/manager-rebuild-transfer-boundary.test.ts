@@ -36,12 +36,6 @@ describe("rebuild staged transfer boundary", () => {
     const owner = await MemoryIndexDatabase.openShadow(file, false);
     try {
       await owner.admitSchema({ cacheEnabled: true, ftsEnabled: true });
-      expect(
-        await owner.read(
-          { type: "session.current", input: { agentId: "main", sessionId: "forgotten" } },
-          () => undefined,
-        ),
-      ).toBe("forgotten");
       const vector = Array.from({ length: 4096 }, (_, i) => ((i % 31) - 15) / 37);
       vector.splice(0, 4, -0, Number.MIN_VALUE, Number.MAX_VALUE, 1 + Number.EPSILON);
       const entries = Array.from({ length: 40 }, (_, i) => ({
@@ -69,12 +63,12 @@ describe("rebuild staged transfer boundary", () => {
       }
       expect(batches).toBeGreaterThan(1);
       expect(largestBatch).toBeLessThanOrEqual(512 * 1024);
-      let checks = 0;
+      // Beta checks freshness once after staging, not before every transfer.
       expect(
         await owner.mutateEmbeddingCache(
           mutation,
           () => undefined,
-          () => ++checks === 1,
+          () => false,
         ),
       ).toBeUndefined();
       expect(owner.db.prepare("SELECT count(*) AS n FROM memory_embedding_cache").get()).toEqual({

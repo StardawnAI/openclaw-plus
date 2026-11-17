@@ -42,7 +42,6 @@ export const sqliteWorkerOwnerProbe = {
       },
     };
   },
-
   admission(
     module: { createSqliteWorkerOperationAdmission: typeof createSqliteWorkerOperationAdmission },
     intercept: (...args: [...Parameters<Admit>, Admit]) => void,

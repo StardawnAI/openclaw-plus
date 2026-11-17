@@ -7,10 +7,7 @@ import type {
   CliBackendConfig,
   CliBackendResolveExecutionArgsContext,
 } from "openclaw/plugin-sdk/cli-backend";
-import {
-  applyExecPolicyLayer,
-  resolveExecModePolicy,
-} from "openclaw/plugin-sdk/exec-approvals-runtime";
+import { resolveExecModePolicy } from "openclaw/plugin-sdk/exec-approvals-runtime";
 import {
   normalizeOptionalLowercaseString,
   normalizeSortedUniqueTrimmedStringList,
@@ -134,11 +131,14 @@ function isOpenClawRequestedYolo(context: CliBackendResolveExecutionArgsContext)
   const agentExec = context.agentId
     ? resolveAgentConfig(context.config ?? {}, context.agentId)?.tools?.exec
     : undefined;
-  const exec = applyExecPolicyLayer(
-    applyExecPolicyLayer({ security: "full", ask: "off" } as const, context.config?.tools?.exec),
-    agentExec,
+  const exec = agentExec ?? context.config?.tools?.exec;
+  return (
+    resolveExecModePolicy({
+      mode: exec?.mode,
+      security: exec?.security ?? "full",
+      ask: exec?.ask ?? "off",
+    }).mode === "full"
   );
-  return resolveExecModePolicy(exec).mode === "full";
 }
 
 /** Keep filesystem settings user-scoped and normalize native permission flags together. */
@@ -419,7 +419,7 @@ function resolveClaudeCliRestrictedExecutionArgs(
     CLAUDE_NO_CHROME_ARG,
     CLAUDE_STRICT_MCP_CONFIG_ARG,
     CLAUDE_TOOLS_ARG,
-    availability.native.join(","),
+    [...availability.native, ...(availability.discovery ?? [])].join(","),
   );
   if (availability.openClaw.length > 0) {
     normalized.push(

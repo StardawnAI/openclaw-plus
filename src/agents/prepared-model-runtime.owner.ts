@@ -1,13 +1,13 @@
 import path from "node:path";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import {
-  createRuntimeConfigReader,
   getRuntimeConfigSnapshot,
   getRuntimeConfigSnapshotMetadata,
   hashRuntimeConfigValue,
 } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { captureRemoteModelCatalogStartupSnapshot } from "../model-catalog/remote-overlay.js";
+import { groupPluginRecords as groupRecords } from "../plugins/record-groups.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { isReservedSystemAgentId } from "../system-agent/agent-id.js";
 import {
@@ -20,18 +20,14 @@ import {
 } from "./harness/runtime-plugin-load-plan.js";
 import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
 import { preparePublishedModelCatalogOwnerIdentity } from "./prepared-model-catalog-owner.js";
+import { copyPreparedModelRuntimeAuthBindings } from "./prepared-model-runtime-auth.js";
 import {
-  bindPreparedModelRuntimeAuth,
-  copyPreparedModelRuntimeAuthBindings,
-  getPreparedModelRuntimePolicyConfigReader,
-} from "./prepared-model-runtime-auth.js";
-import {
-  groupBuildCandidates,
   startSerializedSnapshotBuildBatch,
   type PreparedModelRuntimeBuildResult,
 } from "./prepared-model-runtime.build.js";
 import {
   assertPreparedModelRuntimeInputCurrent,
+  capturePreparedModelRuntimeRefreshError,
   isPreparedModelRuntimePluginLifecycleFailure,
   PreparedModelRuntimeOwnerNotPublishedError,
   PreparedModelRuntimePublicationSupersededError,
@@ -67,11 +63,7 @@ function publishPreparedModelRuntimeOwnerSnapshot(
   owner: PreparedModelRuntimeOwner,
   snapshot: PreparedModelRuntimeSnapshot,
 ): PreparedModelRuntimeSnapshot {
-  const published = stampPreparedModelRuntimeSnapshotConfig(
-    snapshot,
-    owner.input.config,
-    owner.input.readPolicyConfig,
-  );
+  const published = stampPreparedModelRuntimeSnapshotConfig(snapshot, owner.input.config);
   if (owner.snapshot) {
     ownersBySnapshot.delete(owner.snapshot);
   }
@@ -101,10 +93,7 @@ export function prepareModelRuntimeOwner(
 ): PreparedModelRuntimeOwner {
   // Preparation precedes async discovery; neither an old nor unpublished snapshot owns these facts.
   return Object.assign(existing ?? { generation: 0, needsRefresh: true, catalogStale: false }, {
-    input: {
-      ...input,
-      readPolicyConfig: input.readPolicyConfig ?? createRuntimeConfigReader(input.config),
-    },
+    input,
     catalogOwner: preparePublishedModelCatalogOwnerIdentity(input),
     environmentFingerprint: effectiveEnvironmentFingerprint(input),
     catalogMode,
@@ -174,7 +163,6 @@ export function rebindInputToCommittedConfiguredOwner(
     ...(agentId ? { agentId } : {}),
     agentDir: owner.input.agentDir,
     config: owner.input.config,
-    readPolicyConfig: owner.input.readPolicyConfig,
     inheritedAuthDir: owner.input.inheritedAuthDir,
     env: owner.input.env,
     workspaceDir: preserveWorkspaceDir ? input.workspaceDir : owner.input.workspaceDir,
@@ -209,17 +197,12 @@ function modelRuntimeConfigFingerprint(config: OpenClawConfig): string {
 function stampPreparedModelRuntimeSnapshotConfig(
   snapshot: PreparedModelRuntimeSnapshot,
   config: OpenClawConfig,
-  readPolicyConfig: PreparedModelRuntimeInput["readPolicyConfig"],
 ): PreparedModelRuntimeSnapshot {
-  if (
-    snapshot.config === config &&
-    getPreparedModelRuntimePolicyConfigReader(snapshot) === readPolicyConfig
-  ) {
+  if (snapshot.config === config) {
     return snapshot;
   }
   const stamped = Object.freeze({ ...snapshot, config });
   copyPreparedModelRuntimeAuthBindings(snapshot, stamped);
-  bindPreparedModelRuntimeAuth(stamped, { readPolicyConfig });
   return stamped;
 }
 
@@ -242,12 +225,8 @@ export function normalizeOptionalDir(dirname: string | undefined): string | unde
 export async function prepareModelRuntimeInput(
   input: PreparedModelRuntimeInput,
 ): Promise<PreparedModelRuntimeInput> {
-  const preparedInput = {
-    ...input,
-    readPolicyConfig: input.readPolicyConfig ?? createRuntimeConfigReader(input.config),
-  };
   await prepareSharedAuthStoreOwnership(input.env);
-  return normalizePreparedModelRuntimeInput(preparedInput);
+  return normalizePreparedModelRuntimeInput(input);
 }
 
 export function normalizePreparedModelRuntimeInput(
@@ -463,7 +442,6 @@ export async function publishPreparedModelRuntimeOwnerBatch(
     providerDiscoveryTimeoutMs?: number;
     isPublicationCurrent?: () => boolean;
     isOwnerRegistered?: (key: string, owner: PreparedModelRuntimeOwner) => boolean;
-    isOwnerPublished?: (key: string, owner: PreparedModelRuntimeOwner) => boolean;
     isBuildCurrent?: () => boolean;
     onBuildStats?: (stats: PreparedModelRuntimeBuildStats) => void;
     registerEntriesAfterBuildStart?: boolean;
@@ -499,7 +477,6 @@ export async function publishPreparedModelRuntimeOwnerBatch(
       owner.generation === generation &&
       (params.isOwnerRegistered?.(key, owner) ?? params.owners.get(key) === owner);
     const isCurrent = () => (params.isPublicationCurrent?.() ?? true) && isGenerationCurrent();
-    const isPublished = params.isOwnerPublished;
     return {
       catalogMode: owner.catalogMode,
       input,
@@ -509,7 +486,6 @@ export async function publishPreparedModelRuntimeOwnerBatch(
       prepareInboundPluginRegistry: owner.provenance === "configured",
       inspectRegistry:
         owner.provenance === "run" || (owner.provenance === "ephemeral" && input.readOnly === true),
-      isPublished: isPublished ? () => isPublished(key, owner) : undefined,
       isGenerationCurrent,
       retirementSignal: capturePreparedModelRuntimeGeneration(owner),
       isBuildCurrent: params.isBuildCurrent ?? isCurrent,
@@ -533,14 +509,19 @@ export async function publishPreparedModelRuntimeOwnerBatch(
       owner,
     };
   });
-  const groups = groupBuildCandidates(candidates, (candidate) => candidate.catalogMode);
+  const groups = groupRecords(candidates, (candidate) => candidate.catalogMode);
   const results = new Map<PreparedModelRuntimeOwner, PreparedModelRuntimeBuildResult>();
   const publishCandidate = (candidate: (typeof candidates)[number]) => {
     if (!candidate.isCurrent()) {
       return;
     }
     const result = results.get(candidate.owner);
-    if (!result || candidate.owner.snapshot === result.snapshot) {
+    if (!result) {
+      throw new Error(
+        `prepared model runtime snapshot missing after auth refresh for ${candidate.input.agentDir}`,
+      );
+    }
+    if (candidate.owner.snapshot === result.snapshot) {
       return;
     }
     if (captureRemoteModelCatalogStartupSnapshot() !== catalogGeneration) {
@@ -635,15 +616,6 @@ export async function publishPreparedModelRuntimeOwnerBatch(
       if (!settleSingleOwner && candidate.owner.generation === candidate.generation) {
         candidate.owner.pendingPluginGeneration = undefined;
       }
-      if (!candidate.isCurrent()) {
-        continue;
-      }
-      const result = results.get(candidate.owner);
-      if (!result) {
-        throw new Error(
-          `prepared model runtime snapshot missing after auth refresh for ${candidate.input.agentDir}`,
-        );
-      }
       publishCandidate(candidate);
     }
     settleSingleOwner?.published(candidates[0]!.isCurrent);
@@ -660,17 +632,17 @@ export async function publishPreparedModelRuntimeOwnerBatch(
         continue;
       }
       candidate.owner.needsRefresh = true;
-      candidate.owner.refreshError = refreshError;
+      candidate.owner.refreshError = capturePreparedModelRuntimeRefreshError(refreshError);
       if (
         candidate.owner.provenance === "configured" &&
         !(refreshError instanceof PreparedModelRuntimePublicationSupersededError)
       ) {
         candidate.owner.catalogRecovery ??= {
-          error: refreshError,
+          error: candidate.owner.refreshError,
           scheduledAttempted: false,
           retryAfter: 0,
         };
-        candidate.owner.catalogRecovery.error = refreshError;
+        candidate.owner.catalogRecovery.error = candidate.owner.refreshError;
       }
     }
     settleSingleOwner?.failed(refreshError, candidates[0]!.isCurrent);

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyExecPolicyLayer } from "../plugin-sdk/exec-approvals-runtime.js";
+import { applyExecPolicyLayer } from "./exec-policy.js";
 
 describe("applyExecPolicyLayer", () => {
   it("preserves caller fields when applying a mode layer", () => {

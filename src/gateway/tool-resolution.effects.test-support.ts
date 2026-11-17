@@ -88,7 +88,6 @@ export function registerGatewayToolFinalEffectTests() {
         operatorApprovalOnly: true,
         surface: "gateway",
         verifiedInference: inference.binding,
-        deps: inference.deps,
         runAgentTurn: async () => ({ text: "Config verified." }),
       });
       const session: SystemAgentChatSession = {

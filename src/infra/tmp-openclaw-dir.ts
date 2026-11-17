@@ -23,8 +23,6 @@ export type ResolvePreferredOpenClawTmpDirOptions = {
   preferredDir?: string;
   /** Coordination addresses must stay shared across profiles and updater versions. */
   purpose?: "workspace" | "coordination";
-  /** Selected workspace state namespace; defaults to the current process state directory. */
-  stateDir?: string;
   tmpdir?: () => string;
   warn?: (message: string) => void;
 };
@@ -70,10 +68,7 @@ function assertSafeTempAncestors(
   const fs = process.getBuiltinModule("fs");
   const lstat = options.lstatSync ?? fs.lstatSync;
   // Supplied filesystem observations may describe virtual paths rather than host paths.
-  const canonicalRoot =
-    options.lstatSync && options.lstatSync !== fs.lstatSync
-      ? path.resolve(root)
-      : fs.realpathSync.native(root);
+  const canonicalRoot = options.lstatSync ? path.resolve(root) : fs.realpathSync.native(root);
   for (let directory = path.dirname(canonicalRoot); ; directory = path.dirname(directory)) {
     const stat = lstat(directory);
     if (stat.mode !== undefined && (stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) {
@@ -112,7 +107,7 @@ export function resolvePreferredOpenClawTmpDir(
   } catch (error) {
     rejected = error;
   }
-  const stateDir = options.stateDir ?? resolveStateDir();
+  const stateDir = resolveStateDir();
   try {
     const fallbackRoot = resolveRoot({
       ...rootOptions,

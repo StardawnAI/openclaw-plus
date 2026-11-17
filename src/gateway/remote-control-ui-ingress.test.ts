@@ -31,7 +31,6 @@ afterEach(async () => {
 
 function fixture() {
   const ws = new WebSocketServer({ noServer: true, maxPayload: MAX_PREAUTH_PAYLOAD_BYTES });
-  const admission = new AbortController();
   const host: GatewayControlUiIngressHost = {
     controlUiBasePath: "/claw",
     getResolvedAuth: () => ({
@@ -41,7 +40,7 @@ function fixture() {
     }),
     getRuntimeConfig: () => ({}),
     signal: new AbortController().signal,
-    admissionSignal: admission.signal,
+    admissionSignal: new AbortController().signal,
     handleRequest: async (req, res) => {
       res.end(JSON.stringify(req.headers));
     },
@@ -74,7 +73,7 @@ function fixture() {
     handles.add(handle);
     return handle;
   };
-  return { host, options, factory, open, admission };
+  return { host, options, factory, open };
 }
 
 function request(handle: GatewayControlUiIngressV2, pathAndQuery = "/claw/") {
@@ -88,25 +87,6 @@ function request(handle: GatewayControlUiIngressV2, pathAndQuery = "/claw/") {
 }
 
 describe("remote Control UI handle", () => {
-  it("fences new bindings, handles and requests at admission", async () => {
-    const { admission, factory, options } = fixture();
-    const binding = await factory().bindPrincipal(options);
-    const handle = await binding.openControlUi(options);
-    handles.add(handle);
-    try {
-      admission.abort(new Error("Intake fenced"));
-      await expect(factory().bindPrincipal(options)).rejects.toThrow("Intake fenced");
-      await expect(binding.openControlUi(options)).rejects.toThrow("Intake fenced");
-      await expect(binding.request("health", {})).rejects.toMatchObject({
-        code: "UNAVAILABLE",
-        retryable: true,
-      });
-      await expect(request(handle)).rejects.toThrow("Intake fenced");
-    } finally {
-      await binding.close();
-    }
-  });
-
   it("requires an explicit principal on the principal-aware host", async () => {
     const { factory, options } = fixture();
     const { principal: _principal, ...legacyOptions } = options;

@@ -8,10 +8,7 @@ import { captureSessionActorStorageOwner } from "./session-actor-storage-binding
 import { readSessionActorStorageResult } from "./session-actor-storage-result.js";
 import { shouldRemoveSessionEntry } from "./session-entry-lifecycle-removal.js";
 import { planSessionEntryMaintenance } from "./store-maintenance-plan.js";
-import {
-  assertMaintenancePreservationCompatible,
-  resolveSessionMaintenancePreserveKeys,
-} from "./store-maintenance-preserve-snapshot.js";
+import { resolveSessionMaintenancePreserveKeys } from "./store-maintenance-preserve-snapshot.js";
 import { prepareSessionMaintenancePreservation } from "./store-maintenance-preserve.js";
 import { resolveMaintenanceConfig } from "./store-maintenance-runtime.js";
 import {
@@ -44,8 +41,7 @@ export function applyMemorySessionEntryCleanup(
     ) {
       throw new Error("Memory bulk cleanup does not support SQLite repair or upsert callbacks");
     }
-    // cleanupArchivedTranscripts owns published disk archives. Removing a memory entry
-    // already discards its retained windows; archiving an entry preserves them.
+    // Removing a memory entry discards its retained windows; archiving preserves them.
     const empty: SessionEntryLifecycleMutationResult = {
       beforeCount: 0,
       removedEntries: 0,
@@ -74,7 +70,7 @@ export function applyMemorySessionEntryCleanup(
     try {
       preservation = params.skipMaintenance
         ? undefined
-        : await prepareSessionMaintenancePreservation(params.storePath);
+        : await prepareSessionMaintenancePreservation(params.storePath, { env: params.env });
       const beforeStore = Object.fromEntries(
         entries.map(({ sessionKey, entry }) => [sessionKey, entry]),
       );
@@ -101,13 +97,12 @@ export function applyMemorySessionEntryCleanup(
         ...resolveMaintenanceConfig(),
         ...params.maintenanceOverride,
       });
-      const snapshot = preservation?.capture();
-      if (snapshot && maintenance.mode !== "warn") {
+      if (preservation && maintenance.mode !== "warn") {
+        const snapshot = preservation.capture();
         planSessionEntryMaintenance({
           maintenance,
           initialUnarchivedCount: countUnarchivedSessionEntries(store),
           forceMaintenance: params.maintenanceOverride !== undefined,
-          deferArchiving: snapshot.deferArchiving === true,
           readPreserveKeys: () =>
             resolveSessionMaintenancePreserveKeys({
               store,
@@ -146,45 +141,21 @@ export function applyMemorySessionEntryCleanup(
                   captured.authority.assertCurrent();
                   assertSourceCurrent();
                   assertDeletionCurrent();
+                  preservation?.capture();
                 },
               },
               {
                 beforeCommit(receipt) {
                   params.beforeCommitInTransaction?.();
-                  if (snapshot && preservation) {
-                    const automaticRemovals = removals.filter(
-                      ({ sessionKey }) => !explicitKeys.has(sessionKey),
-                    );
-                    assertMaintenancePreservationCompatible(
-                      snapshot,
-                      preservation.refreshCandidates([
-                        ...archives.map(({ sessionKey }) => sessionKey),
-                        ...automaticRemovals.map(({ sessionKey }) => sessionKey),
-                      ]),
-                      [
-                        {
-                          archivedEntries: archives.map(({ sessionKey, entry }) => ({
-                            sessionKey,
-                            sessionId: entry.sessionId,
-                          })),
-                          entryRemovals: automaticRemovals.map(({ sessionKey, expected }) => ({
-                            sessionKey,
-                            expectedEntry: expected,
-                          })),
-                          stateDeletePlans: [],
-                        },
-                      ],
-                    );
-                  }
                   const removed = new Set(receipt.value.removedSessionKeys);
                   settlement = capture(
                     deletedEntries.filter(({ sessionKey }) => removed.has(sessionKey)),
                   );
-                  settlement.beforeCommit();
+                  return settlement.beforeCommit();
                 },
+                settled: (settledOutcome) => settlement?.settle(settledOutcome.kind),
               },
             );
-            settlement?.settle(outcome.kind);
             if (outcome.kind === "committed") {
               params.onLifecycleCommitted?.();
             }

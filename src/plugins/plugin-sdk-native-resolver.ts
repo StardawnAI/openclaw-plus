@@ -8,7 +8,6 @@ import { isPathInside, isPathStrictlyInside } from "../infra/path-guards.js";
 import { escapeRegExp } from "../shared/regexp.js";
 import {
   isPluginSourceModulePath,
-  supportsNativeModuleAliasHooks,
   useNodeModuleHooks,
   type BunPluginRuntime,
   type ResolveFilename,
@@ -30,7 +29,6 @@ type ModuleWithResolver = typeof Module & {
 
 /** Resolver install options for CJS `_resolveFilename` and modern ESM loader hooks. */
 type InstallOpenClawPluginSdkNativeResolverOptions = {
-  modulePath?: string;
   pluginModulePath?: string;
   allowedParentRoots?: readonly string[];
   argv1?: string;
@@ -64,6 +62,7 @@ const INTERNAL_CORE_PACKAGE_ALIASES = [
       ["types", "types.ts"],
       ["validation", "validation.ts"],
       ["internal/anthropic", path.join("internal", "anthropic.ts")],
+      ["internal/google", path.join("internal", "google.ts")],
       ["internal/google-model-family", path.join("internal", "google-model-family.ts")],
       ["internal/openai", path.join("internal", "openai.ts")],
       [
@@ -109,7 +108,7 @@ const BUN_NATIVE_ALIAS_FILTER = new RegExp(
 let installed = false;
 
 function resolveLoaderModulePath(options: InstallOpenClawPluginSdkNativeResolverOptions): string {
-  return options.modulePath ?? fileURLToPath(options.moduleUrl ?? import.meta.url);
+  return fileURLToPath(options.moduleUrl ?? import.meta.url);
 }
 
 function isNativeLoadableSdkTarget(targetPath: string): boolean {
@@ -252,7 +251,8 @@ function resolveHostSdkTargetForParentUrl(
   if (!parentUrl?.startsWith("file:")) {
     return undefined;
   }
-  // Core chunks share SDK modules with plugins without becoming plugin alias parents.
+  // Built core chunks share SDK imports with plugins, but are not plugin alias parents.
+  // Prepare only an existing SDK export imported from its adjacent host directory.
   const sdkRoot = path.dirname(filename);
   if (path.dirname(fileURLToPath(parentUrl)) !== path.dirname(sdkRoot)) {
     return undefined;
@@ -388,7 +388,7 @@ function installResolver(): void {
   }
   const previousResolveFilename = moduleWithResolver[nodeResolveFilenameProperty];
   // Packaged runtimes without aliases must retain the runtime's native resolution path.
-  if (!previousResolveFilename || !supportsNativeModuleAliasHooks()) {
+  if (!previousResolveFilename) {
     installed = Boolean(bun);
     return;
   }
@@ -404,9 +404,8 @@ function installResolver(): void {
           : nextResolve(specifier, context);
         if (context.conditions.includes("import") && resolved.url.startsWith("file:")) {
           const filename = fileURLToPath(resolved.url);
-          const sdkRequest = Array.from(getPluginCache().sdk.contexts.values()).some(
-            ({ sdkRoots }) => sdkRoots.includes(path.dirname(filename)),
-          )
+          const sdkRoot = path.dirname(filename);
+          const sdkRequest = getPluginCache().sdk.roots.has(sdkRoot)
             ? `openclaw/plugin-sdk/${path.basename(filename, path.extname(filename))}`
             : undefined;
           const pluginSdkTarget = isPluginSdkAliasSpecifier(specifier)
@@ -419,13 +418,13 @@ function installResolver(): void {
               ? resolveHostSdkTargetForParentUrl(sdkRequest, context.parentURL, filename)
               : undefined;
           const sdkTarget = pluginSdkTarget ?? hostSdkTarget;
-          // Built plugins and adjacent core chunks use relative SDK URLs. Match the alias before
+          // Built plugins use relative SDK URLs. Match the authorized host alias before
           // evaluation so later synchronous loads never inherit an uninstantiated job.
           if (sdkTarget && pathToFileURL(sdkTarget).href === resolved.url) {
             try {
               Module.createRequire(import.meta.url)(sdkTarget);
             } catch (error) {
-              // Only host-path imports may retain a native async-only ESM graph.
+              // Host-only async graphs remain valid ESM imports, even without a CJS consumer.
               if (!hostSdkTarget || !isRecord(error) || error.code !== "ERR_REQUIRE_ASYNC_MODULE") {
                 throw error;
               }

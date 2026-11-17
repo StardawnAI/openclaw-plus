@@ -8,15 +8,15 @@ import {
   prepareSessionGenerationFacts,
 } from "./session-delivery-generation.js";
 
+// A message edit or branch switch rotates the session id inside one incarnation; a reset
+// rotates the lifecycle revision. Stored references follow the first; live writers do not.
 it.each([
-  { row: "edited", followConversation: true, revision: "original", current: true },
-  { row: "reset", followConversation: true, revision: "original", current: false },
-  { row: "reset", followConversation: true, revision: null, current: true },
-  { row: "edited", followConversation: undefined, revision: "original", current: false },
-  { row: "reset", followConversation: undefined, revision: "original", current: false },
+  { row: "edited", exactTranscript: undefined, current: true },
+  { row: "reset", exactTranscript: undefined, current: false },
+  { row: "edited", exactTranscript: true, current: false },
 ] as const)(
-  "$row conversation current=$current for followConversation=$followConversation revision=$revision",
-  async ({ row, followConversation, revision, current }) => {
+  "a $row conversation is current=$current for exactTranscript=$exactTranscript",
+  async ({ row, exactTranscript, current }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
       const storePath = resolveOpenClawAgentSqlitePath({ agentId: "main", env: state.env });
       openOpenClawAgentDatabase({ agentId: "main", path: storePath, env: state.env });
@@ -29,8 +29,8 @@ it.each([
       const prepared = prepareSessionGenerationFacts({
         ...target,
         sessionId: "original-session",
-        lifecycleRevision: revision,
-        ...(followConversation ? { followConversation } : {}),
+        lifecycleRevision: "original",
+        ...(exactTranscript ? { exactTranscript } : {}),
       });
       if (!current) {
         await expect(prepared).rejects.toSatisfy(isSessionDeliveryGenerationRevokedError);

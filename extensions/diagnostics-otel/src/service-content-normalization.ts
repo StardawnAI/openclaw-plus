@@ -63,6 +63,18 @@ export function normalizeOtelContentValue(
   return safeJsonString(value, redact);
 }
 
+export function assignOtelContentAttr(
+  attributes: Record<string, string | number | boolean>,
+  key: string,
+  value: unknown,
+  redact?: OtelContentRedactor,
+): void {
+  const normalized = normalizeOtelContentValue(value, redact);
+  if (normalized) {
+    attributes[key] = normalized;
+  }
+}
+
 const TRUNCATED_JSON_TEXT_SUFFIX = "...(truncated)";
 const JSON_TRUNCATION_STRING_BUDGETS = [8192, 4096, 2048, 1024, 512, 256, 128, 64, 32] as const;
 const JSON_TRUNCATION_ARRAY_ITEM_BUDGETS = [

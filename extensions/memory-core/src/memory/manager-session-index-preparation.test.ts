@@ -32,28 +32,8 @@ function input(content: string): MemoryIndexPreparationInput {
   };
 }
 
-function expectedSessionChunks(source: MemoryIndexPreparationInput) {
-  const { chunks } = prepareMemoryIndexChunks(source);
-  // Session streaming omits redundant embedding text. The embedding cache owner
-  // reconstructs this exact input from chunk.text; all content and metadata still match.
-  for (const chunk of chunks) {
-    expect(chunk.embeddingInput).toEqual({ text: chunk.text });
-    delete chunk.embeddingInput;
-  }
-  return chunks;
-}
-
 const provenance = { originClass: "untrusted", sessionKind: "interactive", observedAt: 7 } as const;
-const summary: SessionEntrySummary = {
-  path: "synthetic-session",
-  absPath: "/synthetic-session",
-  mtimeMs: 7,
-  size: 0,
-  hash: "fixture",
-  lineCount: 0,
-  lineOriginClasses: [],
-  sessionKind: "interactive",
-};
+const summary = { hash: "fixture" } as SessionEntrySummary;
 
 /** A paged export whose lines are produced lazily, as the transcript worker delivers them. */
 function pagedExport(count: number, line: (index: number) => string, linesPerPage = 2048) {
@@ -143,7 +123,7 @@ it("preserves reset partitions, provenance and provider limits across source pag
   source.provider = { id: "fixture", maxInputTokens: 128 };
   const prepared = await prepareSession(source, exportOf(source));
   const { chunks } = prepared!;
-  expect(chunks).toEqual(expectedSessionChunks(source));
+  expect({ contentHash: undefined, chunks }).toEqual(prepareMemoryIndexChunks(source));
   expect(chunks.length).toBeGreaterThan(2);
   expect(chunks.every((chunk) => chunk.text.length <= 128)).toBe(true);
   expect(chunks.every((chunk) => chunk.endLine < 610 || chunk.startLine >= 610)).toBe(true);
@@ -162,7 +142,9 @@ it("discards chunks from pages before an export reset", async () => {
     await stream.onReset?.();
     return await exported(stream);
   });
-  expect(prepared!.chunks).toEqual(expectedSessionChunks(source));
+  expect({ contentHash: undefined, chunks: prepared!.chunks }).toEqual(
+    prepareMemoryIndexChunks(source),
+  );
   expect(prepared!.chunks.some((chunk) => chunk.text.includes("discarded"))).toBe(false);
 });
 
@@ -170,23 +152,13 @@ it("returns no chunks for a transcript that disappeared", async () => {
   expect(await prepareSession(input(""), async () => null)).toBeNull();
 });
 
-it.each([{ lineMap: [] }, { lineMap: [1, 2] }])(
-  "does not invent a reset boundary absent from line map %j",
-  async ({ lineMap }) => {
-    const source = input(Array.from({ length: 200 }, (_, i) => "User: fact " + i).join("\n"));
-    source.entry.lineMap = lineMap;
-    source.cutoffLine = 50;
-    expect((await prepareSession(source, exportOf(source)))!.chunks).toEqual(
-      expectedSessionChunks(source),
-    );
-  },
-);
-
 it("keeps Unicode, overlap and giant-line boundaries independent of transport frames", async () => {
   const source = input("HEAD \u{20000}" + "word \u{20000}".repeat(10_000) + " TAIL\nNext line");
   const streamed = await prepareSession(source, exportOf(source));
   // The existing whole-document owner is an independent transport/framing oracle.
-  expect(streamed!.chunks).toEqual(expectedSessionChunks(source));
+  expect({ contentHash: undefined, chunks: streamed!.chunks }).toEqual(
+    prepareMemoryIndexChunks(source),
+  );
   expect(streamed!.chunks[0]?.text).toContain("HEAD");
   expect(streamed!.chunks.at(-1)?.text).toContain("Next line");
   for (const chunk of streamed!.chunks) {

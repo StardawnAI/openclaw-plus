@@ -12,7 +12,6 @@ import {
   getLoadedRuntimePluginRegistry,
   registryContainsRuntimePluginIds,
 } from "./active-runtime-registry.js";
-import { normalizePluginsConfigWithResolverCore } from "./config-normalization-shared.js";
 import { normalizePluginsConfig, type NormalizedPluginsConfig } from "./config-state.js";
 import { getCurrentPluginMetadataSnapshot } from "./current-plugin-metadata-snapshot.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "./installed-plugin-index-install-records.js";
@@ -28,6 +27,7 @@ import {
   buildDeclaredProviderOwnerIndex,
   matchesDeclaredProviderOwner,
 } from "./provider-owner-index.js";
+import { projectRegisteredProvider } from "./provider-registration-projection.js";
 import {
   matchesProviderPluginRef,
   resolveProviderRuntimeWorkspaceDir,
@@ -47,8 +47,8 @@ import { getPluginRuntimeGatewayRequestScope } from "./runtime/gateway-request-s
 import { getPluginRuntimeGenerationRegistry } from "./runtime/generation-state.js";
 import {
   buildPluginRuntimeLoadOptions,
-  createPluginRuntimeLoaderLogger,
   getPluginRuntimeLoadContext,
+  pluginRuntimeLoaderLogger,
 } from "./runtime/load-context.js";
 import type { ProviderPlugin } from "./types.js";
 
@@ -219,7 +219,6 @@ export function createProviderRegistryResolver(dependencies: {
       includeUntrustedWorkspacePlugins: params.includeUntrustedWorkspacePlugins,
       registry: snapshot.index,
       manifestRegistry: snapshot.manifestRegistry,
-      normalizePluginId: snapshot.normalizePluginId,
     };
     const setup = params.mode === "setup";
     const explicitOwnerPluginIds = (
@@ -293,12 +292,11 @@ export function createProviderRegistryResolver(dependencies: {
         ...activation,
         workspaceDir: params.workspaceDir,
         env: params.env,
-        logger: createPluginRuntimeLoaderLogger(),
+        logger: pluginRuntimeLoaderLogger,
         manifestRegistry: snapshot.manifestRegistry,
         installRecords: extractPluginInstallRecordsFromInstalledPluginIndex(snapshot.index),
       },
       {
-        normalizePluginId: snapshot.normalizePluginId,
         registrationConfigOrigin:
           !setup && params.registryScope !== "exact" ? params.config : undefined,
         onlyPluginIds: selection.pluginIds,
@@ -422,26 +420,18 @@ export function createProviderRegistryResolver(dependencies: {
     const { inputs, snapshot } = prepared;
     let { loadOptions } = prepared;
     const { env, workspaceDir } = inputs;
-    const registrationKey = (normalizePluginId: PluginLoadOptions["normalizePluginId"]) => {
-      if (generationRegistry || params.config === undefined) {
-        return undefined;
-      }
+    let registrationConfigKey: string | undefined;
+    if (!generationRegistry && params.config !== undefined) {
       const registrationConfig = loadOptions ?? {
         config: params.config,
         activationSourceConfig: resolvePluginActivationSourceConfig(params),
       };
-      const normalize = normalizePluginId
-        ? (config: PluginLoadOptions["config"]) =>
-            normalizePluginsConfigWithResolverCore(config?.plugins, normalizePluginId)
-        : (config: PluginLoadOptions["config"]) => normalizePluginsConfig(config?.plugins);
-      return resolvePluginRegistrationConfigKey({
-        runtimeEntries: normalize(registrationConfig.config).entries,
-        sourceEntries: normalize(registrationConfig.activationSourceConfig).entries,
+      registrationConfigKey = resolvePluginRegistrationConfigKey({
+        runtimeEntries: normalizePluginsConfig(registrationConfig.config?.plugins).entries,
+        sourceEntries: normalizePluginsConfig(registrationConfig.activationSourceConfig?.plugins)
+          .entries,
       });
-    };
-    const registrationConfigKey = snapshot
-      ? registrationKey(snapshot.normalizePluginId)
-      : undefined;
+    }
     if (params.skipIfLoadInFlight && loadOptions && isPluginRegistryLoadInFlight(loadOptions)) {
       return undefined;
     }
@@ -475,7 +465,6 @@ export function createProviderRegistryResolver(dependencies: {
                 pluginIds: aliasOwners,
                 registry: snapshot.index,
                 manifestRegistry: snapshot.manifestRegistry,
-                normalizePluginId: snapshot.normalizePluginId,
               })
             : aliasOwners,
       };
@@ -537,17 +526,12 @@ export function createProviderRegistryResolver(dependencies: {
             return undefined;
           }
         }
-        // Loaded-only calls without metadata use this candidate's captured alias identity,
-        // never a fresh discovery or a resolver borrowed from another registry.
-        const requestedRegistrationKey = snapshot
-          ? registrationConfigKey
-          : registrationKey(context?.normalizePluginId);
         // Exact preparation may learn aliases here, but its owner load must still run.
         if (
           (!generationRegistry && params.registryScope === "exact") ||
           (context &&
-            requestedRegistrationKey !== undefined &&
-            requestedRegistrationKey !== context.registrationConfigKey)
+            registrationConfigKey !== undefined &&
+            registrationConfigKey !== context.registrationConfigKey)
         ) {
           continue;
         }
@@ -605,9 +589,7 @@ export function createProviderRegistryResolver(dependencies: {
       return [];
     }
     const { registry, onlyPluginIds } = resolved;
-    const project =
-      onSelectedRegistry?.(registry) ??
-      ((provider: ProviderPlugin, pluginId: string) => Object.assign({}, provider, { pluginId }));
+    const project = onSelectedRegistry?.(registry) ?? projectRegisteredProvider;
     return registry.providers
       .filter((entry) => !onlyPluginIds || onlyPluginIds.includes(entry.pluginId))
       .map((entry) => project(entry.provider, entry.pluginId));
