@@ -88,6 +88,7 @@ import { createGatewayCronPublisher } from "./server-cron-publication.js";
 import { createGatewayCronTargetResolver } from "./server-cron-targets.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
 import {
+  createSessionAutomationSource,
   registerSessionAutomationSource,
   unregisterSessionAutomationSource,
 } from "./session-automation-index.js";
@@ -120,7 +121,7 @@ export function buildGatewayCronService(params: {
   const webhookSsrfPolicy = mergeSsrFPolicies(params.cfg.cron?.webhookSsrfPolicy);
 
   const { resolveCronAgent, resolveCronTarget, deferSessionEvent, enqueueSessionEvent } =
-    createGatewayCronTargetResolver(env, cronLogger);
+    createGatewayCronTargetResolver(env, cronLogger, scheduledGatewayContextResolver);
 
   const defaultAgentId = tryResolveAmbientOwnerAgentId(params.cfg);
   const resolveSessionStorePath = (agentId?: string) =>
@@ -864,10 +865,7 @@ export function buildGatewayCronService(params: {
     });
     return stopPromise;
   };
-  const automationSource = {
-    getJobs: () => cron.getLoadedJobs(),
-    getDefaultAgentId: () => cron.getDefaultAgentId(),
-  };
+  const automationSource = createSessionAutomationSource(cron, cronEnabled);
   const stopCron = cron.stop.bind(cron);
   let stopped = false;
   let started = false;

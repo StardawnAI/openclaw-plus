@@ -7,7 +7,7 @@ import {
 import { freezeDiagnosticTraceContext } from "../../../infra/diagnostic-trace-context.js";
 import { formatErrorMessage } from "../../../infra/errors.js";
 import { classifyGatewayStorageFailure } from "../../../infra/sqlite-error-diagnostics.js";
-import type { AssistantMessage } from "../../../llm/types.js";
+import type { AssistantHistoryMessage } from "../../../llm/types.js";
 import { isTerminalAssistantError } from "../../../llm/utils/retry.js";
 import type { ProviderRouteOverridePresence } from "../../../plugin-sdk/provider-model-types.js";
 import {
@@ -51,6 +51,7 @@ import {
 import {
   DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT,
   DEFAULT_REASONING_ONLY_RETRY_LIMIT,
+  isRejectedBeforeDispatch,
   resolveNonVisibleTurnRetryInstructions,
   resolveSettledToolBatchEvidence,
   resolveSettledToolTerminalContinuation,
@@ -119,11 +120,10 @@ export function resolveSettledTurnFinalizationRequest(input: {
   settledTurnFinalizationAvailable: boolean;
   replyDeliveryState?: ReplyDeliveryState;
 }): string | null {
-  const terminalAssistant = resolveCurrentAttemptAssistant(input.attempt);
   if (
     !input.settledTurnFinalizationAvailable ||
     resolveReplyExpectation(input.runParams) === "optional" ||
-    isTerminalAssistantError(terminalAssistant) ||
+    isTerminalAssistantError(resolveCurrentAttemptAssistant(input.attempt)) ||
     (input.replyDeliveryState ?? "missing") !== "missing"
   ) {
     return null;
@@ -169,7 +169,7 @@ export async function resolveEmbeddedRunTerminal(input: {
   prepared: ReturnType<typeof prepareEmbeddedRunTerminal>;
   retryState: EmbeddedRunTerminalRetryState;
   attempt: EmbeddedRunAttemptResult;
-  attemptAssistant?: AssistantMessage;
+  attemptAssistant?: AssistantHistoryMessage;
   activeErrorContext: { provider: string; model: string };
   modelApi: string | undefined;
   executionContract: string | undefined;
@@ -244,7 +244,8 @@ export async function resolveEmbeddedRunTerminal(input: {
     replyExpectation === "result-required" && classifyAssistantTurn(terminalFacts).silent;
   const replyRecoverySuppressed =
     !authoredSilenceRequiresResult &&
-    (replyExpectation === "optional" ||
+    // Optional replies may be silent, but a rejected call is not authored silence.
+    ((replyExpectation === "optional" && !isRejectedBeforeDispatch(attempt)) ||
       emptyAssistantReplyIsSilent ||
       input.prepared.replyDeliveryState !== "missing");
   const replyRecoveryAllowed = !replyRecoverySuppressed && !settledTurnFinalizationAttempted;

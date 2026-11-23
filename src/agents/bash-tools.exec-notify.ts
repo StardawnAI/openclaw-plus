@@ -1,8 +1,14 @@
 /** Owns captured destinations and cancellation for background exec completion notifications. */
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
   captureSessionEventTargetForHost as captureSessionEventTarget,
   enqueueSessionEventForHost as enqueueSessionEvent,
 } from "../auto-reply/reply/session-event-handoff.js";
+import {
+  followSessionEventTargetForHost,
+  type SessionEventTargetFollow,
+} from "../auto-reply/reply/session-event-target.js";
+import { runWithoutOwnedSessionTranscriptWrites } from "../config/sessions/transcript-write-context-store.js";
 import {
   hasAgentRunContextExecutionOwner,
   listAgentRunsForSession,
@@ -10,6 +16,7 @@ import {
 import { formatErrorMessage } from "../infra/errors.js";
 import { resolveEventSessionKeyForPolicy } from "../infra/event-session-routing.js";
 import { readExecRequestOwners, withExecRequestOwners } from "../infra/exec-request-context.js";
+import { formatDurationCompact } from "../infra/format-time/format-duration.ts";
 import { withSystemEventOwner } from "../infra/system-event-ownership.js";
 import { enqueueSystemEventWithReceipt } from "../infra/system-events.js";
 import { logWarn } from "../logger.js";
@@ -18,17 +25,11 @@ import { isCronRunSessionKey, isSubagentSessionKey } from "../sessions/session-k
 import {
   processSessionInstanceId,
   recordNotifyOnExitRemoval,
-  tail,
   type ProcessSession,
 } from "./bash-process-registry.js";
-import {
-  appendExecTimeoutRetryGuidance,
-  compactNotifyOutput,
-  renderExecExitLabel,
-} from "./bash-tools.exec-output.js";
+import { appendExecTimeoutRetryGuidance, renderExecExitLabel } from "./bash-tools.exec-output.js";
 import { getGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
-const DEFAULT_NOTIFY_TAIL_CHARS = 400;
 function enqueueExecExitNotification(
   text: string,
   target: NonNullable<ProcessSession["notifySessionTarget"]>,
@@ -99,6 +100,58 @@ export function prepareExecExitNotification(
   );
 }
 
+/** A new conversation does not get the old command's wake; it gets a visible note instead. */
+async function withholdExecExitNotification(
+  session: ProcessSession,
+  target: NonNullable<ProcessSession["notifySessionTarget"]>,
+  followed: Exclude<SessionEventTargetFollow, { status: "current" }>,
+) {
+  const reason =
+    followed.status === "deleted"
+      ? "the conversation was deleted"
+      : "the conversation was reset, rewound or moved to a new session after the command started";
+  logWarn(`exec: completion ${session.id} withheld (${reason}); inspect the process result.`);
+  if (followed.status === "deleted") {
+    return;
+  }
+  const runId = `exec-withheld:${processSessionInstanceId(session)}`;
+  try {
+    // Transcript storage stays lazy: almost every completion is delivered.
+    const { appendSessionTranscriptReport } =
+      await import("../config/sessions/session-accessor.js");
+    const appended = await runWithoutOwnedSessionTranscriptWrites(() =>
+      appendSessionTranscriptReport(
+        {
+          agentId: target.agentId!,
+          sessionKey: target.sessionKey!,
+          storePath: target.storePath,
+          sessionId: followed.sessionId,
+          expectedLifecycleRevision: followed.lifecycleRevision,
+        },
+        {
+          kind: "custom",
+          customTypes: ["run-failed-before-reply"],
+          selectReport: (latest) =>
+            isRecord(latest?.details) && latest.details.runId === runId
+              ? undefined
+              : {
+                  customType: "run-failed-before-reply",
+                  display: true,
+                  excludeFromContext: true,
+                  content: `Background command result withheld (${session.id}, ${renderExecExitLabel(session)}): ${reason}. Its output stays in process log.`,
+                  details: { runId, processId: session.id },
+                },
+        },
+      ),
+    );
+    if (!appended.ok) {
+      throw new Error(`transcript refused the note: ${appended.error.code}`);
+    }
+  } catch (error) {
+    logWarn(`exec: completion ${session.id} withheld note failed (${formatErrorMessage(error)}).`);
+  }
+}
+
 export async function maybeNotifyOnExit(
   session: ProcessSession,
   status: "completed" | "failed",
@@ -125,10 +178,9 @@ export async function maybeNotifyOnExit(
   if (session.exitReason === "manual-cancel" && session.finalizationFailed !== true) {
     return;
   }
-  const exitLabel = renderExecExitLabel(session);
-  const output = compactNotifyOutput(
-    tail(session.tail || session.aggregated || "", DEFAULT_NOTIFY_TAIL_CHARS),
-  );
+  // The retained tail (last 2,000 chars) lets the woken turn act without process log.
+  const tail = session.tail;
+  const output = tail.trim();
   if (
     status === "completed" &&
     session.exitCode === 0 &&
@@ -137,9 +189,18 @@ export async function maybeNotifyOnExit(
   ) {
     return;
   }
-  const summary = output
-    ? `Exec ${status} (${session.id.slice(0, 8)}, ${exitLabel}) :: ${output}`
-    : `Exec ${status} (${session.id.slice(0, 8)}, ${exitLabel})`;
+  const header = `Exec ${status} (${session.id.slice(0, 8)}, ${renderExecExitLabel(session)}, ${
+    formatDurationCompact((session.endedAt ?? Date.now()) - session.startedAt) ?? "0s"
+  })`;
+  const summary = !output
+    ? `${header} with no output.`
+    : session.totalOutputChars > tail.length
+      ? `${header}, last ${tail.length} of ${session.totalOutputChars} output chars (${
+          session.totalOutputChars > session.aggregated.length
+            ? `process log keeps the last ${session.aggregated.length}; earlier output was discarded`
+            : "process log has the rest"
+        }):\n${output}`
+      : `${header}:\n${output}`;
   const eventText = appendExecTimeoutRetryGuidance(summary, session.exitReason);
   const eventSessionKey =
     session.notifySessionTarget?.sessionKey ??
@@ -160,10 +221,23 @@ export async function maybeNotifyOnExit(
       );
       return;
     }
+    const target = session.notifySessionTarget;
+    try {
+      const followed = await followSessionEventTargetForHost(target);
+      if (followed.status !== "current") {
+        await withholdExecExitNotification(session, target, followed);
+        return;
+      }
+    } catch (error) {
+      // Admission still checks the captured generation and refuses a stale one.
+      logWarn(
+        `exec: completion ${session.id} could not read its session (${formatErrorMessage(error)}).`,
+      );
+    }
     try {
       const receipt = enqueueExecExitNotification(
         eventText,
-        session.notifySessionTarget,
+        target,
         processSessionInstanceId(session),
         {
           ...eventOptions,

@@ -54,6 +54,8 @@ const targetScopes = resolveGlobalSingleton(
           authority: PreparedCommandOwnerAuthority;
           requester: CommandOwnerRequester;
         };
+        /** A scheduled job's recorded requester; see `requesterOwner` on capture. */
+        requesterOwner?: SessionEventRequesterOwner;
         deletion?: { agentId: string; isBlocked: () => boolean };
       }
     >(),
@@ -106,6 +108,12 @@ export async function captureSessionEventTargetForHost(
      * The identity comes from the host-owned caller, never from the producer.
      */
     retainRequesterOwner?: true;
+    /**
+     * The host names the work's originating requester from its own record (a scheduled
+     * job's requester). The turn holds owner tools only while `assertCurrent` passes; a
+     * requester without it is a known non-owner caller, so no session-principal fallback.
+     */
+    requesterOwner?: SessionEventRequesterOwner;
   } = {},
 ): Promise<SessionEventTarget> {
   const operatorAuthority = options.operatorAuthority;
@@ -232,10 +240,13 @@ export async function captureSessionEventTargetForHost(
     targetScopes.set(target, {
       env,
       operatorAuthority,
-      ...(callerAgentMatches &&
-      (resolveRequesterPrincipalKey(caller) || requesterCreatorProfileId(caller?.requesterOrigin))
+      ...(options.requesterOwner ||
+      (callerAgentMatches &&
+        (resolveRequesterPrincipalKey(caller) ||
+          requesterCreatorProfileId(caller?.requesterOrigin)))
         ? { hasOriginatingCaller: true as const }
         : {}),
+      ...(options.requesterOwner ? { requesterOwner: options.requesterOwner } : {}),
       ...(operatorAuthority && options.ownerContinuation ? { ownerContinuation: true } : {}),
       ...(requester?.messageProvider &&
       requester.senderId &&
@@ -281,6 +292,56 @@ export function assertSessionEventTargetCurrent(target: SessionEventTarget): voi
   if (deletion.isBlocked()) {
     throw new Error("Session event owner is being deleted");
   }
+}
+
+export type SessionEventTargetFollow =
+  | { status: "current" }
+  | { status: "deleted" }
+  | { status: "new-lifecycle"; sessionId: string; lifecycleRevision?: string };
+
+/**
+ * Move a retained target to its key's current row while the conversation is the same.
+ * The lifecycle revision identifies the conversation: compaction installs a new session
+ * id under the same revision. Reset, /new, rewind and branch switch mint a new revision,
+ * and delete removes the row. The target keeps its captured authority in all cases.
+ */
+export async function followSessionEventTargetForHost(
+  target: SessionEventTarget,
+): Promise<SessionEventTargetFollow> {
+  assertSessionEventTargetCurrent(target);
+  if (!target.sessionId || !target.agentId || !target.sessionKey || !target.storePath) {
+    // An absent origin stays pinned; admission decides about creation.
+    return { status: "current" };
+  }
+  const { withSessionEntryReadOnlyInWorker } =
+    await import("../../config/sessions/session-entry-read-runtime.js");
+  const entry = await withSessionEntryReadOnlyInWorker(
+    {
+      agentId: target.agentId,
+      storePath: target.storePath,
+      sessionKey: target.sessionKey,
+      env: targetScopes.get(target)?.env,
+    },
+    () => assertSessionEventTargetCurrent(target),
+    async (read) => {
+      if (!read.ok) {
+        throw read.error;
+      }
+      return read.value;
+    },
+  );
+  if (!entry?.sessionId) {
+    return { status: "deleted" };
+  }
+  if (entry.lifecycleRevision !== target.lifecycleRevision) {
+    return {
+      status: "new-lifecycle",
+      sessionId: entry.sessionId,
+      lifecycleRevision: entry.lifecycleRevision,
+    };
+  }
+  target.sessionId = entry.sessionId;
+  return { status: "current" };
 }
 
 /** Deferred producers retain snapshots; only admitted consumption holds live generation facts. */
@@ -398,6 +459,15 @@ export function readSessionEventTargetOperatorAuthority(
   return targetScopes.get(target)?.operatorAuthority;
 }
 
+/** A host-recorded requester; owner tools last only while `assertCurrent` passes. */
+export type SessionEventRequesterOwner = Readonly<{ assertCurrent?: () => void }>;
+
+export function readSessionEventTargetRequesterOwner(
+  target: SessionEventTarget,
+): SessionEventRequesterOwner | undefined {
+  return targetScopes.get(target)?.requesterOwner;
+}
+
 /** A captured channel guest still has a caller even without a profile grant. */
 export function hasSessionEventOriginatingCaller(target: SessionEventTarget): boolean {
   return Boolean(
@@ -461,6 +531,8 @@ export function combineSessionEventTargetsForHost(
         readSessionEventTargetOwnerContinuation(first) ||
       hasSessionEventOriginatingCaller(target) !== hasSessionEventOriginatingCaller(first) ||
       commandOwnerRequesterKey(target) !== commandOwnerRequesterKey(first) ||
+      readSessionEventTargetRequesterOwner(target) !==
+        readSessionEventTargetRequesterOwner(first) ||
       channelRouteDedupeKey(target.deliveryContext) !== route
     ) {
       throw new Error(
