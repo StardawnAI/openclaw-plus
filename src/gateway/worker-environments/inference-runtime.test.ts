@@ -5,6 +5,7 @@ import { WORKER_PROVIDER_REPLAY_MAX_DATA_BYTES } from "../../../packages/gateway
 import { validateWorkerInferenceTerminalOutcome } from "../../../packages/gateway-protocol/src/schema/worker-inference.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { bindAgentToolExecutionLocation } from "../../agents/agent-tool-metadata.js";
+import * as extraParamsRuntime from "../../agents/embedded-agent-runner/extra-params.js";
 import { createToolSurfacePresentationForTest } from "../../agents/tool-surface-plan.test-support.js";
 import { makeZeroUsageSnapshot } from "../../agents/usage.js";
 import { onTrustedInternalDiagnosticEvent } from "../../infra/diagnostic-events.js";
@@ -804,16 +805,30 @@ describe("worker inference provider runtime", () => {
   );
 
   it.each([
-    { name: "positive cost-only", tokens: false, cost: 0.25, billed: false },
-    { name: "billed zero", tokens: false, cost: 0, billed: true },
-    { name: "empty snapshot", tokens: false, cost: undefined, billed: false },
+    { name: "positive cost-only", tokens: false, cost: 0.25, billed: false, expected: 0.25 },
+    { name: "billed zero", tokens: false, cost: 0, billed: true, expected: 0 },
+    { name: "empty snapshot", tokens: false, cost: undefined, billed: false, expected: undefined },
+    { name: "placeholder with tokens", tokens: true, cost: 0, billed: false, expected: 0.0000257 },
   ])(
     "accounts for $name before rejecting a dangling streamed tool call",
-    async ({ tokens, cost, billed }) => {
-      const runtime = setup();
+    async ({ tokens, cost, billed, expected }) => {
+      const runtime = tokens
+        ? setup(sessionEntry, {
+            config: {
+              ...config,
+              models: {
+                providers: {
+                  [PROVIDER]: { baseUrl: BASE_URL, models: [logicalModel] },
+                },
+              },
+            },
+          })
+        : setup();
       const terminal = finalMessage();
-      terminal.usage = structuredClone(tokens ? usage : makeZeroUsageSnapshot());
-      terminal.usage.cost.total = cost ?? 0;
+      terminal.usage = {
+        ...(tokens ? usage : makeZeroUsageSnapshot()),
+        cost: { ...makeZeroUsageSnapshot().cost, total: cost ?? 0 },
+      };
       if (billed) {
         terminal.usage.cost.totalOrigin = "provider-billed";
       }
@@ -837,7 +852,14 @@ describe("worker inference provider runtime", () => {
         type: "error",
         reason: "provider-error",
       });
-      const expectedEvents = cost === undefined ? [] : [expect.objectContaining({ costUsd: cost })];
+      const expectedEvents =
+        expected === undefined
+          ? []
+          : [
+              expect.objectContaining({
+                costUsd: tokens ? expect.closeTo(expected, 12) : expected,
+              }),
+            ];
       expect(usageEvents).toEqual(expectedEvents);
       if (cost !== undefined && !tokens) {
         expect(usageEvents[0]).not.toHaveProperty("context.used");
@@ -879,7 +901,9 @@ describe("worker inference provider runtime", () => {
   });
 
   it("passes the admitted search capability to the provider and revokes it after prompt policy", async () => {
+    const applyStreamPolicy = extraParamsRuntime.applyExtraParamsToAgent;
     const runtime = setup();
+    runtime.applyStreamPolicy.mockImplementation(applyStreamPolicy);
     const searchTool = {
       name: "web_search",
       label: "Search",
@@ -904,12 +928,17 @@ describe("worker inference provider runtime", () => {
       }),
     });
     vi.spyOn(workerTurnOwners, "getWorkerTurnToolSurface").mockReturnValue(toolRuntime);
+    const execution = params(request(), vi.fn());
+    execution.sessionTarget = {
+      ...execution.sessionTarget,
+      sessionKey: "agent:runtime-agent:dashboard:1",
+    };
     try {
       for (const enabled of [true, false]) {
         if (!enabled) {
           toolRuntime.applyPromptToolsAllow([]);
         }
-        expect(await run(runtime)).toMatchObject({ type: "done" });
+        expect(await runtime.executor(execution)).toMatchObject({ type: "done" });
         expect(
           runtime.applyStreamPolicy.mock.lastCall?.[11]?.nativeWebSearchPolicyContext
             ?.webSearchEnabled,

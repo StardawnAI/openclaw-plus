@@ -22,6 +22,7 @@ import * as snapshots from "./sqlite-snapshot-source.js";
 import * as discoveryWorker from "./update-candidate-state.inspection.js";
 import { resolveUpdateCaptureRoot } from "./update-capture-paths.js";
 import { resolveManagedUpdateLeaseDatabasePath } from "./update-managed-service-handoff-lease.js";
+import * as backupReader from "./update-recovery-backup-reader.js";
 import { UPDATE_STATE_INSPECTION_PROGRESS_PREFIX } from "./update-state-inspection-protocol.js";
 import { captureRetainedNativeWorkerSource } from "./worker-native-lifecycle.js";
 
@@ -157,6 +158,23 @@ it("reuses a sealed standalone baseline only while the complete source is unchan
   expect(await f.capture(true), "explicit full integrity verification does not reuse").toHaveLength(
     3,
   );
+});
+
+it("rejects an ineligible retained capture before verifying its payloads", async () => {
+  const f = await fixture();
+  await f.capture();
+  const verifyPayloads = vi.spyOn(backupReader, "withVerifiedUpdateRecoveryBackup");
+  const reused = await findReusableDoctorCapture({
+    stateDir: f.stateDir,
+    installRoot: path.join(f.root, "different-install"),
+    env: { ...process.env },
+    assertCurrent() {},
+  });
+  expect(reused).toBeUndefined();
+  expect(
+    verifyPayloads,
+    "an ineligible capture must stream zero payload hashes",
+  ).not.toHaveBeenCalled();
 });
 
 it("rediscovers files, declared paths, config includes, links, permissions, and new agent databases", async () => {
@@ -413,4 +431,27 @@ it("treats the verification entry bound as a cache miss and still creates a fres
   await f.capture();
   expect(await f.reuse()).toBeUndefined();
   expect(await f.capture()).toHaveLength(2);
+});
+
+it("captures declared SQLite sidecar roots through their database image and reuses it", async () => {
+  const f = await fixture();
+  // Mirrors memory-core's legacy index declarations: the database plus every sidecar suffix.
+  const legacy = path.join(f.stateDir, "memory", "main.sqlite");
+  await fs.mkdir(path.dirname(legacy));
+  {
+    using db = new DatabaseSync(legacy);
+    db.exec("CREATE TABLE chunks (id INTEGER PRIMARY KEY); INSERT INTO chunks VALUES (1)");
+  }
+  const sidecars = ["-wal", "-shm", "-journal"].map((suffix) => `${legacy}${suffix}`);
+  f.resources.push(
+    { path: legacy, kind: "file" },
+    ...sidecars.map((sidecar) => ({ path: sidecar, kind: "file" as const })),
+  );
+  const first = await f.capture();
+  expect(first).toHaveLength(1);
+  const { ref } = await f.capturedFile(legacy, true);
+  const manifest = parseUpdateRecoveryBackupManifest(await fs.readFile(ref.manifestPath, "utf8"));
+  expect(manifest.roots).toContain(legacy);
+  expect(manifest.roots.filter((root) => sidecars.includes(root))).toEqual([]);
+  expect(await f.capture(), "an unchanged sidecar declaration reuses the baseline").toEqual(first);
 });

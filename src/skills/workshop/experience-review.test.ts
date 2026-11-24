@@ -104,15 +104,21 @@ function withAdmission(run: (assertCurrent: ReturnType<typeof activeAssertion>) 
     return completedReview;
   });
 }
-it.each(["success", "failure"])(
-  "cleans up system review diagnostics after %s without affecting the source",
-  async (outcome) => {
+it.each([
+  ["success", undefined],
+  ["failure", undefined],
+  ["success", 300],
+  ["failure", 300],
+] as const)(
+  "cleans up system review diagnostics after %s (timeoutSeconds=%s) without affecting the source",
+  async (outcome, timeoutSeconds) => {
     const foreground = { sessionId: candidate.source.sessionId };
     observe(foreground.sessionId);
     let reviewSessionId = "";
     mocks.runEmbeddedAgent.mockImplementation(async (params: ReviewParams) => {
       reviewSessionId = params.sessionId;
       expect(params.trigger).toBeUndefined();
+      expect(params.timeoutMs).toBe(timeoutSeconds === undefined ? 172_800_000 : 300_000);
       observe(reviewSessionId);
       if (outcome === "failure") {
         throw new Error("review provider failed");
@@ -120,6 +126,12 @@ it.each(["success", "failure"])(
       return completedReview;
     });
 
+    if (timeoutSeconds !== undefined) {
+      candidate.config.agents = {
+        ...candidate.config.agents,
+        defaults: { ...candidate.config.agents?.defaults, timeoutSeconds },
+      };
+    }
     const review = runSkillExperienceReview(candidate);
     await (outcome === "failure"
       ? expect(review).rejects.toThrow("review provider failed")
@@ -131,7 +143,7 @@ it.each(["success", "failure"])(
   },
 );
 
-it("yields an in-flight review when interactive work starts", async () => {
+it("keeps an in-flight review running when unrelated interactive work starts", async () => {
   const ownHandle = createEmbeddedRunHandle();
   const interactiveHandle = createEmbeddedRunHandle({ abort: vi.fn() });
   mocks.runEmbeddedAgent.mockImplementation(async (params: ReviewParams) => {
@@ -139,15 +151,15 @@ it("yields an in-flight review when interactive work starts", async () => {
     try {
       expect(params.abortSignal?.aborted).toBe(false);
       registerTestEmbeddedRun("interactive-session", interactiveHandle, "agent:other:interactive");
-      expect(params.abortSignal?.aborted).toBe(true);
+      expect(params.abortSignal?.aborted).toBe(false);
       expect(interactiveHandle.abort).not.toHaveBeenCalled();
-      return { meta: { durationMs: 1, aborted: true } };
+      return completedReview;
     } finally {
       clearTestEmbeddedRun("interactive-session", interactiveHandle);
       clearTestEmbeddedRun(params.sessionId, ownHandle);
     }
   });
-  await expect(runSkillExperienceReview(candidate)).rejects.toThrow("yielded to foreground");
+  await expect(runSkillExperienceReview(candidate)).resolves.toBeUndefined();
 });
 
 it("announces changes committed before the review run failed", async () => {

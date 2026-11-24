@@ -330,6 +330,12 @@ export function parseClaudeCliHistoryEntry(
   if ((type !== "user" && type !== "assistant") || role !== type) {
     return null;
   }
+  // Claude Code writes assistant-shaped lifecycle rows (aborted turns, harness
+  // errors) with a synthetic model marker. They are not replies: importing them
+  // renders them as assistant answers and feeds them back into resumed sessions.
+  if (type === "assistant" && entry.message.model === "<synthetic>") {
+    return null;
+  }
 
   const timestamp = parseDateStringTimestampMs(entry.timestamp);
   const externalId = normalizeOptionalString(entry.uuid);
@@ -444,8 +450,13 @@ export function parseClaudeCliHistoryEntry(
       api: "anthropic-messages",
       provider: CLAUDE_CLI_PROVIDER,
       ...(normalizeOptionalString(entry.message.model) ? { model: entry.message.model } : {}),
+      // Claude records `tool_use`; OpenClaw history uses the provider-neutral
+      // `toolUse`, which the Control UI reads to show narration as commentary.
       ...(normalizeOptionalString(entry.message.stop_reason)
-        ? { stopReason: entry.message.stop_reason }
+        ? {
+            stopReason:
+              entry.message.stop_reason === "tool_use" ? "toolUse" : entry.message.stop_reason,
+          }
         : {}),
       ...(usage ? { usage } : {}),
       ...(timestamp !== undefined ? { timestamp } : {}),

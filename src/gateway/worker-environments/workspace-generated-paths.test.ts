@@ -44,8 +44,13 @@ async function makeWorkspace(files: Record<string, string>) {
 const cacheRoots = [
   ".openclaw/tmp",
   ".local/share/pnpm/store",
+  ".openclaw/.pnpm-store",
   ".cache/openclaw/bun",
   ".cache/ms-playwright",
+  ".cache/convex/binaries",
+  ".local/share/NuGet/http-cache",
+  ".local/share/NuGet/v3-cache",
+  ".nuget/packages",
   ".cache/bun-transpiler",
   ".artifacts/vitest-worker-cache",
   ".artifacts/vitest-workers",
