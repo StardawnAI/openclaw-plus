@@ -33,6 +33,12 @@ RUN set -eux; \
     sed -i -E 's/"openclaw"[[:space:]]*:[[:space:]]*"workspace:[^"]+"/"openclaw": "*"/g' "$f"; \
   done
 
+# Patch: scripts/ui.mts publishes the Control UI build via fs.renameSync, which
+# throws EXDEV when dist/ straddles a device/mount boundary (observed on some
+# BuildKit/CI storage backends even for a rename within dist/). Fall back to a
+# copy+remove, mirroring Node's own recommended EXDEV handling for rename().
+RUN node -e "const fs=require('fs');const p='scripts/ui.mts';let s=fs.readFileSync(p,'utf8');const m='const delay = PUBLISH_RENAME_DELAYS_MS[attempt];';if(!s.includes(m)){throw new Error('rename retry marker not found; upstream ui.mts may have changed')};const fb='if (hasErrorCode(error, \"EXDEV\")) { fs.cpSync(from, to, { recursive: true }); fs.rmSync(from, { recursive: true, force: true }); return; }\n      '+m;s=s.replace(m,fb);fs.writeFileSync(p,s);"
+
 RUN pnpm install --no-frozen-lockfile
 RUN pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
