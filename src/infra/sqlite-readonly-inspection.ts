@@ -5,15 +5,16 @@ import {
   isSqliteReadOnlyError,
   readSourceJournalMode,
   readSourceSidecars,
+  requiresPrivateRollbackRecovery,
   SqliteSourceChangedError,
 } from "./sqlite-readonly-location.js";
+import { readSqliteSchemaCookie } from "./sqlite-schema-contract.js";
 import { withSqliteSourceReadDatabase } from "./sqlite-source-handle.js";
 
 /**
  * Inspect in a dedicated child: closing a source in the caller can release its POSIX locks.
- * `preserveSourceArtifacts` reads a complete WAL family through a read-only index without
- * changing database contents. SQLite may create an empty WAL if the last owner closes
- * before the read; unavailable families return undefined for the private snapshot owner.
+ * `preserveSourceArtifacts` reads only a complete WAL family, through a read-only index, so
+ * no source byte changes; any other family returns undefined for the private snapshot owner.
  */
 export function tryInspectSqliteReadOnlyInProcess<T>(
   pathname: string,
@@ -95,4 +96,19 @@ const SQLITE_CANTOPEN_RESULT_CODE = 14;
 
 function isSqliteCantOpenError(error: unknown): boolean {
   return sqlitePrimaryResultCode(error) === SQLITE_CANTOPEN_RESULT_CODE;
+}
+
+/** The isolated reader lets SQLite distinguish a hot journal from harmless residue. */
+export function requiresSqliteRollbackRecoveryInProcess(pathname: string): boolean {
+  return withSqliteSourceReadDatabase(pathname, "source", (database) => {
+    try {
+      readSqliteSchemaCookie(database);
+      return false;
+    } catch (error) {
+      if (!requiresPrivateRollbackRecovery(pathname, error)) {
+        throw error;
+      }
+      return true;
+    }
+  });
 }

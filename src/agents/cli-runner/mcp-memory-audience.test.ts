@@ -31,7 +31,6 @@ vi.mock("../../plugins/memory-state.js", () => ({
   resolveLoadedMemoryProviderKind: () => "native",
 }));
 
-import { sequenceCliCleanups } from "./cleanup.js";
 import { mintCliMcpClientGrant } from "./mcp-client-grant.js";
 import { resolveCliMcpMemoryAudience } from "./mcp-memory-audience.js";
 
@@ -107,11 +106,7 @@ describe("resolveCliMcpMemoryAudience", () => {
       admittedRunContext: await admission.admit("plugin-harness"),
     };
     const stable = mintMcpLoopbackClientGrant(params);
-    const { memoryAudience, release } = await resolveCliMcpMemoryAudience(turn.run, turn.grant);
-    using resources = new DisposableStack();
-    resources.defer(release);
-    const minted = mintCliMcpClientGrant({ ...params, memoryAudience });
-    const cleanup = sequenceCliCleanups(minted.cleanup, () => resources.dispose())!;
+    const minted = await mintCliMcpClientGrant(turn.run, "main", params);
     try {
       expect(fakeSessionOwner.activeLeases).toBe(1);
       expect(
@@ -129,14 +124,12 @@ describe("resolveCliMcpMemoryAudience", () => {
       await minted.cleanup();
       expect(activateMcpLoopbackClientGrantCapture(capture)).toBe(false);
       expect(resolved?.isCurrent()).toBe(false);
-      expect(fakeSessionOwner.activeLeases).toBe(1);
-      await cleanup();
       expect(fakeSessionOwner.activeLeases).toBe(0);
       expect(() => assertMemoryAudienceCurrent(audience)).toThrow("released");
-      await cleanup();
+      await minted.cleanup();
       expect(fakeSessionOwner.activeLeases).toBe(0);
     } finally {
-      await cleanup();
+      await minted.cleanup();
       revokeMcpLoopbackClientGrantsForRuntime(runtimeOwnerToken);
       admission.close();
     }

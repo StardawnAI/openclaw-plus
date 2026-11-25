@@ -11,7 +11,7 @@ import {
   splitTrailingDirective,
 } from "../auto-reply/reply/streaming-directives.js";
 import { readAutomationDisplayState } from "../infra/agent-run-registry.automation.js";
-import type { AssistantHistoryMessage } from "../llm/types.js";
+import type { AssistantMessage } from "../llm/types.js";
 import {
   parseAssistantTextSignature,
   readAssistantTextBlocksForPhase,
@@ -126,7 +126,7 @@ export function resolveAssistantStreamContentIndex(value: unknown): number | und
 }
 
 export function resolveAssistantStreamBlockIndex(
-  message: AssistantHistoryMessage,
+  message: AssistantMessage,
   contentIndex: number | undefined,
   itemId: string | undefined,
 ): number | undefined {
@@ -146,11 +146,11 @@ export function resolveAssistantStreamBlockIndex(
   return index >= 0 ? index : undefined;
 }
 
-export function scopeAssistantMessageToStreamBlock<T extends AssistantHistoryMessage>(
-  message: T,
+export function scopeAssistantMessageToStreamBlock(
+  message: AssistantMessage,
   contentIndex: number | undefined,
   itemId: string | undefined,
-): T {
+): AssistantMessage {
   const index = resolveAssistantStreamBlockIndex(message, contentIndex, itemId);
   if (index === undefined || !Array.isArray(message.content)) {
     return message;
@@ -167,7 +167,7 @@ export function scopeAssistantMessageToStreamBlock<T extends AssistantHistoryMes
 
 export function emitAssistantCommentaryStreamData(
   ctx: EmbeddedAgentSubscribeContext,
-  message: AssistantHistoryMessage,
+  message: AssistantMessage,
   finalMessage = false,
 ) {
   const isResponsesCommentary = isResponsesApiAssistantMessage(message);
@@ -423,7 +423,8 @@ export function createStreamingReplyResolver(): StreamingReplyResolver {
       text === undefined &&
       params.evtType !== "text_end" &&
       params.parsedStreamDirectives &&
-      params.parsedStreamDirectives.text === params.visibleDelta &&
+      hasDirectiveMarker &&
+      params.parsedStreamDirectives.text.trim() === params.visibleDelta.trim() &&
       params.appendDelta !== null &&
       params.previousCleaned &&
       params.previousText.length > params.previousCleaned.length &&

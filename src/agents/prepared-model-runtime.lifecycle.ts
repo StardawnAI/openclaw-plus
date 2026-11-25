@@ -19,20 +19,6 @@ export function capturePreparedModelRuntimeGeneration(
   return (owner.generationRetirement ??= new AbortController()).signal;
 }
 
-// Catalog callbacks retain this guard. Capture only its generation, not the batch's
-// previous catalog, candidates or transient publication callbacks.
-export function createPreparedModelRuntimeGenerationGuard(
-  owner: PreparedModelRuntimeOwner,
-  generation: number,
-  key: string,
-  owners: Map<string, PreparedModelRuntimeOwner>,
-  isOwnerRegistered?: (key: string, owner: PreparedModelRuntimeOwner) => boolean,
-): () => boolean {
-  return () =>
-    owner.generation === generation &&
-    (isOwnerRegistered?.(key, owner) ?? owners.get(key) === owner);
-}
-
 export function retirePreparedModelRuntimeGeneration(
   owner: Pick<PreparedModelRuntimeOwner, "generationRetirement">,
 ): void {
@@ -43,6 +29,29 @@ export function retirePreparedModelRuntimeGeneration(
     // Retained signals must not keep the retiring caller's lazy stack frames alive.
     void retirement.signal.reason.stack;
   }
+}
+
+// A remote catalog commit may replace rows without revoking the request's authority.
+// Key by the captured generation predicate, which catalog projections preserve.
+const catalogReplacements = new WeakMap<() => boolean, () => boolean>();
+
+export function recordPreparedModelCatalogReplacement(
+  previous: { isCurrent: () => boolean },
+  replacement: { isCurrent: () => boolean },
+): void {
+  catalogReplacements.set(previous.isCurrent, replacement.isCurrent);
+}
+
+export function hasCurrentPreparedModelCatalogReplacement(
+  owner: { isCurrent: () => boolean },
+  expected?: { isCurrent: () => boolean },
+): boolean {
+  const replacement = catalogReplacements.get(owner.isCurrent);
+  return (
+    !owner.isCurrent() &&
+    (!expected || expected.isCurrent === replacement) &&
+    replacement?.() === true
+  );
 }
 
 type ModelRuntimeClose = (error: Error) => Promise<void>;

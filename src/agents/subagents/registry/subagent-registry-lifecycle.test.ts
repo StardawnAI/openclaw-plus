@@ -5,6 +5,10 @@ import { getRuntimeConfig } from "../../../config/config.js";
 import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../../../config/io.js";
 import * as sessionAccessor from "../../../config/sessions/session-accessor.js";
 import { resolveSessionStorePathForScope } from "../../../config/sessions/session-store-path.js";
+import {
+  runWithOwnedSessionTranscriptWrite,
+  withOwnedSessionTranscriptWrites,
+} from "../../../config/sessions/transcript-write-context.js";
 import { LegacyContextEngine } from "../../../context-engine/legacy.js";
 import {
   listContextEngineQuarantines,
@@ -18,8 +22,6 @@ import {
   registerAgentRunContext,
   releaseAgentRunDelegatedAuthority,
 } from "../../../infra/agent-run-registry.js";
-import { PluginInstance } from "../../../plugins/plugin-instance.js";
-import { PluginInvocationScope } from "../../../plugins/plugin-invocation-scope.js";
 import { createEmptyPluginRegistry } from "../../../plugins/registry-empty.js";
 import { PluginRegistryInspectionResources } from "../../../plugins/registry-inspection-resources.js";
 import { retireInspectionInstances } from "../../../plugins/registry-inspection.test-support.js";
@@ -49,6 +51,7 @@ import {
 } from "../../cron-creator-authority-context.js";
 import { createEnteredGate } from "../../entered-gate.test-support.js";
 import { loadAgentRuntimePluginRegistryHandle } from "../../runtime-plugins.js";
+import { createRequesterTranscriptWriter } from "../../test-helpers/requester-transcript-writer.test-support.js";
 import { withGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { createStructuredOutputTool } from "../../tools/structured-output-tool.js";
 import type { SubagentAnnounceDeliveryResult } from "../announce/subagent-announce-dispatch.js";
@@ -69,9 +72,9 @@ import * as cleanupPolicy from "./subagent-registry-cleanup.js";
 import { createSubagentRegistryCompletionRuntime } from "./subagent-registry-completion-runtime.js";
 import { resolveSubagentKillTargetState } from "./subagent-registry-completion.js";
 import { createSubagentRegistryContextCleanup } from "./subagent-registry-context-cleanup.js";
-import { registerInvocationLifecycleCases } from "./subagent-registry-invocation.test-support.js";
 import { registerRequesterDatabaseAdmissionTests } from "./subagent-registry-lifecycle-admission.test-support.js";
 import {
+  registerCleanupBurstAuthorityTest,
   registerDetachedCleanupAuthorityTest,
   registerDeliveryRetryOwnerTests,
   registerDirectSessionCleanupAuthorityTests,
@@ -1923,6 +1926,7 @@ describe("subagent registry lifecycle hardening", () => {
 
   it("abandons a killed callback tail after success becomes canonical", async () => {
     const entry = createRunEntry({ expectsCompletionMessage: true });
+    const joinCleanup = observeRootWork();
     let releaseKilledTiming: (() => void) | undefined;
     helperMocks.persistSubagentSessionTiming
       .mockImplementationOnce(
@@ -1959,6 +1963,7 @@ describe("subagent registry lifecycle hardening", () => {
     );
     releaseKilledTiming?.();
     await Promise.all([killed, success]);
+    await joinCleanup();
 
     expect(readLifecycleRun(entry)).toMatchObject({
       endedReason: SUBAGENT_ENDED_REASON_COMPLETE,
@@ -3242,7 +3247,7 @@ describe("subagent registry lifecycle hardening", () => {
       expect(readLifecycleRun(entry).requesterSettleWake).toEqual(batch);
       expect(readLifecycleRun(entry).delivery).toMatchObject({
         status: "pending",
-        disposition: "intentional_non_delivery",
+        disposition: undefined,
       });
       expect(readLifecycleRun(entry).delivery?.lastError).toBeUndefined();
       expect(readLifecycleRun(entry).delivery?.nextAttemptAt).toBeUndefined();
@@ -3584,13 +3589,6 @@ describe("requester settle wake trigger", () => {
       .mockResolvedValue(undefined);
   });
 
-  registerInvocationLifecycleCases({
-    createRunEntry,
-    createLifecycleController,
-    completeRun,
-    finishCleanup,
-  });
-
   it.each(["completed", "stale-after-resolution", "restart-before-admission"] as const)(
     "owns context cleanup after its caller scope drains (%s)",
     async (mode) => {
@@ -3598,9 +3596,6 @@ describe("requester settle wake trigger", () => {
       await engineTest.resetContextEngineRuntimeQuarantineForTests();
       runtimeMocks.log.mockClear();
       const registry = createEmptyPluginRegistry();
-      const instance = new PluginInstance("detached-cleanup");
-      const invocationScope = new PluginInvocationScope(registry, [instance]);
-      const ordinaryCall = instance.wrap(() => {});
       const resources = new PluginRegistryInspectionResources(retireInspectionInstances);
       resources.attach(registry);
       const retire = vi.fn();
@@ -3617,14 +3612,12 @@ describe("requester settle wake trigger", () => {
         disposalStarted.resolve();
         await disposalGate.promise;
       });
-      const factory = vi.fn(
-        instance.wrap(async () => {
-          expect(getAsyncWorkSignal()?.aborted).toBe(false);
-          factoryStarted.resolve();
-          await factoryGate.promise;
-          return Object.assign(new LegacyContextEngine(), { onSubagentEnded, dispose });
-        }),
-      );
+      const factory = vi.fn(async () => {
+        expect(getAsyncWorkSignal()?.aborted).toBe(false);
+        factoryStarted.resolve();
+        await factoryGate.promise;
+        return Object.assign(new LegacyContextEngine(), { onSubagentEnded, dispose });
+      });
       registerContextEngineInRegistry(registry, "cleanup-owned", factory, "plugin:fixture");
       registerContextEngineInRegistry(registry, "legacy", () => new LegacyContextEngine(), "core");
       vi.mocked(getRuntimeConfig).mockReturnValue(
@@ -3655,9 +3648,7 @@ describe("requester settle wake trigger", () => {
         },
       });
       const caller = new AsyncWorkScope();
-      const continuation = caller.run(() =>
-        invocationScope.run(() => AsyncLocalStorage.snapshot()),
-      );
+      const continuation = caller.run(() => AsyncLocalStorage.snapshot());
       const suspension = tryBeginGatewaySuspendAdmission(() => {});
       expect(suspension?.commit()).toBe(true);
       try {
@@ -3668,8 +3659,6 @@ describe("requester settle wake trigger", () => {
         );
         // Admission is parked while the originating async owner becomes permanently closed.
         await caller.drain();
-        invocationScope.release();
-        expect(() => continuation(ordinaryCall)).toThrow("Plugin invocation scope is closed");
         expect(factory).not.toHaveBeenCalled();
         if (mode === "restart-before-admission") {
           markGatewayRestartDraining();
@@ -3716,11 +3705,42 @@ describe("requester settle wake trigger", () => {
         vi.mocked(loadAgentRuntimePluginRegistryHandle).mockReset();
         await engineTest.resetContextEngineRuntimeQuarantineForTests();
         resetGatewayWorkAdmission();
-        invocationScope.release();
-        await instance.dispose();
       }
     },
   );
+
+  it("runs a detached settle wake outside a disposed requester transcript owner", async () => {
+    const sessionKey = "agent:main:disposed-settle-wake-owner";
+    const entry = createRunEntry({ requesterSessionKey: sessionKey, endedAt: 4_000 });
+    let disposed = false;
+    const wakeReady = createDeferredCore();
+    const { requesterTranscriptWrite, withRequesterTranscriptWrite } =
+      createRequesterTranscriptWriter(() => disposed);
+    const freshTranscriptWrite = vi.fn(async () => {});
+    const settleWake = vi.fn(async () => {
+      await wakeReady.promise;
+      await runWithOwnedSessionTranscriptWrite({ sessionKey }, freshTranscriptWrite);
+      return false;
+    });
+    const controller = createLifecycleController({
+      entry,
+      maybeWakeRequesterAfterAllChildrenSettled: settleWake,
+    });
+
+    await withOwnedSessionTranscriptWrites(
+      { sessionKey, withTranscriptWrite: withRequesterTranscriptWrite },
+      async () => {
+        await finishCleanup(controller, entry);
+      },
+    );
+
+    disposed = true;
+    wakeReady.resolve();
+
+    await waitForLifecycleState(() => expect(freshTranscriptWrite).toHaveBeenCalledOnce());
+    expect(requesterTranscriptWrite).not.toHaveBeenCalled();
+    expect(settleWake).toHaveBeenCalledOnce();
+  });
 
   it.each(["replacement row", "newer child generation"])(
     "drops detached cleanup tails after a %s takes ownership",
@@ -4060,9 +4080,8 @@ describe("requester settle wake trigger", () => {
             path: "none",
             reason: "completion_handoff_pending",
             terminal: true,
-            disposition: "intentional_non_delivery",
           });
-          return "intentional_non_delivery" as const;
+          return "requester_waiting" as const;
         },
       );
       onTestFinished(seedResidentLifecycleRun(entry));
@@ -4082,8 +4101,8 @@ describe("requester settle wake trigger", () => {
       );
       expect(readLifecycleRun(entry).delivery).toMatchObject({
         status: "pending",
-        disposition: "intentional_non_delivery",
-        lastError: "completion_handoff_pending",
+        disposition: undefined,
+        lastError: undefined,
       });
       expect(readLifecycleRun(entry).delivery?.deliveredAt).toBeUndefined();
 
@@ -4250,9 +4269,8 @@ describe("requester settle wake trigger", () => {
           path: "none",
           reason: "completion_handoff_pending",
           terminal: true,
-          disposition: "intentional_non_delivery",
         });
-        return "intentional_non_delivery" as const;
+        return "requester_waiting" as const;
       },
     );
     let pendingDescendantRuns = 0;
@@ -4278,7 +4296,7 @@ describe("requester settle wake trigger", () => {
 
     expect(readLifecycleRun(entry).delivery).toMatchObject({
       status: "failed",
-      disposition: "intentional_non_delivery",
+      disposition: "permanent_failure",
       lastError: "requester settle wake attempts exhausted",
     });
     expect(readLifecycleRun(entry).requesterSettleWake).toBeUndefined();
@@ -4819,54 +4837,10 @@ describe("requester settle wake trigger", () => {
     }
   });
 
-  it("bounds a cleanup burst while retaining admitted work when admission closes", async () => {
-    resetGatewayWorkAdmission();
-    const entries = Array.from({ length: 130 }, (_, index) =>
-      createRunEntry({
-        runId: `bounded-cleanup-${index}`,
-        childSessionKey: `agent:main:subagent:bounded-cleanup-${index}`,
-        endedAt: 4_000,
-        expectsCompletionMessage: true,
-      }),
-    );
-    const runs = new Map(entries.map((entry) => [entry.runId, entry]));
-    const gate = createDeferredCore();
-    const started: string[] = [];
-    const announce = vi.fn(
-      async (params: Parameters<SubagentLifecycleOptions["runSubagentAnnounceFlow"]>[0]) => {
-        started.push(params.childSessionKey);
-        await gate.promise;
-        return "delivered" as const;
-      },
-    );
-    const controller = createLifecycleController({
-      entry: entries[0]!,
-      runs,
-      runSubagentAnnounceFlow: announce,
-    });
-    try {
-      for (const entry of entries) {
-        expect(controller.startSubagentAnnounceCleanupFlow(entry)).toBe(true);
-      }
-      await waitForLifecycleState(() => expect(announce).toHaveBeenCalledTimes(2));
-      await new Promise<void>((resolve) => {
-        setImmediate(resolve);
-      });
-      expect(started).toEqual(entries.slice(0, 2).map((entry) => entry.childSessionKey));
-      expect(getActiveGatewayRootWorkCount()).toBe(entries.length);
-      markGatewayRestartDraining();
-      gate.resolve();
-      await waitForLifecycleState(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
-      expect(started).toEqual(entries.map((entry) => entry.childSessionKey));
-      expect([...runs.values()].every((entry) => entry.cleanupCompletedAt !== undefined)).toBe(
-        true,
-      );
-    } finally {
-      gate.resolve();
-      await waitForLifecycleState(() => expect(getActiveGatewayRootWorkCount()).toBe(0));
-      controller.clearRuntimeState();
-      resetGatewayWorkAdmission();
-    }
+  registerCleanupBurstAuthorityTest({
+    createRunEntry,
+    createLifecycleController,
+    waitForLifecycleState,
   });
 });
 /* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

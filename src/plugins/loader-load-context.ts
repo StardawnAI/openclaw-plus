@@ -27,6 +27,7 @@ import { getPluginCache } from "./plugin-cache.js";
 import { resolvePluginDiscoveryContext } from "./plugin-control-plane-context.js";
 import { resolvePluginRuntimeArtifactPreference } from "./plugin-runtime-artifact-selection.js";
 import { normalizePluginIdScope } from "./plugin-scope.js";
+import { inheritPreparedSyntheticAuthScope } from "./provider-synthetic-auth.js";
 import { getPluginLoaderCacheState } from "./registry-lifecycle.js";
 import { getPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import { getActivePluginRegistry, getPluginRegistryForContext } from "./runtime.js";
@@ -382,6 +383,10 @@ export function resolvePluginLoadCacheContext(options: PluginLoadOptions = {}) {
   const capture = () => {
     if (!captured) {
       const cfg = captureRuntimeConfig(runtimeConfig);
+      // Raw substitution changes auth inputs; only policy/capture views inherit closed facts.
+      if (!shouldResolveRawConfigEnvVars) {
+        inheritPreparedSyntheticAuthScope(rawConfig, cfg);
+      }
       if (registrationGeneration !== undefined && cfg !== runtimeConfig) {
         // api.config reentry belongs to the load already registering this generation.
         runtimeBindingCacheIds.set(cfg, registrationGeneration);

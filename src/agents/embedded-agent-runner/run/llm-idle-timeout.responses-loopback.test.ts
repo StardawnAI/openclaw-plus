@@ -14,7 +14,6 @@ import { createSessionControllerWatchdog } from "../../../sessions/session-contr
 import { reserveTestPortListener } from "../../../test-utils/port-claims.js";
 import "../../../llm/ai-transport-host.js";
 import { resolveFailoverReasonFromError } from "../../failover-error.js";
-import { attachModelProviderRequestTransport } from "../../provider-request-config.js";
 import type { StreamFn } from "../../runtime/index.js";
 import { completionModel } from "../../simple-completion.test-support.js";
 import { createRetryController } from "./failover-retry-controller.test-support.js";
@@ -110,18 +109,15 @@ describe("Responses watchdog through the loopback transport", () => {
         }
       };
       bodyChunks.subscribe(onBodyChunk);
-      const model = attachModelProviderRequestTransport(
-        completionModel({
-          id: "synthetic-responses",
-          name: "Synthetic Responses",
-          api: "openai-responses",
-          provider: "openai",
-          baseUrl: `${origin}/v1`,
-          reasoning: true,
-          maxTokens: 256,
-        }),
-        { allowPrivateNetwork: true },
-      );
+      const model = completionModel({
+        id: "synthetic-responses",
+        name: "Synthetic Responses",
+        api: "openai-responses",
+        provider: "openai",
+        baseUrl: `${origin}/v1`,
+        reasoning: true,
+        maxTokens: 256,
+      });
       const runAbort = new AbortController();
       const base = createOpenAIResponsesTransportStreamFn();
       const onTimeout = vi.fn();
@@ -141,8 +137,7 @@ describe("Responses watchdog through the loopback transport", () => {
             ),
           ),
         );
-        const warmupResult = await within(warmup.result());
-        expect(warmupResult.stopReason, warmupResult.errorMessage).toBe("stop");
+        expect((await within(warmup.result())).stopReason).toBe("stop");
         received = "";
         exercising = true;
         vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });

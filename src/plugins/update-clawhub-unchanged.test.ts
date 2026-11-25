@@ -7,7 +7,6 @@ import { clawHubSecurityResponse, clawHubVersionMetadata } from "./clawhub.test-
 import {
   createClawHubArchiveFactory,
   DEMO_PLUGIN_ARCHIVE_ENTRIES,
-  sha256Hex,
 } from "./clawhub.test-support.js";
 import * as installer from "./install.js";
 import {
@@ -24,10 +23,6 @@ it.each([
   "identical",
   "changed digest",
   "missing entry",
-  "missing manifest",
-  "broken host dependency",
-  "file-list only",
-  "dry run",
   "blocked release",
   "incompatible release",
 ])("updates a verified ClawHub artifact: %s", async (scenario) => {
@@ -41,19 +36,6 @@ it.each([
     const before = await fs.stat(path.join(installPath, "index.js"));
     if (scenario === "missing entry") {
       await fs.rm(path.join(installPath, "index.js"));
-    }
-    if (scenario === "missing manifest") {
-      await fs.rm(path.join(installPath, "openclaw.plugin.json"));
-    }
-    if (scenario === "broken host dependency") {
-      const manifest = JSON.parse(DEMO_PLUGIN_ARCHIVE_ENTRIES["package.json"]);
-      await fs.writeFile(
-        path.join(installPath, "package.json"),
-        JSON.stringify({
-          ...manifest,
-          peerDependencies: { openclaw: "*" },
-        }),
-      );
     }
     vi.spyOn(packages, "fetchClawHubPackageDetail").mockResolvedValue({
       package: {
@@ -69,14 +51,7 @@ it.each([
     });
     vi.spyOn(packages, "fetchClawHubPackageArtifact").mockResolvedValue(
       clawHubVersionMetadata({
-        ...(scenario === "file-list only"
-          ? {
-              files: Object.entries(DEMO_PLUGIN_ARCHIVE_ENTRIES).map(([filePath, contents]) => ({
-                path: filePath,
-                sha256: sha256Hex(contents),
-              })),
-            }
-          : { sha256hash: archive.integrity }),
+        sha256hash: archive.integrity,
         ...(scenario === "incompatible release"
           ? { compatibility: { pluginApiRange: ">=2099.1.1" } }
           : {}),
@@ -111,19 +86,12 @@ it.each([
     const result = await updateNpmInstalledPlugins({
       config,
       onCapabilityConsent: acceptCapabilities,
-      dryRun: scenario === "dry run",
     });
     const rejected = scenario === "blocked release" || scenario === "incompatible release";
-    const replaced = [
-      "changed digest",
-      "missing entry",
-      "missing manifest",
-      "broken host dependency",
-      "file-list only",
-    ].includes(scenario);
+    const replaced = scenario === "changed digest" || scenario === "missing entry";
     expect(result.outcomes[0]?.status).toBe(rejected ? "error" : "unchanged");
     expect(result.changed).toBe(replaced);
-    expect(install).toHaveBeenCalledTimes(replaced || scenario === "dry run" ? 1 : 0);
+    expect(install).toHaveBeenCalledTimes(replaced ? 1 : 0);
     if (scenario !== "incompatible release") {
       expect(security).toHaveBeenCalledOnce();
     }

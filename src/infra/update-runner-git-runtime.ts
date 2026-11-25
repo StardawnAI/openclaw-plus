@@ -4,10 +4,11 @@ import path from "node:path";
 import { hasCommandProcessCleanupError } from "../process/exec-result.js";
 import { resolvePathViaExistingAncestorSync } from "./boundary-path.js";
 import { hasErrnoCode, isErrno } from "./errno.js";
-import { throwSettledAggregate } from "./error-graph-internal.js";
+import { settleWithCleanup, throwSettledAggregate } from "./error-graph-internal.js";
 import { formatErrorMessage } from "./errors.js";
 import type { PackageUpdateTransaction } from "./package-update-swap-contract.js";
 import { isPathInside } from "./path-guards.js";
+import { readBuiltGatewayBuildId } from "./update-git-runtime.js";
 import type { CommandRunner } from "./update-runner-types.js";
 import {
   readRuntimeModulesManifest,
@@ -320,8 +321,13 @@ export async function prepareGitRuntimePromotion(
       await relocateRuntimeTree(candidate, sourceRoot, destination, relocations);
     }
   } catch (error) {
-    await cleanup();
-    throw error;
+    return settleWithCleanup(
+      (async () => {
+        throw error;
+      })(),
+      cleanup,
+      "Git runtime preparation and cleanup failed.",
+    );
   }
   const assertParents = (entry: (typeof staged)[number]) => {
     const identities = entry.identities;
@@ -458,8 +464,11 @@ export function createGitRuntimeTransaction({
   promotion,
   assertRollbackSafe,
   restoreRuntime,
+  activation,
 }: {
   root: string;
+  /** The checked-out candidate commit and the build it replaced. */
+  activation?: { sha: string; previousBuildId: string | null };
   promotion: Pick<Awaited<ReturnType<typeof prepareGitRuntimePromotion>>, "backupRoot"> & {
     cleanup: (assertCurrent?: () => void) => Promise<UpdateStepResult | void>;
   };
@@ -479,6 +488,13 @@ export function createGitRuntimeTransaction({
   });
   const transaction: PackageUpdateTransaction = {
     backupRoot: promotion.backupRoot,
+    ...(activation && {
+      // Activation copies the candidate's build-info unchanged: this is the validated build.
+      readGitActivation: async () => {
+        const buildId = await readBuiltGatewayBuildId(root);
+        return buildId ? { ...activation, buildId } : undefined;
+      },
+    }),
     assertRollbackSafe,
     rollback: (assertCurrent) => {
       assertCurrent();
@@ -521,6 +537,17 @@ export function createGitRuntimeTransaction({
           return retired;
         }
         const snapshots = `${transaction.databaseBackupRoot}.databases`;
+        assertCurrent();
+        try {
+          // Server-side captures go first; their manifests stay until the drop succeeds.
+          await transaction.discardDatabaseCaptures?.();
+        } catch (error) {
+          assertCurrent();
+          return retention(
+            `Git verification succeeded; PostgreSQL capture cleanup remains pending at ${snapshots}: ${formatErrorMessage(error)}`,
+            true,
+          );
+        }
         assertCurrent();
         try {
           await fs.rm(snapshots, { recursive: true, force: true });

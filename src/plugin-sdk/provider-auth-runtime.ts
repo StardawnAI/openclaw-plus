@@ -262,21 +262,21 @@ function isHttpOrigin(value: string): boolean {
 }
 
 type ResolveApiKeyForProvider =
-  typeof import("../agents/model-auth-provider.js").resolveApiKeyForProviderCore;
+  typeof import("../agents/model-auth.js").resolveApiKeyForProviderCore;
 type GetRuntimeAuthForModel =
   typeof import("../plugins/runtime/runtime-model-auth.runtime.js").getRuntimeAuthForModelCore;
 
 /**
- * Resolves provider API-key auth without loading model-runtime preparation.
+ * Resolves provider API-key auth through the runtime auth module.
  */
 export async function resolveApiKeyForProvider(
-  /** Provider auth lookup params forwarded to the provider auth owner. */
+  /** Provider auth lookup params forwarded to the runtime auth module. */
   params: Parameters<ResolveApiKeyForProvider>[0],
 ): Promise<Awaited<ReturnType<ResolveApiKeyForProvider>>> {
   params.signal?.throwIfAborted();
-  const { resolveApiKeyForProviderCore } = await import("../agents/model-auth-provider.js");
+  const runtimeAuth = await import("../plugins/runtime/runtime-model-auth.runtime.js");
   params.signal?.throwIfAborted();
-  return resolveApiKeyForProviderCore(params);
+  return runtimeAuth.resolveProviderRuntimeApiKey(params);
 }
 
 /**

@@ -6,10 +6,18 @@ import type {
 import type { ImageContent } from "../../../packages/llm-core/src/types.js";
 import type { AnyAgentTool } from "../tools/common.js";
 
-export type AgentHarnessContextMedia = { text?: string; images: ImageContent[] };
+export type AgentHarnessContextMedia = {
+  text?: string;
+  images: ImageContent[];
+  /** User native-image sources, including intentionally suppressed or unavailable pixels. */
+  hasImageAttachments?: boolean;
+  /** User attachments are exclusively native images, even if restoration failed. */
+  imageOnly?: boolean;
+};
+/** maxChars=0 classifies the user source without hydrating attachment content. */
 export type AgentHarnessContextMediaRequest = { message: AgentMessage; maxChars: number };
 
-export type AgentHarnessHostApprovalResult = Readonly<{
+type AgentHarnessHostApprovalResult = Readonly<{
   decision: ApprovalDecision | null | undefined;
   terminalReason: ApprovalTerminalReason | null | undefined;
 }>;
@@ -178,6 +186,10 @@ export type AgentHarnessHostCapabilities = Readonly<{
   }>;
   /** Closure-bound non-secret maps prepared before harness placement. */
   preparedEnvironment?: () => AgentHarnessPreparedEnvironment;
+  /** Prepare disposable scratch only after selecting an admitted local execution root. */
+  prepareLocalExecScratch?: (
+    workspace: Readonly<{ cwd: string }>,
+  ) => Promise<Readonly<Record<"TMPDIR" | "TMP" | "TEMP", string>>>;
   /** Current bounded presence hint; physical activity does not identify the message source. */
   activeComputerContext?: () => string;
   /** Applies the exact host caller binding to a plugin-built tool surface. */
@@ -236,14 +248,3 @@ export type AgentHarnessHostCapabilities = Readonly<{
     signal?: AbortSignal;
   }) => Promise<AgentHarnessHostApprovalResult | undefined>;
 }>;
-
-export type HostToolSurfaceOptions = Parameters<
-  NonNullable<AgentHarnessHostCapabilities["createToolSurfaceAsync"]>
->[0];
-
-export type AgentHarnessHost = {
-  capabilities: AgentHarnessHostCapabilities;
-  close: () => void;
-  setInputAttachmentReadAllowed: (allowed: boolean) => void;
-  runWithScope: <T>(run: () => Promise<T>) => Promise<T>;
-};

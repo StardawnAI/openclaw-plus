@@ -86,12 +86,7 @@ it.each([
         requestParams: { sessionKey: fixture.target.sessionKey, agentId: "main" },
       });
       expect(auth.error).toBeNull();
-      const authorization = auth.authorization!;
-      const source = {
-        assertCurrent: () =>
-          (authorization.assertAdmittedInputCurrent ?? authorization.assertCurrent)(),
-        release: authorization.retain!(),
-      };
+      const source = auth.authorization!.retainForRun!();
       auth.authorization!.release?.();
       const sharingTarget = await resolveSessionSharingTargetAsync({
         cfg: ctx.getRuntimeConfig(),

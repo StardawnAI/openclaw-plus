@@ -131,12 +131,12 @@ it("persists current-run timing after pre-start failure and clears it on the nex
   let persistence = Promise.resolve();
   const unsubscribe = onAgentEvent((event) => {
     if (event.sessionKey === target.sessionKey && event.stream === "lifecycle") {
-      persistence = persistence.then(async () => {
-        await lifecycleState.persistGatewaySessionLifecycleEvent({
+      persistence = persistence.then(() =>
+        lifecycleState.persistGatewaySessionLifecycleEvent({
           sessionKey: target.sessionKey,
           event,
-        });
-      });
+        }),
+      );
     }
   });
   const createBackstop = (runId: string) =>
@@ -371,7 +371,7 @@ it.each(["success", "failed-write"])(
           return () => {
             const persistence = persist();
             if (params.event.runId === runId && params.event.data?.phase === "start") {
-              startPersisted.resolve(persistence.then(() => undefined));
+              startPersisted.resolve(persistence);
             }
             return persistence;
           };
@@ -600,7 +600,7 @@ it.for([
             expect.objectContaining({
               type: "custom_message",
               customType: "run-failed-before-reply",
-              content: "Your request couldn't be completed: Preparation failed",
+              content: "Your request couldn't be completed.",
               display: true,
               details: { runId, error: "Preparation failed" },
             }),

@@ -19,6 +19,7 @@ import * as modelPricing from "../model-catalog/pricing.js";
 import { closeAgentWorkAdmissions } from "../sessions/session-controller.lifecycle.js";
 import { sessionChanges, type SessionRowChange } from "../sessions/session-row-changes.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
+import { readGlobalSingleton } from "../shared/global-singleton.js";
 import type { SessionCostUsagePublication } from "../shared/usage-types.js";
 import {
   createAgentDatabaseInspectionRefusal,
@@ -75,10 +76,6 @@ const sessionFresh = (totalTokens: number) => ({
 });
 const timestamp = Date.parse("2026-09-18T12:00:00Z");
 const mainConfig = () => ({ agents: { entries: { main: {} } } });
-const topologyAgents = () => ({
-  ownership: "explicit" as const,
-  entries: { main: {}, alpha: {}, beta: {} },
-});
 
 function refuseStartup(agentId: string) {
   const refusal = createAgentDatabaseInspectionRefusal({
@@ -95,8 +92,7 @@ function observeProjection(config: Parameters<typeof costWindow>[0]) {
   const publications: SessionCostUsagePublication[] = [];
   sessionCostUsageNotifications.onUpdated = (event) => publications.push(event);
   const warn = vi.fn();
-  const lifetime = startProjection(config, warn);
-  return { publications, warn, lifetime };
+  return { publications, warn, lifetime: startProjection(config, warn) };
 }
 const startProjection = (config: Parameters<typeof costWindow>[0], warn = vi.fn()) =>
   startSessionCostUsageProjectionLifetime({ getConfig: () => config, warn });
@@ -131,8 +127,15 @@ function costWindow(config: Parameters<typeof loadCostUsageSummaryCached>[0]["co
 
 it.for(["discovery", "pricing", "scan admission"])(
   "aborts in-flight %s before joining the usage sidecar",
-  async (phase, { signal }) => {
-    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+  async (phase, { signal }) =>
+    withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const listeners = readGlobalSingleton(
+        Symbol.for("openclaw.internalSessionTranscriptListeners"),
+      );
+      if (!(listeners instanceof Set)) {
+        throw new Error("Transcript listener registry is unavailable");
+      }
+      const listenersBefore = listeners.size;
       const entered = createDeferred();
       const release = createDeferred();
       let releaseAdmission: (() => void) | undefined;
@@ -148,10 +151,16 @@ it.for(["discovery", "pricing", "scan admission"])(
           },
         );
       } else if (phase === "pricing") {
-        vi.spyOn(modelPricing, "prepareModelPricingContext").mockImplementationOnce(async () => {
-          entered.resolve();
-          await release.promise;
-        });
+        seedUsage("stop-during-pricing");
+        const prepare = modelPricing.prepareModelPricingContext;
+        vi.spyOn(modelPricing, "prepareModelPricingContext").mockImplementationOnce(
+          async (...args) => {
+            const result = await prepare(...args);
+            entered.resolve();
+            await release.promise;
+            return result;
+          },
+        );
       } else {
         seedUsage("stop-during-scan");
         const prepare = pricing.prepareUsageCostPricing;
@@ -165,21 +174,20 @@ it.for(["discovery", "pricing", "scan admission"])(
         });
       }
       const lifetime = startProjection(mainConfig());
-      let stopping: Promise<void> | undefined;
       try {
         await withinTest(entered.promise, signal);
         vi.useFakeTimers();
         const stopped = vi.fn();
-        stopping = lifetime.stop().then(stopped);
+        void lifetime.stop().then(stopped);
+        expect(listeners.size).toBe(listenersBefore);
         await vi.advanceTimersByTimeAsync(100);
         expect(stopped).toHaveBeenCalledOnce();
       } finally {
         release.resolve();
         releaseAdmission?.();
-        await (stopping ?? lifetime.stop());
+        await lifetime.stop();
       }
-    });
-  },
+    }),
 );
 
 it("keeps usage backfill and all-agent totals available while another agent's deletion drains", async ({
@@ -462,7 +470,7 @@ it("routes startup, shared selectors, invalidations, and admitted topology owner
   signal,
 }) => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const agents = topologyAgents();
+    const agents = { ownership: "explicit" as const, entries: { main: {}, alpha: {}, beta: {} } };
     let config: Parameters<typeof costWindow>[0] = { agents };
     setRuntimeConfigSnapshot(config);
     await state.writeText("agents/unowned/marker", "Synthetic unowned agent");

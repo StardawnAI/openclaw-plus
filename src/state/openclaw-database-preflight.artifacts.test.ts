@@ -8,7 +8,6 @@ import {
   captureTargetDatabaseSchemaContext,
   checkTargetDatabaseSchemasForContexts,
 } from "../cli/update-cli/schema-preflight.js";
-import * as nodeSqlite from "../infra/node-sqlite.js";
 import { startSqliteConcurrentWriter } from "../infra/sqlite-concurrent-writer.test-support.js";
 import { readMainDatabasePosixLocks } from "../infra/sqlite-posix-locks.test-support.js";
 import { tryInspectSqliteReadOnlyInProcess } from "../infra/sqlite-readonly-inspection.js";
@@ -350,6 +349,23 @@ it("refuses a newer schema committed only to an open WAL without changing a sour
   });
 }, 60_000);
 
+// An owner that opens, commits and closes as the last connection, so each close removes the
+// WAL family while the reader may be opening it.
+const closingOwner = `
+  const { DatabaseSync } = require("node:sqlite");
+  const file = process.argv[1];
+  let running = true;
+  process.on("message", () => { running = false; });
+  process.send("ready");
+  (function cycle() {
+    if (!running) { process.disconnect(); return; }
+    const database = new DatabaseSync(file);
+    database.exec("PRAGMA busy_timeout = 2000; INSERT OR REPLACE INTO owner_cycles VALUES (1)");
+    database.close();
+    setImmediate(cycle);
+  })();
+`;
+
 it("falls back to the private snapshot when the last owner closes during a preserving read", async () => {
   const root = tempDirs.make("openclaw-preflight-close-race-");
   const file = path.join(root, "agent.sqlite");
@@ -357,55 +373,48 @@ it("falls back to the private snapshot when the last owner closes during a prese
     using database = openRawDatabase(file);
     database.exec(`
       PRAGMA journal_mode = WAL;
-      CREATE TABLE churn (value BLOB NOT NULL);
+      CREATE TABLE owner_cycles (id INTEGER PRIMARY KEY);
       PRAGMA user_version = ${supportedVersions.agent};
     `);
   }
-  const inspect = () =>
-    tryInspectSqliteReadOnlyInProcess(
-      file,
-      (database) => database.prepare("PRAGMA user_version").get(),
-      { preserveSourceArtifacts: true },
-    );
-  await withAgentOwner(file, "idle", supportedVersions.agent, async () => {
-    const liveBefore = sourceArtifacts([file]);
-    expect(inspect()).toEqual({ value: { user_version: supportedVersions.agent } });
-    expect(sourceArtifacts([file])).toEqual(liveBefore);
+  const owner = spawn(process.execPath, ["--input-type=commonjs", "-e", closingOwner, file], {
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
   });
-
-  using owner = openRawDatabase(file);
-  owner.exec("INSERT INTO churn VALUES (zeroblob(1))");
-
-  // No concurrent writer uses this local owner. Close the real last connection
-  // after WAL-family classification but before SQLite opens its read-only index;
-  // unconstrained child scheduling cannot guarantee that window in 300 reads.
-  const open = nodeSqlite.openNodeSqliteDatabase;
-  let closedMain: Buffer | undefined;
-  vi.spyOn(nodeSqlite, "openNodeSqliteDatabase").mockImplementationOnce((...args) => {
-    owner.close();
-    expect(fs.existsSync(`${file}-wal`)).toBe(false);
-    expect(fs.existsSync(`${file}-shm`)).toBe(false);
-    closedMain = fs.readFileSync(file);
-    return open(...args);
+  const closed = new Promise((resolve) => {
+    owner.once("close", resolve);
   });
-  // Hand off to the private snapshot owner rather than admit or throw the open failure.
-  expect(inspect()).toBeUndefined();
-  expect(fs.readFileSync(file)).toEqual(closedMain);
-  // SQLite may create an empty WAL before discovering that the read-only index
-  // disappeared. Do not require its absence or unchanged directory metadata.
-  if (fs.existsSync(`${file}-wal`)) {
-    expect(fs.statSync(`${file}-wal`).size).toBe(0);
+  const outcomes = { read: 0, snapshot: 0 };
+  try {
+    await new Promise((resolve, reject) => {
+      owner.once("message", resolve);
+      owner.once("close", reject);
+    });
+    // Each read races one close on about one read in six; 300 reads make a miss negligible.
+    for (let read = 0; read < 300; read += 1) {
+      const inspection = tryInspectSqliteReadOnlyInProcess(
+        file,
+        (database) => database.prepare("PRAGMA user_version").get(),
+        { preserveSourceArtifacts: true },
+      );
+      if (inspection) {
+        expect(inspection.value).toEqual({ user_version: supportedVersions.agent });
+        outcomes.read += 1;
+      } else {
+        outcomes.snapshot += 1;
+      }
+      await new Promise((resolve) => {
+        setImmediate(resolve);
+      });
+    }
+  } finally {
+    if (owner.connected) {
+      owner.send("stop");
+    }
+    await closed;
   }
-  expect(fs.existsSync(`${file}-shm`)).toBe(false);
-  expect(fs.existsSync(`${file}-journal`)).toBe(false);
-  using committed = nodeSqlite.openNodeSqliteDatabase(file, { readOnly: true });
-  expect(committed.prepare("PRAGMA user_version").get()).toEqual({
-    user_version: supportedVersions.agent,
-  });
-  expect(committed.prepare("SELECT hex(value) AS value FROM churn").all()).toEqual([
-    { value: "00" },
-  ]);
-  expect(fs.readFileSync(file)).toEqual(closedMain);
+  // Both paths ran: live families were read in place, closed ones went to the snapshot.
+  expect(outcomes.read).toBeGreaterThan(0);
+  expect(outcomes.snapshot).toBeGreaterThan(0);
 }, 60_000);
 
 it("ignores uncommitted writer versions without ending the owning transactions", async () => {

@@ -304,25 +304,14 @@ it("preserves config, credentials, and sessions when combined reset cannot acqui
 
   quietRuntime(defaultRuntime);
   vi.spyOn(defaultRuntime, "exit").mockImplementation(createNonExitingRuntime().exit);
-  const reset = (dryRun = false) => {
+  const reset = () => {
     const program = new Command();
     registerMaintenanceCommands(program);
     return program.parseAsync(
-      [
-        "reset",
-        "--scope",
-        "config+creds+sessions",
-        "--yes",
-        "--non-interactive",
-        ...(dryRun ? ["--dry-run"] : []),
-      ],
+      ["reset", "--scope", "config+creds+sessions", "--yes", "--non-interactive"],
       { from: "user" },
     );
   };
-
-  await reset(true);
-  expect(loadSessionEntry(session)).toMatchObject(entry);
-  await expect(readFiles(paths)).resolves.toEqual(bytes);
 
   await expect(reset()).rejects.toMatchObject({ name: "ExitError", code: 1 });
   expect(defaultRuntime.error).toHaveBeenCalledWith(

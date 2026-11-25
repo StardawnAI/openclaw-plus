@@ -46,7 +46,6 @@ import {
 } from "./compact.hooks.assertions.test-support.js";
 import {
   acquiredPreparedModelRuntime,
-  createCompactHooksDirectRunner,
   expectedNativeCompactionOptions,
   useCompactHooksSessionFixture,
 } from "./compact.hooks.fixture.test-support.js";
@@ -94,7 +93,7 @@ import {
   registerQueuedProviderRefreshTest,
 } from "./compact.hooks.memory-refresh.test-support.js";
 import {
-  createCompactHooksPreparedModelRuntime,
+  createCompactHooksPreparedModelRuntimeLease,
   createCompactHooksResolvedModel,
   type CompactHooksQueuedCompaction,
 } from "./compact.hooks.metadata.test-support.js";
@@ -396,10 +395,10 @@ beforeAll(async () => {
   const loaded = await loadCompactHooksHarness();
   compactTesting = await import("./compact.hooks.owner-test-support.js");
   configRuntime = await import("../../config/runtime-snapshot.js");
-  compactEmbeddedAgentSessionDirect = await createCompactHooksDirectRunner(
-    loaded.compactEmbeddedAgentSessionDirect,
-    () => ({ sessionKey: TEST_SESSION_KEY, storePath: TEST_STORE_PATH }),
-  );
+  compactEmbeddedAgentSessionDirect = (params) => {
+    configRuntime.setRuntimeConfigSnapshot(params.config ?? {});
+    return loaded.compactEmbeddedAgentSessionDirect({ agentId: "main", ...params });
+  };
   compactEmbeddedAgentSession = (params, host) => {
     configRuntime.setRuntimeConfigSnapshot(params.config ?? {});
     return loaded.compactEmbeddedAgentSession(params, host);
@@ -448,7 +447,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
     createOpenClawCodingToolsMock.mockReturnValue(
       ["read", "exec"].map((name) => compactionTool(name, {})),
     );
-    buildConfiguredAgentSystemPromptMock.mockImplementation((params) =>
+    buildConfiguredAgentSystemPromptMock.mockImplementation(async (params) =>
       JSON.stringify({
         promptMode: params.promptMode,
         skillsPrompt: params.skillsPrompt ?? null,
@@ -651,7 +650,7 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
         compacted: false,
         reason: expect.stringContaining("timed out"),
       });
-      expect(policies).toEqual([undefined]);
+      expect(policies).toEqual(["retry-invalid-once"]);
     } finally {
       vi.useRealTimers();
     }
@@ -894,17 +893,14 @@ describe("compactEmbeddedAgentSessionDirect hooks", () => {
       }),
       workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
     };
-    const preparedModelRuntime = createCompactHooksPreparedModelRuntime({
+    const preparedModelRuntimeLease = createCompactHooksPreparedModelRuntimeLease({
       agentId: "main",
       agentDir: join(TEST_WORKSPACE_DIR, "agents/main/agent"),
       config: { tools: { profile: "coding" } },
       workspaceDir: join(TEST_WORKSPACE_DIR, "workspace"),
       metadataSnapshot,
-    }) as never;
-    acquireAgentRunPreparedModelRuntimeMock.mockResolvedValueOnce({
-      snapshot: preparedModelRuntime,
-      [Symbol.asyncDispose]: vi.fn(async () => {}),
     });
+    acquireAgentRunPreparedModelRuntimeMock.mockResolvedValueOnce(preparedModelRuntimeLease);
     createOpenClawCodingToolsMock.mockReturnValueOnce([
       compactionTool(toolName, {
         parameters: { type: "object", properties: {}, additionalProperties: false },
@@ -1502,7 +1498,8 @@ describe("compactEmbeddedAgentSession hooks (ownsCompaction engine)", () => {
         },
       });
     enqueueCommandInLaneMock.mockImplementation(
-      (lane, task, ...[options]: [CommandQueueEnqueueOptions?]) => enqueue(lane, task, options),
+      (lane, task, ...[options]: [CommandQueueEnqueueOptions?]) =>
+        enqueue(String(lane), task, options),
     );
     const overrides = {
       abortSignal: controller.signal,

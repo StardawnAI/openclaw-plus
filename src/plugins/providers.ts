@@ -29,6 +29,8 @@ import { createPluginIdScopeSet } from "./plugin-scope.js";
 import { getProviderOwnerIndex } from "./provider-owner-index.js";
 
 type ProviderManifestLoadParams = {
+  /** Prepared resolver for this exact installed index and manifest view. */
+  normalizePluginId?: NormalizePluginId;
   config?: PluginLoadOptions["config"];
   workspaceDir?: string;
   env?: PluginLoadOptions["env"];
@@ -38,8 +40,6 @@ type ProviderManifestLoadParams = {
     Partial<Pick<PluginMetadataSnapshot, "owners" | "byPluginId">>;
 };
 type ProviderRegistryLoadParams = ProviderManifestLoadParams & {
-  /** Prepared resolver for this exact installed index and manifest view. */
-  normalizePluginId?: NormalizePluginId;
   onlyPluginIds?: readonly string[];
 };
 type ProviderRefOwnership =
@@ -256,7 +256,7 @@ function isProviderPluginEligibleForSetupDiscovery(params: {
 }
 
 export function resolveDiscoverableProviderOwnerPluginIds(
-  params: Omit<ProviderRegistryLoadParams, "metadataSnapshot"> & {
+  params: Omit<ProviderManifestLoadParams, "metadataSnapshot"> & {
     pluginIds: readonly string[];
     includeUntrustedWorkspacePlugins?: boolean;
   },
@@ -294,7 +294,7 @@ function isProviderPluginEligibleForRuntimeOwnerActivation(params: {
 }
 
 export function resolveActivatableProviderOwnerPluginIds(
-  params: Omit<ProviderRegistryLoadParams, "metadataSnapshot"> & {
+  params: Omit<ProviderManifestLoadParams, "metadataSnapshot"> & {
     pluginIds: readonly string[];
   },
 ): string[] {
@@ -455,7 +455,7 @@ export function resolveProviderRefOwnership(
 }
 
 export function resolveOwningPluginIdsForModelRef(
-  params: Omit<ProviderRegistryLoadParams, "metadataSnapshot"> & {
+  params: Omit<ProviderManifestLoadParams, "metadataSnapshot"> & {
     model: string;
   },
 ): readonly string[] | undefined {

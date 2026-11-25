@@ -1,5 +1,10 @@
 import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
-import { streamSimple, type Context, type ProviderStreamOptions } from "openclaw/plugin-sdk/llm";
+import {
+  streamSimple,
+  type AssistantMessage,
+  type Context,
+  type ProviderStreamOptions,
+} from "openclaw/plugin-sdk/llm";
 import {
   mapAssistantMessageStream,
   wrapProviderPayloadHook,
@@ -49,10 +54,10 @@ function collectToolNames(context: Context): Set<string> {
   return names;
 }
 
-function mapAssistantNames<T extends Extract<Context["messages"][number], { role: "assistant" }>>(
-  message: T,
+function mapAssistantNames(
+  message: AssistantMessage,
   mapName: (name: string) => string,
-): T {
+): AssistantMessage {
   return {
     ...message,
     content: message.content.map((block) =>

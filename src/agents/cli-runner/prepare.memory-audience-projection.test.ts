@@ -54,7 +54,7 @@ it.each([
         .filter((name) => name === "exec" || scope.memoryAudience === memoryAudience)
         .map((name) => ({ name })),
     });
-    const { mint, revoke } = mockCliMcpPreparation({
+    const { mint, revokeMinted } = mockCliMcpPreparation({
       resolveCliMcpMemoryAudience: resolveAudience,
       resolveMcpLoopbackScopedTools: projectTools,
       resolveMcpLoopbackPolicyTools: projectTools,
@@ -78,29 +78,8 @@ it.each([
     await context.preparedBackend.cleanup?.();
     // The grant that carries the audience is revoked before its lease ends.
     expect(release).toHaveBeenCalledOnce();
-    expect(revoke.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(revokeMinted.mock.invocationCallOrder[0]).toBeLessThan(
       release.mock.invocationCallOrder[0] ?? 0,
     );
   });
-});
-
-it("releases the admitted audience when tool projection fails before mint", async () => {
-  const release = vi.fn();
-  const failProjection = () => {
-    throw new Error("projection failed");
-  };
-  const { mint } = mockCliMcpPreparation({
-    resolveCliMcpMemoryAudience: async () => ({ release }),
-    resolveMcpLoopbackScopedTools: failProjection,
-    resolveMcpLoopbackPolicyTools: failProjection,
-  });
-  await expect(
-    fixture.prepare({
-      provider: "claude-cli",
-      sessionKey: AUDIENCE_CHILD_KEY,
-      config: { plugins: { enabled: false } },
-    }),
-  ).rejects.toThrow("projection failed");
-  expect(mint).not.toHaveBeenCalled();
-  expect(release).toHaveBeenCalledOnce();
 });

@@ -57,6 +57,10 @@ export function setupFeishuBroadcastTestHarness() {
   const mockGetChatInfo = vi.fn();
   const resolvedTurnCalls: ChannelInboundTurnPlan[] = [];
   const mockCurrentConfig = vi.fn(() => createBroadcastConfig());
+  const finalize: NonNullable<BuildChannelInboundEventContextParams["finalize"]> = (ctx) => {
+    mocks.builtInboundContextCalls.push(ctx);
+    return ctx;
+  };
   const runtimeStub = {
     config: { current: mockCurrentConfig },
     channel: {
@@ -68,11 +72,8 @@ export function setupFeishuBroadcastTestHarness() {
       commands: { shouldComputeCommandAuthorized: vi.fn(() => false), isControlCommandMessage },
       inbound: {
         ingress: createPluginRuntimeMock().channel.inbound.ingress,
-        buildContext: (params: BuildChannelInboundEventContextParams) => {
-          const ctx = buildChannelInboundEventContext(params);
-          mocks.builtInboundContextCalls.push(ctx);
-          return ctx;
-        },
+        buildContext: (params: BuildChannelInboundEventContextParams) =>
+          buildChannelInboundEventContext({ ...params, finalize }),
         run: vi.fn(async (params: Parameters<PluginRuntime["channel"]["inbound"]["run"]>[0]) => {
           const input = await params.adapter.ingest(params.raw);
           if (!input) {

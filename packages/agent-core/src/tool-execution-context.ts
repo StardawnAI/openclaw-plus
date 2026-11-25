@@ -50,9 +50,7 @@ export function getAgentToolExecutionContext(): AgentToolExecutionContext | unde
   return activeToolExecution.getStore();
 }
 
-export function resolveAgentAssistantTurnId(
-  message: Pick<AssistantMessage, "responseId" | "turnId">,
-): string | undefined {
+export function resolveAgentAssistantTurnId(message: AssistantMessage): string | undefined {
   return message.responseId?.trim() || message.turnId?.trim() || undefined;
 }
 

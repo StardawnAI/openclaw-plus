@@ -1,3 +1,4 @@
+import { isPendingBackgroundResultMessage } from "../../../packages/agent-core/src/harness/session/background-result-placement.js";
 import {
   readTranscriptMutationAtSync,
   validatePreparedAssistantAppendSync,
@@ -22,6 +23,7 @@ import { isSessionTranscriptSideAppendEntry } from "../../config/sessions/transc
 import { SessionTranscriptWriterClaimReboundError } from "../../config/sessions/transcript-write-context.js";
 import type { Message } from "../../llm/types.js";
 import { readOwnNestedToolActivity } from "../../sessions/nested-tool-activity.js";
+import { readUserTurnMentionInvitation } from "../../sessions/user-turn-transcript-admission.js";
 import type { PreparedModelPromptProjection } from "../../sessions/user-turn-transcript.types.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import { recordModelFallbackStop } from "../model-fallback-stop.js";
@@ -133,6 +135,7 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
                     canonical.message.role === "toolResult" ||
                     readOwnNestedToolActivity(canonical.message) !== undefined),
                 idempotencyLookup: options?.idempotencyLookup,
+                mentionInvitation: readUserTurnMentionInvitation(options?.beforeFreshMessageCommit),
               }
             : undefined;
         if (canonical.type === "message" && message) {
@@ -142,6 +145,7 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
           canonical,
           activeBranchAppend ? "active-branch" : undefined,
           admission,
+          "reload",
           message,
           options?.beforeFreshMessageCommit,
           undefined,
@@ -397,6 +401,7 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
     if (projection && !needsReload) {
       const previous = this.byId.get(projection.messageId);
       if (previous?.type === "message") {
+        this.pendingWritableTranscriptEntries.delete(previous);
         const rewritten = { ...previous, message: projection.message };
         this.byId.set(previous.id, rewritten);
         this.fileEntries = this.fileEntries.map((candidate) =>
@@ -440,7 +445,11 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
       }
     } else if (
       this.boundedContextIncomplete &&
-      transcriptEventContextEligibility(canonicalEntry) === 0
+      transcriptEventContextEligibility(canonicalEntry) === 0 &&
+      !(
+        canonicalEntry.type === "message" &&
+        isPendingBackgroundResultMessage(canonicalEntry.message)
+      )
     ) {
       // Match bounded hydration: SQLite owns display payloads; only the tail's ancestry is live.
       const parentId =
@@ -488,9 +497,10 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
           if (prefix.anchorIds.length) {
             return [prefix];
           }
-          return canonicalEntry.type === "reset" || canonicalEntry.type === "branch_summary"
-            ? []
-            : [{ ...prefix, anchorIds: [canonicalEntry.id] }];
+          if (canonicalEntry.type === "reset" || canonicalEntry.type === "branch_summary") {
+            return [];
+          }
+          return [{ ...prefix, anchorIds: [canonicalEntry.id] }];
         });
       }
       if (canonicalEntry.type === "label") {
@@ -550,7 +560,12 @@ export class SessionManagerAppend extends SessionManagerSuffixPersistence {
             ? this.boundedContextLimits.maxEvents
             : this.byId.size + this.opaqueParentsById.size
           : this.byId.size,
-        isInterruptedTail,
+        isInterruptedTail:
+          isInterruptedTail &&
+          ((entry) => {
+            this.ownTranscriptEntries([entry]);
+            return isInterruptedTail(entry);
+          }),
       },
       includeOmitted,
     );

@@ -325,13 +325,8 @@ function resolveProviderAttributionPolicy(
       // ChatGPT gates models on this header and on the /models `client_version` that reads it
       // (extensions/openai/base-url.ts). Send the numeric release; prerelease or build suffixes are
       // untested, and placeholders such as "unknown" fail the gate. User-Agent keeps the full build.
-      const release =
-        /^(\d{4}\.\d+\.\d+)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/u.exec(
-          version,
-        );
-      const numericRelease = release?.[1];
-      const gateVersion =
-        numericRelease && Number(numericRelease.slice(0, 4)) >= 2026 ? numericRelease : "99.0.0";
+      const release = /^(\d{4})\.\d+\.\d+/u.exec(version);
+      const gateVersion = release && Number(release[1]) >= 2026 ? release[0] : "99.0.0";
       return {
         ...policy,
         verification: "vendor-hidden-api-spec",

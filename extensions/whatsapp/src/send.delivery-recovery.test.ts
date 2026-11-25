@@ -356,13 +356,8 @@ it("keeps pre-connect recovery replayable, then sends exactly once after connect
     await drainDefaultWhatsAppDeliveries(stateDir);
     await drainDefaultWhatsAppDeliveries(stateDir);
 
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith(
-      "+1555",
-      "queued before listener startup",
-      undefined,
-      undefined,
-      { accountId: "default" },
-    );
+    expect(sendMessage.mock.calls).toEqual([
+      ["+1555", "queued before listener startup", undefined, undefined, { accountId }],
+    ]);
   });
 });

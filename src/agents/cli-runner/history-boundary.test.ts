@@ -4,6 +4,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { clearRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
+import { appendAssistantMessageToSessionTranscript } from "../../config/sessions.js";
 import {
   getCliHistoryWriter,
   runWithCliHistoryWriter,
@@ -19,7 +20,7 @@ import { runWithoutOwnedSessionTranscriptWrites } from "../../config/sessions/tr
 import { getOwnedSessionTranscriptWriterFence } from "../../config/sessions/transcript-write-context.js";
 import type { CliSessionBinding } from "../../config/sessions/types.js";
 import { commitCronConversationResult } from "../../cron/conversation-result.js";
-import { mirrorDeliveredSourceReplyToTranscript } from "../../infra/outbound/source-reply-mirror.js";
+import { runInAgentRunWriteContext } from "../../infra/agent-run-terminal-writes.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { PersistedUserTurnMessage } from "../../sessions/user-turn-transcript.types.js";
 import { buildPersistedVoiceMessage } from "../../talk/voice-transcript.js";
@@ -227,10 +228,7 @@ describe("CLI transcript account boundary", () => {
                     agentId: f.target.agentId,
                     jobId: "catch-up",
                     runStartedAt: 1,
-                    conversation: {
-                      ...f.target,
-                      lifecycleRevision: loadSessionEntryReadOnly(f.target)?.lifecycleRevision,
-                    },
+                    conversation: f.target,
                     payloads: [{ text: markers[0] }],
                     deliveryAttemptFence: null,
                   }),
@@ -459,18 +457,15 @@ describe("CLI transcript account boundary", () => {
     // A message-tool send reaches the Gateway outside the CLI run's async context.
     const mirror = (runId: string, text: string) =>
       runWithCliHistoryWriter(undefined, () =>
-        mirrorDeliveredSourceReplyToTranscript({
-          action: "send",
-          channel: "discord",
-          runId,
-          agentId: f.target.agentId,
-          sessionKey: f.target.sessionKey,
-          sessionId: f.target.sessionId,
-          cfg: { session: { store: f.target.storePath } },
-          actionParams: { target: "user-1", message: text },
-          toolContext: { currentChannelProvider: "discord", currentChannelId: "user-1" },
-          deliveredPayload: { ok: true, messageId: "mirror-" + runId },
-        }),
+        runInAgentRunWriteContext(runId, () =>
+          appendAssistantMessageToSessionTranscript({
+            agentId: f.target.agentId,
+            sessionKey: f.target.sessionKey,
+            expectedSessionId: f.target.sessionId,
+            storePath: f.target.storePath,
+            text,
+          }),
+        ),
       );
     await f.run("epoch-a", async (allowed, params) => {
       expect(allowed).toBe(true);

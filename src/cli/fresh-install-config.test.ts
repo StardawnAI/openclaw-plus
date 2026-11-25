@@ -3,7 +3,7 @@ import type { ConfigFileSnapshot } from "../config/types.openclaw.js";
 import { isUnconfiguredConfigSource, shouldStartLocalOnboarding } from "./fresh-install-config.js";
 
 // Shape captured from a real first run interrupted with Ctrl-C at the Quick start prompt.
-const interruptedFirstRun: ConfigFileSnapshot["sourceConfig"] = {
+const interruptedFirstRun = {
   wizard: { securityAcknowledgedAt: "2026-11-02T22:11:29.390Z" },
   plugins: {
     entries: {
@@ -37,17 +37,17 @@ describe("isUnconfiguredConfigSource", () => {
 
 describe("shouldStartLocalOnboarding", () => {
   it("resumes onboarding when only migrations added an agent roster", async () => {
-    const migrated: ConfigFileSnapshot["sourceConfig"] = {
+    const migrated = {
       ...interruptedFirstRun,
       agents: { entries: { main: {} } },
-    };
+    } as unknown as ConfigFileSnapshot["sourceConfig"];
     await expect(
       shouldStartLocalOnboarding({
         exists: true,
         valid: true,
         path: "/tmp/openclaw.json",
         sourceConfig: migrated,
-        sourceConfigBeforeMigrations: interruptedFirstRun,
+        sourceConfigBeforeMigrations: interruptedFirstRun as unknown as typeof migrated,
       }),
     ).resolves.toBe(true);
   });

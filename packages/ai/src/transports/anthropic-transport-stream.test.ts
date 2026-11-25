@@ -126,17 +126,17 @@ function createOpenRawSseResponse(params: {
   });
 }
 
-async function latestAnthropicRequest() {
-  const [input, init] = guardedFetchMock.mock.calls.at(-1) ?? [];
-  // Decode the actual fetch body: frozen Anthropic requests may use a Blob.
+function latestAnthropicRequest() {
+  const [, init] = guardedFetchMock.mock.calls.at(-1) ?? [];
+  const body = init?.body;
   return {
     init,
-    payload: (await new Request(input, init).json()) as Record<string, unknown>,
+    payload: typeof body === "string" ? (JSON.parse(body) as Record<string, unknown>) : {},
   };
 }
 
-async function latestAnthropicRequestHeaders() {
-  return new Headers((await latestAnthropicRequest()).init?.headers);
+function latestAnthropicRequestHeaders() {
+  return new Headers(latestAnthropicRequest().init?.headers);
 }
 
 function guardedFetchCall(
@@ -173,9 +173,8 @@ function findRecord(items: unknown, predicate: (record: Record<string, unknown>)
   throw new Error("Expected matching record");
 }
 
-async function latestAnthropicUserMessage() {
-  const { payload } = await latestAnthropicRequest();
-  return findRecord(payload.messages, (record) => record.role === "user");
+function latestAnthropicUserMessage() {
+  return findRecord(latestAnthropicRequest().payload.messages, (record) => record.role === "user");
 }
 
 function makeAnthropicToolUseMessage(
@@ -319,14 +318,14 @@ describe("anthropic transport stream", () => {
     };
     await runTransportStream(model, undefined, options);
     for (const [name, value] of Object.entries(headers)) {
-      expect((await latestAnthropicRequestHeaders()).get(name)).toBe(value);
+      expect(latestAnthropicRequestHeaders().get(name)).toBe(value);
     }
     if (guarded) {
       expect(buildGuardedModelFetchMock).toHaveBeenCalledWith(model);
       const [url, init] = guardedFetchCall();
       expect(url).toBe("https://api.anthropic.com/v1/messages");
       expect(init?.method).toBe("POST");
-      expect((await latestAnthropicRequest()).payload).toMatchObject({
+      expect(latestAnthropicRequest().payload).toMatchObject({
         model: "claude-sonnet-4-6",
         stream: true,
         stop_sequences: ["User:", "Assistant:"],
@@ -348,8 +347,8 @@ describe("anthropic transport stream", () => {
         headers: optionHeaders,
       } as AnthropicStreamOptions);
 
-      expect((await latestAnthropicRequest()).payload.fallbacks).toBe("default");
-      expect((await latestAnthropicRequestHeaders()).get("anthropic-beta")).toBe(
+      expect(latestAnthropicRequest().payload.fallbacks).toBe("default");
+      expect(latestAnthropicRequestHeaders().get("anthropic-beta")).toBe(
         `${customBeta ? "files-api-2025-04-14" : "fine-grained-tool-streaming-2025-05-14"},server-side-fallback-2026-07-01,thinking-binding-controls-2026-08-01`,
       );
     },
@@ -375,8 +374,8 @@ describe("anthropic transport stream", () => {
 
     expect(result.stopReason).toBe("stop");
     expect(guardedFetchMock).toHaveBeenCalledOnce();
-    expect((await latestAnthropicRequest()).payload).not.toHaveProperty("fallbacks");
-    expect((await latestAnthropicRequestHeaders()).get("anthropic-beta") ?? "").not.toContain(
+    expect(latestAnthropicRequest().payload).not.toHaveProperty("fallbacks");
+    expect(latestAnthropicRequestHeaders().get("anthropic-beta") ?? "").not.toContain(
       "server-side-fallback",
     );
   });
@@ -617,8 +616,8 @@ describe("anthropic transport stream", () => {
     await runTransportStream(makeAnthropicTransportModel({ baseUrl: "" }));
     expect(guardedFetchCall()[0]).toBe(`${endpoint}/messages`);
     expect(buildGuardedModelFetchMock.mock.calls[0]?.[0]).toMatchObject({ baseUrl: endpoint });
-    expect((await latestAnthropicRequest()).payload.model).toBe("claude-sonnet-4-6");
-    expect((await latestAnthropicRequestHeaders()).get("anthropic-beta")).toBeNull();
+    expect(latestAnthropicRequest().payload.model).toBe("claude-sonnet-4-6");
+    expect(latestAnthropicRequestHeaders().get("anthropic-beta")).toBeNull();
   });
 
   it.each([
@@ -655,7 +654,7 @@ describe("anthropic transport stream", () => {
       expect(guardedFetchMock).not.toHaveBeenCalled();
     } else {
       expect(result.stopReason).toBe("stop");
-      expect((await latestAnthropicRequest()).payload).toMatchObject({
+      expect(latestAnthropicRequest().payload).toMatchObject({
         model: model.id,
         max_tokens: expected,
         stream: true,
@@ -927,7 +926,7 @@ describe("anthropic transport stream", () => {
       "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
     );
     expect(headers.get("user-agent")).toContain("claude-cli/");
-    const firstCallParams = (await latestAnthropicRequest()).payload;
+    const firstCallParams = latestAnthropicRequest().payload;
     const system = requireArray(firstCallParams.system, "system").map(
       (item) => requireRecord(item, "system item").text,
     );
@@ -1066,7 +1065,7 @@ describe("anthropic transport stream", () => {
         options,
       );
       const assistantMessage = findRecord(
-        (await latestAnthropicRequest()).payload.messages,
+        latestAnthropicRequest().payload.messages,
         (record) => record.role === "assistant",
       );
       expect(assistantMessage.reasoning_content).toBe("Need context.");
@@ -1132,17 +1131,24 @@ describe("anthropic transport stream", () => {
             : []),
         ],
       } as unknown as AnthropicStreamContext,
-      { apiKey: "sk-ant-api", ...(!withValid ? { toolChoice: "auto" } : {}) },
+      {
+        apiKey: "sk-ant-api",
+        toolChoice: withValid ? { type: "tool", name: "good_plugin_tool" } : "auto",
+      },
     );
 
     if (!withValid) {
       expect(result.stopReason).toBe("stop");
-      expect((await latestAnthropicRequest()).payload).not.toHaveProperty("tools");
-      expect((await latestAnthropicRequest()).payload).not.toHaveProperty("tool_choice");
+      expect(latestAnthropicRequest().payload).not.toHaveProperty("tools");
+      expect(latestAnthropicRequest().payload).not.toHaveProperty("tool_choice");
       return;
     }
 
-    expect((await latestAnthropicRequest()).payload.tools).toEqual([
+    expect(latestAnthropicRequest().payload.tool_choice).toEqual({
+      type: "tool",
+      name: "good_plugin_tool",
+    });
+    expect(latestAnthropicRequest().payload.tools).toEqual([
       expect.objectContaining({
         name: "good_plugin_tool",
         input_schema: {
@@ -1202,7 +1208,7 @@ describe("anthropic transport stream", () => {
     } as never);
     await stream.result();
 
-    const firstCallParams = (await latestAnthropicRequest()).payload;
+    const firstCallParams = latestAnthropicRequest().payload;
     const assistantMessage = findRecord(
       firstCallParams.messages,
       (record) => record.role === "assistant",
@@ -1235,7 +1241,7 @@ describe("anthropic transport stream", () => {
         { apiKey: "synthetic-kimi-key", reasoning: "high" },
       );
       const assistant = findRecord(
-        (await latestAnthropicRequest()).payload.messages,
+        latestAnthropicRequest().payload.messages,
         (msg) => msg.role === "assistant",
       );
       expect(assistant.content).toEqual([text("Retained thought")]);
@@ -1281,7 +1287,7 @@ describe("anthropic transport stream", () => {
         },
       ],
     });
-    const payload = (await latestAnthropicRequest()).payload;
+    const payload = latestAnthropicRequest().payload;
     const assistants = requireArray(payload.messages, "messages")
       .map((msg) => requireRecord(msg, "message"))
       .filter((msg) => msg.role === "assistant");
@@ -1338,7 +1344,7 @@ describe("anthropic transport stream", () => {
       },
       { apiKey: "sk-xiaomi-test" },
     );
-    const payload = (await latestAnthropicRequest()).payload;
+    const payload = latestAnthropicRequest().payload;
     const assistants = requireArray(payload.messages, "messages")
       .map((msg) => requireRecord(msg, "message"))
       .filter((msg) => msg.role === "assistant");
@@ -1364,7 +1370,7 @@ describe("anthropic transport stream", () => {
     await runTransportStream(makeAnthropicTransportModel(), {
       messages: [makeUserMessage(" \n\t ", 0)],
     });
-    expect((await latestAnthropicRequest()).payload.messages).toEqual([
+    expect(latestAnthropicRequest().payload.messages).toEqual([
       {
         role: "user",
         content: [{ type: "text", text: ".", cache_control: { type: "ephemeral" } }],
@@ -1384,7 +1390,7 @@ describe("anthropic transport stream", () => {
       ],
     });
     expect(
-      findRecord((await latestAnthropicUserMessage()).content, (block) => block.type === "image"),
+      findRecord(latestAnthropicUserMessage().content, (block) => block.type === "image"),
     ).toMatchObject({ source: { type: "base64", media_type: "image/jpeg", data: "aW1hZ2U=" } });
   });
 
@@ -1421,7 +1427,7 @@ describe("anthropic transport stream", () => {
         })),
       ],
     } as AnthropicStreamContext);
-    const blocks = requireArray((await latestAnthropicUserMessage()).content, "tool results");
+    const blocks = requireArray(latestAnthropicUserMessage().content, "tool results");
     expect(blocks).toHaveLength(5);
     const projected = blocks.map((block, index) => {
       expect(block).toMatchObject({
@@ -1469,10 +1475,10 @@ describe("anthropic transport stream", () => {
     });
     expect(result.stopReason).toBe("stop");
     expect(normalizer).not.toHaveBeenCalled();
-    expect(JSON.stringify((await latestAnthropicUserMessage()).content)).toContain("image omitted");
+    expect(JSON.stringify(latestAnthropicUserMessage().content)).toContain("image omitted");
     const toolResult = findRecord(
       findRecord(
-        (await latestAnthropicRequest()).payload.messages,
+        latestAnthropicRequest().payload.messages,
         (msg) =>
           Array.isArray(msg.content) &&
           msg.content.some((block) => requireRecord(block, "block").type === "tool_result"),
@@ -1646,18 +1652,20 @@ describe("anthropic transport stream", () => {
     responseModel?: string;
   }>([
     {
-      name: "does not infer adaptive thinking from forward-compatible effort maps",
+      // Unknown Claude ids take the strict contract: manual budgets are rejected by every
+      // Claude model released since Opus 5, so a new model starts on adaptive thinking.
+      name: "uses adaptive thinking for an unknown Claude model",
       model: {
-        id: "claude-future",
+        id: "claude-zzz-9-9",
         name: "Future Claude",
         provider: "github-copilot",
         reasoning: true,
         thinkingLevelMap: { xhigh: null, max: "max" },
       },
       message: "Think as much as supported.",
-      options: { apiKey: "copilot-token", reasoning: "max" },
-      expected: { thinking: { type: "enabled", budget_tokens: 7168 } },
-      absent: ["output_config"],
+      options: { apiKey: "copilot-token", reasoning: "max", temperature: 0.2 },
+      expected: { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+      absent: ["temperature"],
     },
     {
       name: "resolves thinking as disabled when the legacy budget is positive but sub-minimum",
@@ -1768,7 +1776,7 @@ describe("anthropic transport stream", () => {
         context ?? (message ? { messages: [makeUserMessage(message, 0)] } : undefined),
         options,
       );
-      const payload = (await latestAnthropicRequest()).payload;
+      const payload = latestAnthropicRequest().payload;
       if (expected) {
         expect(payload).toMatchObject(expected);
       }

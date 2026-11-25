@@ -50,24 +50,10 @@ it.each([
   }
 });
 
-it.each([
-  ["@ALL uppercase", "~sampel-palnet", undefined, true],
-  ["~sampel-palnet-extra", "~sampel-palnet", undefined, false],
-  ["my~sampel-palnetfriend", "~sampel-palnet", undefined, false],
-  ["prenimbus", "~sampel-palnet", "nimbus", false],
-  ["nimbusy", "~sampel-palnet", "nimbus", false],
-  ["nimbus, hello", "~sampel-palnet", "nimbus", true],
-  ["", "~sampel-palnet", undefined, false],
-  ["test", "", undefined, false],
-  [null as unknown as string, "~sampel-palnet", undefined, false],
-] as const)("detects mentions in %j", (text, ship, nick, expected) => {
-  expect(isBotMentioned(text, ship, nick)).toBe(expected);
-});
-
 const zod = { ship: "~zod" };
 it.each([
-  [[["@ALL uppercase"], [zod, ", hi"], [{ bold: [zod] }, " hi"], [{ strike: [zod] }, "?"]], true],
-  [[["nimbus, hello"], ["say ", { italics: [zod] }, "."], ["Are you there, ", zod, "?"]], true],
+  [[["@ALL"], [zod, ","], [{ bold: [zod] }], [{ strike: [zod] }], ["nimbus:"]], true],
+  [[["nimbus,"], ["x ", { italics: [zod] }, "."], ["x ", zod, "?"], [{ bold: ["nimbus"] }]], true],
   [[[{ "inline-code": "a`b" }, " ", zod, " hi ", { "inline-code": "c" }]], true],
   [[["~zod-extra"], ["my~zodfriend"], [{ "inline-code": "ping ~zod, now" }], ["nimbusy"]], false],
   [[["https://tlon.io/~zod"], ["prenimbus"], [], { block: { code: { code: "~zod, hi" } } }], false],

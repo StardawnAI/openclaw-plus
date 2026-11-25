@@ -3,16 +3,18 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { iterateSessionContextEntries } from "../../../packages/agent-core/src/harness/session/session.js";
+import { parseDurationMs } from "../../cli/parse-duration.js";
+import type { AgentContextPruningConfig } from "../../config/types.agent-defaults.js";
 import { createDedupeCache } from "../../infra/dedupe.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { emitSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
 import { freezeTrustedJsonSnapshot } from "../../shared/immutable-data.js";
+import { compileGlobPatterns, matchesAnyGlobPattern } from "../glob-pattern.js";
 import type { AgentMessage } from "../runtime/index.js";
 import type { SessionManager } from "../sessions/index.js";
 import { formatFullOutputFooter } from "../sessions/tools/tool-contracts.js";
 import { resolveLiveToolResultMaxChars } from "../tool-result-limits.js";
 import { readCacheTtlCheckpoint } from "./cache-ttl-checkpoint.js";
-import type { CacheTtlPruningSettings } from "./cache-ttl-pruning-settings.js";
 import * as truncationNotice from "./context-truncation-notice.js";
 import { log } from "./logger.js";
 import {
@@ -41,7 +43,6 @@ import {
 } from "./tool-result-text-budget.js";
 import { rewriteTranscriptEntriesInSessionManager } from "./transcript-rewrite.js";
 
-export { resolveCacheTtlPruningSettings } from "./cache-ttl-pruning-settings.js";
 export {
   DEFAULT_MAX_LIVE_TOOL_RESULT_CHARS,
   resolveLiveToolResultMaxChars,
@@ -50,8 +51,44 @@ const PROMPT_TOOL_RESULT_AGGREGATE_CAP_MULTIPLIER = 4;
 const AGGREGATE_TOOL_RESULT_CONTEXT_SHARE = 0.5;
 const CACHE_TTL_IMAGE_CHARS = 8_000;
 const CACHE_TTL_IMAGE_MARKER = "[image removed during context pruning]";
+const CACHE_TTL_DEFAULT_PLACEHOLDER = "[Old tool result content cleared]";
 
+type CacheTtlPruningSettings = {
+  ttlMs: number;
+  hardClear: boolean;
+  placeholder: string;
+  isToolPrunable: (toolName: string) => boolean;
+};
 type CacheTtlToolResultMessage = Extract<AgentMessage, { role: "toolResult" }>;
+
+export function resolveCacheTtlPruningSettings(
+  config: AgentContextPruningConfig | undefined,
+): CacheTtlPruningSettings | undefined {
+  if (config?.mode !== "cache-ttl") {
+    return undefined;
+  }
+  let ttlMs = 5 * 60_000;
+  try {
+    ttlMs = config.ttl ? parseDurationMs(config.ttl, { defaultUnit: "m" }) : ttlMs;
+  } catch {
+    // Invalid durations retain the shipped five-minute default.
+  }
+  const normalize = normalizeLowercaseStringOrEmpty;
+  const deny = compileGlobPatterns({ raw: config.tools?.deny, normalize });
+  const allow = compileGlobPatterns({ raw: config.tools?.allow, normalize });
+  return {
+    ttlMs,
+    hardClear: config.hardClear?.enabled ?? true,
+    placeholder: config.hardClear?.placeholder?.trim() || CACHE_TTL_DEFAULT_PLACEHOLDER,
+    isToolPrunable: (toolName) => {
+      const normalized = normalize(toolName);
+      return (
+        !matchesAnyGlobPattern(normalized, deny) &&
+        (allow.length === 0 || matchesAnyGlobPattern(normalized, allow))
+      );
+    },
+  };
+}
 
 function cacheTtlText(block: unknown, serializeMalformed = true): string | undefined {
   if (!isRecord(block) || block.type !== "text") {
@@ -470,13 +507,7 @@ export function truncateToolResultMessage(
   const remainingBudget = Math.max(0, maxChars - preservedChars);
   const reducibleChars = totalTextChars - preservedChars;
   const reducibleNoticeChars = preserveSmallBlocks ? largeBlockNoticeChars : totalNoticeChars;
-  // Oversized collections of short blocks need one readable prefix, even when
-  // the caller disables minimum retention. Per-block notices crowd out their text.
-  if (
-    (blocks.every(({ textChars }) => textChars <= MIN_KEEP_CHARS) &&
-      totalNoticeChars > maxChars / 2) ||
-    reducibleNoticeChars > remainingBudget
-  ) {
+  if (reducibleNoticeChars > remainingBudget) {
     return {
       ...msg,
       content: keepToolResultTextPrefix(blocks, maxChars, suffixFactory, budgetOptions),
@@ -609,7 +640,7 @@ export function truncateOversizedToolResultsInMessages(
       if (projectionKey) {
         projectionState.frozen.add(projectionKey);
         if (
-          plan.changedIndices.size > 0 &&
+          plan.changedIndices.has(index) &&
           projectedMessage?.role === "toolResult" &&
           projectedMessage !== originalMessage
         ) {

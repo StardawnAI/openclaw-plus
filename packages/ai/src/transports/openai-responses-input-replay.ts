@@ -1,4 +1,4 @@
-import type { AssistantHistoryMessage, AssistantMessage, Model } from "@openclaw/llm-core";
+import type { AssistantMessage, Model } from "@openclaw/llm-core";
 import { stableStringify } from "@openclaw/normalization-core";
 import { isRecord, isStringArray } from "@openclaw/normalization-core/record-coerce";
 import type { ResponseInput } from "openai/resources/responses/responses.js";
@@ -15,15 +15,13 @@ export function recordResponsesInputReplay(
   }
 }
 
-export function readResponsesInputReplayState(message: AssistantHistoryMessage) {
+export function readResponsesInputReplayState(message: AssistantMessage) {
   const replay =
     "openclawResponsesInputReplay" in message ? message.openclawResponsesInputReplay : undefined;
   return isRecord(replay) ? replay : undefined;
 }
 
-function readResponsesInputReplay(
-  message: AssistantHistoryMessage,
-): ResponsesInputReplay | undefined {
+function readResponsesInputReplay(message: AssistantMessage): ResponsesInputReplay | undefined {
   const replay = readResponsesInputReplayState(message);
   if (
     replay &&
@@ -59,7 +57,7 @@ export function createResponsesInputReplay(model: Model) {
     fingerprints.set(item, value);
     return value;
   };
-  return (input: ResponseInput, output: ResponseInput, message: AssistantHistoryMessage) => {
+  return (input: ResponseInput, output: ResponseInput, message: AssistantMessage) => {
     const key = message.turnId || message.responseId;
     const start = (key ? starts.get(key) : undefined) ?? output[0];
     if (key && start) {

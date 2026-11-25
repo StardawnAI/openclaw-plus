@@ -8,7 +8,7 @@ import {
   emitAgentRunOutputTokens,
 } from "../infra/agent-events.js";
 import { getAgentRunContext } from "../infra/agent-run-registry.js";
-import type { AssistantHistoryMessage, HistoryUsage, Usage } from "../llm/types.js";
+import type { AssistantMessage, Usage } from "../llm/types.js";
 import {
   createUsageAccumulator,
   mergeUsageIntoAccumulator,
@@ -31,10 +31,7 @@ import {
   type NormalizedUsage,
 } from "./usage.js";
 
-function preserveAssistantUsage(
-  message: AssistantHistoryMessage,
-  pending: NormalizedUsage | undefined,
-) {
+function preserveAssistantUsage(message: AssistantMessage, pending: NormalizedUsage | undefined) {
   if (!pending || message.usage.usageReport?.state === "unavailable") {
     return;
   }
@@ -58,7 +55,7 @@ function preserveAssistantUsage(
   const output = pending.output ?? 0;
   const cacheRead = pending.cacheRead ?? 0;
   const cacheWrite = pending.cacheWrite ?? 0;
-  const usage = {
+  message.usage = {
     ...makeZeroUsageSnapshot(),
     input,
     output,
@@ -71,8 +68,7 @@ function preserveAssistantUsage(
     totalTokens: pending.total ?? input + output + cacheRead + cacheWrite,
     ...(pending.reasoningTokens !== undefined ? { reasoningTokens: pending.reasoningTokens } : {}),
   };
-  message.usage = usage;
-  Object.assign(usage.cost, pending.cost);
+  Object.assign(message.usage.cost, pending.cost);
 }
 
 /** Owns model facts at event ingress, independently of queued reply delivery. */
@@ -84,12 +80,12 @@ export function createEmbeddedModelState(
   let pending: NormalizedUsage | undefined;
   let lastUsage: NormalizedUsage | undefined;
   let retryUsage: NormalizedUsage | undefined;
-  let completed: AssistantHistoryMessage | undefined;
+  let completed: AssistantMessage | undefined;
   let successfulModelResponse = false;
   let publishedMessageModel: string | undefined;
   const runContext = getAgentRunContext(params.runId);
 
-  const publishMessageModel = (message: AssistantHistoryMessage, reset: boolean) => {
+  const publishMessageModel = (message: AssistantMessage, reset: boolean) => {
     if (reset) {
       publishedMessageModel = undefined;
     }
@@ -116,7 +112,7 @@ export function createEmbeddedModelState(
     publishedMessageModel = identity;
   };
 
-  const recordPendingUsage = (raw: HistoryUsage) => {
+  const recordPendingUsage = (raw: Usage) => {
     const usage = normalizeUsage(raw);
     if (!hasObservedModelUsage(usage)) {
       return;
@@ -157,7 +153,7 @@ export function createEmbeddedModelState(
       });
     }
   };
-  const recordContextAccounting = (message: AssistantHistoryMessage, successful: boolean) =>
+  const recordContextAccounting = (message: AssistantMessage, successful: boolean) =>
     params.onContextAccountingEvent?.({
       kind: "model",
       contextTokens: deriveSessionTotalTokens({ lastCallUsage: normalizeUsage(message.usage) }),

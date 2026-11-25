@@ -105,8 +105,7 @@ describe("openai completions transport requests", () => {
               });
           if (request.stream === false) {
             releaseBody = () => res.end(responseBody);
-            // Deliver an incomplete JSON body; acceptance must release the remaining bytes.
-            res.write(" ");
+            res.flushHeaders();
           } else {
             releaseBody = undefined;
             res.end(responseBody);

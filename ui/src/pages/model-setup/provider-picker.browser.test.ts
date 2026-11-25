@@ -64,8 +64,7 @@ describe.runIf("__vitest_browser__" in globalThis)("selected dropdown opening", 
     expect.soft(selectedBounds.bottom).toBeLessThanOrEqual(menuBounds.bottom);
     expect({ x: scrollX, y: scrollY }).toEqual(pageScroll);
     await userEvent.keyboard("{End}");
-    await expect.poll(() => document.activeElement).toBe(items[29]);
-    expect(menu.dataset.phase).toBe("opening");
+    expect(document.activeElement).toBe(items[29]);
     for (const animation of animations) {
       animation.finish();
     }

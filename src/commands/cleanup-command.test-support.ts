@@ -1,35 +1,22 @@
 // Cleanup command test support provides non-exiting runtimes and log captures for cleanup suites.
 import { vi } from "vitest";
-import type { GatewayService } from "../daemon/service-types.js";
 import { createNonExitingRuntime, type RuntimeEnv } from "../runtime.js";
 import type { MockFn } from "../test-utils/vitest-mock-fn.js";
 
 const resolveCleanupPlanForDryRun = vi.fn();
-export const resolveCleanupPlanForRemoval: MockFn<
-  typeof import("./cleanup-plan.js").resolveCleanupPlanForRemoval
-> = vi.fn();
-export const removePath: MockFn<typeof import("./cleanup-utils.js").removePath> = vi.fn();
+export const resolveCleanupPlanForRemoval = vi.fn();
+export const removePath = vi.fn();
 const removeConfigCredentialsAndSessions = vi.fn();
-export const removeStateAndLinkedPaths: MockFn<
-  typeof import("./cleanup-utils.js").removeStateAndLinkedPaths
-> = vi.fn();
-export const removeWorkspaceDirs: MockFn<typeof import("./cleanup-utils.js").removeWorkspaceDirs> =
-  vi.fn();
-type CleanupGatewayService = {
-  notLoadedText: string;
-  isLoaded: MockFn<GatewayService["isLoaded"]>;
-  isAbsent: MockFn<NonNullable<GatewayService["isAbsent"]>>;
-  stop: MockFn<GatewayService["stop"]>;
-  uninstall: MockFn<GatewayService["uninstall"]>;
-};
-const gatewayServiceState = vi.hoisted((): CleanupGatewayService => ({
+export const removeStateAndLinkedPaths = vi.fn();
+export const removeWorkspaceDirs = vi.fn();
+const gatewayServiceState = vi.hoisted(() => ({
   notLoadedText: "is not installed",
   isLoaded: vi.fn(),
   isAbsent: vi.fn(),
   stop: vi.fn(),
   uninstall: vi.fn(),
 }));
-export const gatewayService: CleanupGatewayService = gatewayServiceState;
+export const gatewayService = gatewayServiceState;
 const cleanupConfigState = vi.hoisted(() => ({ isNixMode: false }));
 
 vi.mock("../config/config.js", () => ({

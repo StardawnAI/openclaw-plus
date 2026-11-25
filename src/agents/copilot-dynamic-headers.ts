@@ -2,6 +2,7 @@
  * Builds GitHub Copilot provider compatibility headers from message content.
  */
 import { projectCopilotRequestFacts } from "@openclaw/ai/internal/shared";
+import type { Context } from "../llm/types.js";
 
 /** @deprecated GitHub Copilot provider-owned helper; do not use from third-party plugins. */
 export const COPILOT_EDITOR_VERSION = "vscode/1.107.0";
@@ -30,15 +31,13 @@ export function buildCopilotIdeHeaders(
 }
 
 /** Return true when Copilot should receive its vision request header. */
-export function hasCopilotVisionInput(
-  messages: Parameters<typeof projectCopilotRequestFacts>[0],
-): boolean {
+export function hasCopilotVisionInput(messages: Context["messages"]): boolean {
   return projectCopilotRequestFacts(messages, "nested").hasImages;
 }
 
 /** Build per-request Copilot headers, including initiator and vision flags. */
 export function buildCopilotDynamicHeaders(params: {
-  messages: Parameters<typeof projectCopilotRequestFacts>[0];
+  messages: Context["messages"];
   hasImages: boolean;
 }): Record<string, string> {
   return {

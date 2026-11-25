@@ -86,7 +86,6 @@ const PLAYBACK_TRANSCODE_POLICY = {
     transcodeInputFormats: {
       "video/avi": "avi",
       "video/flv": "flv",
-      "video/matroska": "matroska,webm",
       "video/quicktime": "mov",
       "video/webm": "matroska,webm",
       "video/x-flv": "flv",

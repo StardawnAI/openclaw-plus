@@ -18,8 +18,8 @@ import {
   onTrustedToolExecutionEvent,
   resetDiagnosticEventsForTest,
   setDiagnosticsEnabledForProcess,
-  type TrustedToolExecutionEvent,
   waitForDiagnosticEventsDrained,
+  type TrustedToolExecutionEvent,
 } from "../../infra/diagnostic-events.js";
 import {
   closeDiagnosticEmbeddedRunOwner,
@@ -54,7 +54,7 @@ import {
   supervisorSpawnMock,
   wrapPreparedCliRunWithTestAdmission,
 } from "./execute.test-support.js";
-import { buildPreparedCliRunContext } from "./prepared-context.test-support.js";
+import { createPreparedCliContext } from "./prepared-context.test-support.js";
 import { prepareCliRunTerminalReply } from "./terminal-reply.js";
 import type { PreparedCliRunContext } from "./types.js";
 const executePreparedCliRun = wrapPreparedCliRunWithTestAdmission(executePreparedCliRunImpl);
@@ -88,6 +88,7 @@ function terminal(result = "done", session_id = "session-jsonl") {
 function messageUse(id: string, input: Record<string, unknown>) {
   return toolUse(id, "mcp__openclaw__message", input);
 }
+
 function streamDelta(delta: unknown, index?: number) {
   return jsonl({
     type: "stream_event",
@@ -188,13 +189,39 @@ function recordToolOutcome(
   args: Record<string, unknown>,
   outcome: "completed" | "failed" | "unknown" = "completed",
   result?: unknown,
+  beforeResult?: () => void,
 ) {
   const captureHandle = markMcpLoopbackToolCallStarted({ captureKey, toolName, args });
+  beforeResult?.();
   if (!captureHandle) {
     return;
   }
   recordMcpLoopbackToolCallResultForHandle({ captureHandle, toolName, args, outcome, result });
   markMcpLoopbackToolCallFinished(captureHandle);
+}
+
+function buildPreparedCliRunContext(params: {
+  output: "json" | "jsonl" | "text";
+  provider?: string;
+  runId?: string;
+  beforeExecution?: () => Promise<void>;
+  parseJsonlEvent?: CliBackendParseJsonlEvent;
+}): PreparedCliRunContext {
+  const provider = params.provider ?? "codex-cli";
+  const runId = params.runId ?? `run-${params.output}`;
+  const backend = {
+    command: "agent-cli",
+    args: [],
+    output: params.output,
+    input: "stdin" as const,
+    serialize: true,
+  };
+  const context = createPreparedCliContext(
+    { provider, model: "model", runId, agentId: "main", sessionKey: "agent:main:main" },
+    { id: provider, config: backend, bundleMcp: false, parseJsonlEvent: params.parseJsonlEvent },
+  );
+  context.preparedBackend.beforeExecution = params.beforeExecution;
+  return context;
 }
 
 function claudeJsonlContext() {
@@ -205,6 +232,7 @@ function captureContext(provider = "claude-cli", output: "text" | "jsonl" = "jso
   context.mcpDeliveryCapture = true;
   return context;
 }
+
 function settledResult(
   context: PreparedCliRunContext,
   output: Awaited<ReturnType<typeof executePreparedCliRun>>,
@@ -235,11 +263,9 @@ function installCaptureGrant(context: PreparedCliRunContext) {
 }
 
 function requireSupervisorSpawnInput(index = 0): SupervisorSpawnInput {
-  const call = supervisorSpawnMock.mock.calls[index];
-  if (!call) {
-    throw new Error("Expected supervisor spawn");
-  }
-  return call[0] as SupervisorSpawnInput;
+  const input = supervisorSpawnMock.mock.calls[index]?.[0];
+  assert.isDefined(input, "Expected supervisor spawn");
+  return input;
 }
 beforeEach(() => {
   vi.unstubAllEnvs();
@@ -260,6 +286,7 @@ beforeEach(() => {
   });
   setActivePluginRegistry(registry);
 });
+
 function createDiagnosticFixture() {
   const time = { now: 1_000_000 };
   const clock = vi.spyOn(Date, "now").mockImplementation(() => time.now);
@@ -1007,28 +1034,30 @@ it("correlates parallel same-name loopback calls by arguments instead of admissi
 
 it("keeps identical parallel outcomes unknown with first tool finishes before second CLI identity", async () => {
   const toolEvents = captureToolEvents();
+  const recordEvent = vi.fn();
   mockCaptureSpawn((input, captureKey) => {
     const toolArgs = { action: "react", emoji: "same" };
-    const emitToolStarts = (...ids: string[]) =>
-      input.onStdout?.(assistant(...ids.map((id) => messageUse(id, toolArgs))));
-    const recordOutcome = (outcome: "completed" | "failed") =>
-      recordToolOutcome(captureKey, "message", toolArgs, outcome);
-    const emitToolResults = (...ids: string[]) =>
-      input.onStdout?.(user(...ids.map((id) => toolResult(id, "ok"))));
-    emitToolStarts("call-identical-a");
-    recordOutcome("failed");
-    recordOutcome("completed");
-    emitToolResults("call-identical-a");
-    emitToolStarts("call-identical-b");
-    emitToolResults("call-identical-b");
-    emitToolStarts("call-identical-later");
-    recordOutcome("completed");
+    input.onStdout?.(assistant(messageUse("call-identical-a", toolArgs)));
+    recordToolOutcome(captureKey, "message", toolArgs, "failed");
+    recordToolOutcome(captureKey, "message", toolArgs, "completed");
+    input.onStdout?.(user(toolResult("call-identical-a", "ok")));
+    input.onStdout?.(assistant(messageUse("call-identical-b", toolArgs)));
+    input.onStdout?.(user(toolResult("call-identical-b", "ok")));
+    input.onStdout?.(assistant(messageUse("call-identical-later", toolArgs)));
+    recordToolOutcome(captureKey, "message", toolArgs, "completed");
     input.onStdout?.(`${user(toolResult("call-identical-later", "ok"))}${terminal()}`);
   });
   const context = captureContext();
+  context.trajectoryRecorder = { recordEvent };
 
   await executePreparedCliRun(context);
-
+  const results = recordEvent.mock.calls.filter(([type]) => type === "tool.result");
+  const outcomes = results.map(([, row]) => [row?.toolCallId, row?.status, row?.success]);
+  expect(outcomes).toEqual([
+    ["call-identical-a", "unknown", undefined],
+    ["call-identical-b", "unknown", undefined],
+    ["call-identical-later", "completed", true],
+  ]);
   expect(toolEvents).toHaveLength(6);
   expectToolEvents(
     toolEvents,
@@ -1148,8 +1177,9 @@ it.each([
       timedOut: true,
     },
   );
-
   const context = captureContext();
+  const recordEvent = vi.fn();
+  context.trajectoryRecorder = { recordEvent };
   context.params.onExecutionPhase = vi.fn();
   await expect(executePreparedCliRun(context)).rejects.toMatchObject({
     message: expect.stringMatching(/exceeded timeout/i),
@@ -1168,6 +1198,7 @@ it.each([
     model: "model",
     backend: "claude-cli",
   });
+  expect(recordEvent.mock.calls.map(([type]) => type)).not.toContain("tool.result");
 
   expectToolEvents(toolEvents, [
     ["started", fixture.toolCallId],
@@ -1426,17 +1457,21 @@ it.each([
 
 it.each([
   ["explicit final", true, "source", "required", "Tool-authored answer", true],
-  ["default final", undefined, "source", "required", "Tool-authored answer", true],
+  ["default final", undefined, "source", "required", "Same answer, rewritten", true],
   ["explicit short final", true, "source", "required", "Done", true, "Done"],
   ["default short final", undefined, "source", "required", "Done", true, "Done"],
   ["short progress repeat", false, "source", "required", "Done", true, "Done"],
   ["trimmed short final", true, "source", "required", "Done", true, " Done "],
-  ["distinct short final", true, "source", "required", "No", false, "Done"],
-  ["short prefix correction", true, "source", "required", "Done, but failed", false, "Done"],
+  ["distinct short final", true, "source", "required", "No", true, "Done"],
+  ["short prefix correction", true, "source", "required", "Done, but failed", true, "Done"],
   ["short other conversation", true, "other", "required", "Done", false, "Done"],
   ["identical emoji final", true, "source", "required", "✅", true, "✅"],
-  ["distinct emoji final", true, "source", "required", "❌", false, "✅"],
+  ["distinct emoji final", true, "source", "required", "❌", true, "✅"],
   ["continued work", undefined, "source", "required", "The operation failed", false],
+  ["overlapping work", true, "source", "required", "Fresh check result", false],
+  ["overlapping default final", undefined, "source", "required", "Fresh check result", false],
+  ["earlier overlapping work", true, "source", "required", "Fresh check result", false],
+  ["earlier result before send", undefined, "source", "required", "Fresh check result", false],
   ["progress", false, "source", "required", "Final answer", false],
   ["other conversation", true, "other", "required", "Final answer", false],
   ["partial delivery", true, "partial", "required", "Final answer", false],
@@ -1454,6 +1489,28 @@ it.each([
     context.params.currentChannelId = "source-chat";
     context.params.terminalReplyExpectation = terminalReplyExpectation;
     mockCaptureSpawn((input, captureKey) => {
+      const checkArgs = { command: "check-result" };
+      let overlappingCheck: ReturnType<typeof markMcpLoopbackToolCallStarted>;
+      const finishOverlappingCheck = () => {
+        if (!overlappingCheck) {
+          return;
+        }
+        recordMcpLoopbackToolCallResultForHandle({
+          captureHandle: overlappingCheck,
+          toolName: "exec",
+          args: checkArgs,
+          outcome: _label.startsWith("earlier") ? "failed" : "completed",
+        });
+        markMcpLoopbackToolCallFinished(overlappingCheck);
+        overlappingCheck = undefined;
+      };
+      if (_label.startsWith("earlier")) {
+        overlappingCheck = markMcpLoopbackToolCallStarted({
+          captureKey,
+          toolName: "exec",
+          args: checkArgs,
+        });
+      }
       recordToolOutcome(
         captureKey,
         "message",
@@ -1486,9 +1543,22 @@ it.each([
               : {}),
           },
         },
+        () => {
+          if (_label === "earlier result before send") {
+            finishOverlappingCheck();
+          }
+          if (_label.startsWith("overlapping")) {
+            overlappingCheck = markMcpLoopbackToolCallStarted({
+              captureKey,
+              toolName: "exec",
+              args: checkArgs,
+            });
+          }
+        },
       );
+      finishOverlappingCheck();
       if (_label === "continued work") {
-        recordToolOutcome(captureKey, "exec", { command: "check-result" }, "completed");
+        recordToolOutcome(captureKey, "exec", checkArgs, "completed");
       }
       input.onStdout?.(text);
     });

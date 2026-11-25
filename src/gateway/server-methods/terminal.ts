@@ -403,10 +403,6 @@ async function openTerminalSessionWithSource(
     );
     return;
   }
-  if (!context.isTerminalEnabled()) {
-    unavailable("terminal is disabled");
-    return;
-  }
   const refreshedLaunch = context.resolveTerminalLaunchPolicy(launch.plan.agentId);
   if (!refreshedLaunch.ok) {
     respondLaunchBlocked(respond, refreshedLaunch.block, request.failureHint);
@@ -439,7 +435,6 @@ async function openTerminalSessionWithSource(
           source?.assertCurrent();
           return (
             context.isConnectionActive?.(connId) !== false &&
-            context.isTerminalEnabled() &&
             (!request.requireCliAgents ||
               context.getRuntimeConfig().gateway?.cliAgents?.enabled !== false) &&
             context.resolveTerminalLaunchPolicy(refreshedLaunch.plan.agentId).ok &&

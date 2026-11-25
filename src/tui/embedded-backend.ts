@@ -202,7 +202,7 @@ export class EmbeddedTuiBackend implements TuiBackend {
     this.sessionProjection = (async () => {
       const config = await captureRuntimeConfigAsyncReader()();
       const { runSessionStartupMigration } =
-        await import("../config/sessions/startup-migration.js");
+        await import("../config/sessions/startup-migration-runtime.js");
       await runSessionStartupMigration({
         cfg: config,
         env: process.env,
@@ -1121,10 +1121,7 @@ export class EmbeddedTuiBackend implements TuiBackend {
     try {
       if (queuedAfter) {
         try {
-          await Promise.race([
-            waitForQueuedLocalRun(queuedAfter, runId),
-            waitForAbortSignal(controller.signal),
-          ]);
+          await waitForAbortSignal(controller.signal, waitForQueuedLocalRun(queuedAfter, runId));
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           this.emitChatTerminal(

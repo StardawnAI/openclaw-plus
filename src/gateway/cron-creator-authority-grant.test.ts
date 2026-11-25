@@ -1,5 +1,3 @@
-import { setImmediate as nextTurn } from "node:timers/promises";
-import { queryObjects } from "node:v8";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { createTestAdmittedRunContext } from "../agents/admitted-run-context.test-support.js";
@@ -15,6 +13,7 @@ import type {
   EmbeddedRunAttemptParams,
   EmbeddedRunAttemptParamsV2,
 } from "../plugin-sdk/agent-harness-runtime.js";
+import { expectCollected } from "../test-utils/retention.js";
 import type { AgentRuntimeIdentity } from "./agent-runtime-identity-token.js";
 import {
   attachCronStreamExecPolicy,
@@ -106,9 +105,11 @@ describe("cron creator authority grants", () => {
         return scope.signal;
       }
     }
-    const signal = new RevokingCaller().revoke();
-    await nextTurn();
-    expect(queryObjects(RevokingCaller)).toBe(0);
+    const { signal, caller: callerRef } = (() => {
+      const caller = new RevokingCaller();
+      return { signal: caller.revoke(), caller: new WeakRef(caller) };
+    })();
+    await expectCollected(callerRef);
     expect(signal.reason).toBeInstanceOf(TypeError);
     expect(signal.reason).toMatchObject({ name: "CronCreatorAuthorityExpiredError", status: 403 });
     expect(() => signal.throwIfAborted()).toThrow(signal.reason);
@@ -139,6 +140,42 @@ describe("cron creator authority grants", () => {
     expect(
       hasCronCreatorGrantProvenance({ cronCreatorAuthorityGrant: runtimeGrant }, external.runId),
     ).toBe(false);
+  });
+
+  it("does not infer external origin from scoped creation authority", () => {
+    const scope = createScope(
+      "scoped-external",
+      { kind: "external", channel: "discord" },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+    const grant = mint(scope, undefined, undefined, undefined, "requester");
+    expect(provenance(grant, scope.runId)).toEqual({
+      capturesRuntimeAuthority: false,
+      callerScopedCreation: true,
+    });
+  });
+
+  it("records a channel owner's external origin without granting runtime authority", () => {
+    let current = true;
+    const scope = createScope(
+      "telegram-owner",
+      { kind: "external", channel: "telegram" },
+      { source: "channel-owner", isCurrent: () => current },
+    );
+    const grant = mint(scope, undefined, undefined, undefined, "requester");
+    expect(provenance(grant, scope.runId)).toEqual({
+      capturesRuntimeAuthority: false,
+      callerOrigin: { kind: "external", channel: "telegram" },
+    });
+    expect(consume(grant).authority).toBeUndefined();
+    current = false;
+    expect(() => mint(scope, undefined, undefined, undefined, "requester")).toThrow(
+      "no longer active",
+    );
   });
 
   it("rejects run substitution and transports private runtime authority only once", () => {

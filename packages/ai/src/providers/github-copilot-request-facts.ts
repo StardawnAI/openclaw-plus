@@ -4,8 +4,7 @@ import { hasRuntimeContextMarker } from "../types.js";
 export function projectCopilotRequestFacts(
   messages: readonly {
     role: string;
-    // Summary and other non-content roles still participate in initiator selection.
-    content?: unknown;
+    content: unknown;
     runtimeContext?: unknown;
     runtimeContextCarrier?: unknown;
   }[],

@@ -127,15 +127,14 @@ it.each([false, true])(
     await withRequestFixture(
       async (fixture) => {
         await fixture.controller.initializeAuthProfile();
-        let holding: ReturnType<typeof holdPeerRefresh> | undefined;
+        let held: Awaited<ReturnType<typeof holdPeerRefresh>> | undefined;
         const peerAdmission = createDeferredCore();
         const beforeEnter = preparing ? peerAdmission.promise : undefined;
         const release = createDeferredCore();
         const lookup = modelAuth.getApiKeyForModelCore;
         vi.spyOn(modelAuth, "getApiKeyForModelCore").mockImplementationOnce(async (params) => {
           const resolved = await lookup(params);
-          holding = holdPeerRefresh(fixture, undefined, release, beforeEnter);
-          await holding;
+          held = await holdPeerRefresh(fixture, undefined, release, beforeEnter);
           return resolved;
         });
         const outcome = requestAuth(fixture);
@@ -151,11 +150,9 @@ it.each([false, true])(
           });
         } finally {
           peerAdmission.resolve();
-          // Join acquisition too: the deadline can settle before the cleanup handle returns.
+          // The auth deadline can settle before holdPeerRefresh returns its cleanup handle.
           release.resolve();
-          await (
-            await holding
-          )?.peer;
+          await held?.peer;
         }
       },
       { getDeadline },

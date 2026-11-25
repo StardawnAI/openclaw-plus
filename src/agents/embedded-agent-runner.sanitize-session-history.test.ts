@@ -296,6 +296,55 @@ describe("sanitizeSessionHistory", () => {
     expect(content).toContain("sourceSession=agent:main:req");
   });
 
+  it.each([
+    {
+      appendOnlyRuntimeContext: true,
+      roles: ["user", "assistant", "user", "user", "user", "user"],
+    },
+    { appendOnlyRuntimeContext: false, roles: ["user", "assistant", "user"] },
+  ])(
+    "replays background results as labelled user input (appendOnly=$appendOnlyRuntimeContext)",
+    async ({ appendOnlyRuntimeContext, roles: expectedRoles }) => {
+      const reports = ["PR flow 18:12: green", "PR flow 19:12: green", "PR flow 20:12: green"];
+      const policy = makeAnthropicReplayPolicy({
+        appendOnlyRuntimeContext,
+        dropReasoningFromHistory: false,
+      });
+      const sanitized = await sanitizeAnthropic(
+        [
+          user("watch the PR flow"),
+          assistant([text("Watching.")], { usage: makeUsage(1, 1, 2) }),
+          ...reports.map((report) => ({
+            ...assistant([text(report)]),
+            api: OPENCLAW_TRANSCRIPT_ARTIFACT_API,
+            provider: "openclaw",
+            model: "automation-result",
+            openclawAutomation: { kind: "cron", jobId: "job-1", runId: "run-1" },
+          })),
+          user("status?"),
+        ],
+        { policy },
+      );
+      const out = await validateAnthropic(sanitized, policy);
+
+      expect(roles(out)).toEqual(expectedRoles);
+      expect(assistantContent(out)).toEqual([text("Watching.")]);
+      const userText = out
+        .filter((message): message is UserMessage => message.role === "user")
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : message.content.map((block) => (block.type === "text" ? block.text : "")).join(""),
+        )
+        .join("\n");
+      for (const report of reports) {
+        expect(userText).toContain(
+          `[OpenClaw background result] You sent the message below to the user in this chat from a separate background run. It is a record of what they saw, not a new request.\n\n${report}`,
+        );
+      }
+    },
+  );
+
   it("preserves existing usage cost while normalizing token fields", async () => {
     const cost = {
       input: 1.25,
@@ -319,18 +368,11 @@ describe("sanitizeSessionHistory", () => {
     });
   });
 
-  it.each([1, -1])("preserves unknown cost with input token count %s", async (input) => {
-    const usage = { input, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10 };
-    const message: AgentMessage = { ...assistant([text("answer")]), usage };
-    const out = await sanitize([user("question"), message]);
-    const replay = out[1];
-    expect(replay?.role).toBe("assistant");
-    if (replay?.role !== "assistant") {
-      throw new Error("Expected the replay assistant");
-    }
-    expect(replay.usage).toEqual({ ...usage, input: Math.max(0, input) });
-    expect(replay.usage.cost).toBeUndefined();
-    expect(message.usage.input).toBe(input);
+  it("preserves unknown cost when token fields already match", async () => {
+    const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 10 };
+    const out = await sanitize([user("question"), { ...textAssistant("answer"), usage }]);
+    expect((out[1] as AssistantMessage).usage).toEqual(usage);
+    expect((out[1] as AssistantMessage).usage.cost).toBeUndefined();
   });
 
   it("keeps fresh usage after compaction timestamp in summary-first ordering", async () => {
@@ -562,9 +604,13 @@ describe("sanitizeSessionHistory", () => {
     expect(assistantContent(sanitized)).toEqual([text("Pong")]);
     expect(roles(sanitized)).toEqual(["user", "assistant", "user", "user"]);
     expect(JSON.stringify(sanitized)).not.toContain("assistant copied inbound metadata omitted");
-    const validated = await validateAnthropic(sanitized);
-    expect(roles(validated)).toEqual(["user", "assistant", "user"]);
-    expect((validated[2] as UserMessage).content).toEqual([text("First"), text("Second")]);
+    // Every route keeps runtime context append-only, so the Messages API keeps both user turns.
+    expect(roles(await validateAnthropic(sanitized))).toEqual([
+      "user",
+      "assistant",
+      "user",
+      "user",
+    ]);
   });
 
   it("strips completed Qwen reasoning but preserves the current tool-call continuation", async () => {

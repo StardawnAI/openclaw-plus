@@ -47,7 +47,6 @@ import {
   resolveFeishuGroupSession,
   resolveFeishuMediaList,
 } from "./bot-content.js";
-import { shouldIncludeFetchedGroupContextMessage } from "./bot-context-visibility.js";
 import { resolveGroupName } from "./bot-group-name.js";
 import { resolveFeishuBotName } from "./bot-name.js";
 import { resolveFeishuSenderName, type FeishuPermissionError } from "./bot-sender-name.js";
@@ -72,6 +71,7 @@ import {
   resolveFeishuGroupConversationIngressAccess,
   resolveFeishuGroupSenderActivationIngressAccess,
   resolveFeishuReplyPolicy,
+  shouldIncludeFetchedGroupContextMessage,
 } from "./policy.js";
 import { resolveFeishuReasoningPreviewEnabled } from "./reasoning-preview.js";
 import { shouldSendNoVisibleReplyFallback } from "./reply-delivery-result.js";
@@ -1122,7 +1122,7 @@ export async function handleFeishuMessage(params: {
             readAllowFromStore: pairing.readAllowFromStore,
             senderOpenId: ctx.senderOpenId,
             senderUserId,
-            conversationId: ctx.senderOpenId,
+            conversationId: ctx.chatId,
             mayPair: false,
             contextBinding,
           });
@@ -1465,9 +1465,7 @@ export async function handleFeishuMessage(params: {
             // Observer agent: no-op dispatcher (session entry + inference, no Feishu reply).
             // Only the active agent should execute commands, including explicit turn metadata.
             agentCtx.CommandAuthorized = false;
-            if (agentCtx.CommandTurn?.kind !== "normal") {
-              delete agentCtx.CommandTurn;
-            }
+            delete agentCtx.CommandTurn;
             delete agentCtx.CommandSource;
           }
           const turnResult = await runAgentTurn(agentCtx, () => ({

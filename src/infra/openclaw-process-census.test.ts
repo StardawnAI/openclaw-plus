@@ -324,6 +324,54 @@ it.each(["service marker", "unnamed package"])(
   },
 );
 
+it.each([
+  { name: "foreign root", uid: 0, evidence: "none", retained: false },
+  { name: "foreign user", uid: 2000, evidence: "none", retained: false },
+  { name: "same user", uid: 1000, evidence: "none", retained: true },
+  { name: "unknown user", uid: undefined, evidence: "none", retained: true },
+  { name: "same-user OpenClaw", uid: 1000, evidence: "openclaw", retained: true },
+  { name: "foreign argv holder", uid: 0, evidence: "argv", retained: true },
+  { name: "foreign cwd holder", uid: 0, evidence: "cwd", retained: true },
+  { name: "foreign preload alias", uid: 0, evidence: "alias", retained: true },
+])(
+  "checks runtime evidence despite denied identity inspection: $name",
+  ({ uid, evidence, retained }) => {
+    const runtime = "/tmp/openclaw-update-runtime-Held01";
+    const script = evidence === "openclaw" ? "/app/openclaw.mjs" : "/app/server/index.mjs";
+    processRow(
+      peer,
+      [
+        "node",
+        ...(evidence === "alias" ? ["--require", "/runtime-alias/preload.cjs"] : []),
+        evidence === "argv" ? `${runtime}/worker.js` : script,
+      ],
+      {
+        uid,
+        cwd: evidence === "cwd" ? runtime : denied(),
+      },
+    );
+    const inspect = read.getMockImplementation()!;
+    read.mockImplementation((file: string) => {
+      if (
+        file === `/proc/${peer}/environ` ||
+        (uid === undefined && file === `/proc/${peer}/status`)
+      ) {
+        throw denied();
+      }
+      return inspect(file);
+    });
+    realpath.mockImplementation((file: string) =>
+      file === "/runtime-alias/preload.cjs" ? `${runtime}/preload.cjs` : file,
+    );
+    const result = inspectOtherOpenClawProcesses(runtime);
+    expect(result).not.toHaveProperty("error");
+    expect("pids" in result && result.pids).toEqual(retained ? [peer] : []);
+    if (!retained) {
+      expect(result).not.toHaveProperty("warnings");
+    }
+  },
+);
+
 it.each(["bridge", "start"])("distinguishes a Bun file from a package task: %s", (script) => {
   processRow(peer, ["bun", "run", "--silent", script], { cwd: "/unrelated-app" });
   realpath.mockImplementation((file: string) =>
@@ -383,7 +431,7 @@ it.each([
   expectPids(verified ? [] : [launcher]);
 });
 
-it.each(["missing self", "missing ancestor", "failed enumeration", "container", "win32"])(
+it.each(["missing self", "missing ancestor", "failed enumeration", "container"])(
   "does not authorize cleanup with %s",
   (failure) => {
     if (failure === "missing self") {
@@ -400,18 +448,10 @@ it.each(["missing self", "missing ancestor", "failed enumeration", "container", 
     if (failure === "container") {
       container.mockReturnValue(true);
     }
-    if (failure === "win32") {
-      mockProcessPlatform("win32");
-    }
     const result = inspectOtherOpenClawProcesses();
     if (failure === "container") {
       expect(result).toEqual({ error: expect.stringContaining("Host process visibility") });
       expect(directory).not.toHaveBeenCalled();
-    } else if (failure === "win32") {
-      expect(result).toEqual({
-        error: expect.stringContaining("Exact process command census is unavailable on win32"),
-      });
-      expect(census).not.toHaveBeenCalled();
     } else {
       expect(result).toHaveProperty("error");
     }

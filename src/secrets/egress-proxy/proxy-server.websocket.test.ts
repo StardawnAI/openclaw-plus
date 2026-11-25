@@ -6,10 +6,10 @@ import net, { type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { promisify } from "node:util";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "../../../packages/gateway-client/src/websocket.test-support.js";
 import { createTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { PROXY_ENV_KEYS } from "../../infra/net/proxy-env.js";
 import { ensureSecretEgressProxyCa, generateLocalProxyLeaf } from "../../proxy-capture/ca.js";
 import { sealSecretSentinel } from "../sentinel.js";
 import {
@@ -164,9 +164,6 @@ beforeAll(async () => {
 afterAll(() => seedDirs.cleanup());
 
 beforeEach(async () => {
-  for (const key of [...PROXY_ENV_KEYS, "NO_PROXY", "no_proxy"]) {
-    vi.stubEnv(key, undefined);
-  }
   caDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-egress-websocket-"));
   for (const file of ["root-ca.pem", "root-ca-key.pem", "leaf-key.pem"]) {
     fs.copyFileSync(path.join(seedDir, file), path.join(caDir, file));
@@ -241,14 +238,9 @@ afterEach(async () => {
   }
   sockets.clear();
   await proxy.stop();
-  await new Promise<void>((resolve) => {
-    wss.close(() => resolve());
-  });
-  await new Promise<void>((resolve) => {
-    origin.close(() => resolve());
-  });
+  await promisify(wss.close.bind(wss))();
+  await promisify(origin.close.bind(origin))();
   fs.rmSync(caDir, { recursive: true, force: true });
-  vi.unstubAllEnvs();
 });
 
 describe("secret egress WebSocket forwarding", () => {

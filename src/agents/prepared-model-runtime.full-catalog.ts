@@ -43,7 +43,6 @@ import {
 import { acquirePreparedMediaCapabilityProviders } from "./prepared-model-runtime.plugin-generation.js";
 import type {
   PreparedRuntimeCapabilityModel,
-  PreparedModelCatalogInventory,
   PreparedModelRuntimeCatalogMode,
   PreparedModelRuntimePluginGeneration,
   PreparedModelRuntimeSnapshot,
@@ -331,19 +330,6 @@ export function materializePreparedModelCatalog(
 export const isPreparedModelCatalogFull = (snapshot: ModelCatalogSnapshot): boolean =>
   fullModelCatalogSnapshots.has(snapshot);
 
-/** Finalizes readiness and full-inventory provenance together after projection. */
-export function finalizePreparedModelCatalog(
-  catalog: ModelCatalogSnapshot,
-  inventory: PreparedModelCatalogInventory,
-  eligibleProviders: readonly string[],
-  acquiredNative: boolean,
-): void {
-  catalog.authoritative = acquiredNative && !catalog.refreshFailed && catalog.authoritative;
-  if (acquiredNative && eligibleProviders.every((provider) => inventory.providers.has(provider))) {
-    markPreparedModelCatalogFull(catalog);
-  }
-}
-
 /** Restores process-local provenance after a complete catalog crosses a worker boundary. */
 export function markPreparedModelCatalogFull(snapshot: ModelCatalogSnapshot): ModelCatalogSnapshot {
   fullModelCatalogSnapshots.add(snapshot);
@@ -426,12 +412,12 @@ export function createPreparedModelRuntimeSnapshot(
       pluginMetadataSnapshot,
     ),
     inlineProviderModels,
-    createStores: (publishedModels?: ReadonlyMap<string, readonly Model[]>) => {
+    createStores: (publishedModels, selectedModel) => {
       // Runtime keys and session extensions mutate per-run stores; parsed inputs stay shared.
       const authStorage = AuthStorage.inMemory(credentials);
       return {
         authStorage,
-        modelRegistry: templateModelRegistry.fork(authStorage, publishedModels),
+        modelRegistry: templateModelRegistry.fork(authStorage, publishedModels, selectedModel),
       };
     },
     routeModelResolutionMemo: new Map<string, Promise<Model>>(),

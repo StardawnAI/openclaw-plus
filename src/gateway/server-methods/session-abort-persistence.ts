@@ -12,11 +12,11 @@ export function createSessionAbortPersistence(params: {
   stopReason?: string;
   assertCurrent?: () => void;
 }) {
-  return async (
+  return (
     owner: Pick<ActiveEmbeddedRunOwner, "runId" | "sessionId" | "startedAtMs">,
     requireYielded?: true,
-  ) => {
-    await persistGatewaySessionLifecycleEvent({
+  ) =>
+    persistGatewaySessionLifecycleEvent({
       sessionKey: params.sessionKey,
       agentId: params.agentId,
       assertCommitAllowed: () => {
@@ -44,5 +44,4 @@ export function createSessionAbortPersistence(params: {
         },
       },
     });
-  };
 }

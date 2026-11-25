@@ -50,11 +50,7 @@ it.each([
   ["state", cleanup.removeStateAndLinkedPaths, false],
   ["workspace", cleanup.removeWorkspaceDirs, ["/tmp/.openclaw/workspace"]],
 ] as const)("reports incomplete full reset when %s cleanup fails", async (kind, remove, result) => {
-  if (kind === "state") {
-    remove.mockResolvedValueOnce(result);
-  } else {
-    remove.mockResolvedValueOnce([...result]);
-  }
+  remove.mockResolvedValueOnce(result);
   await expectIncomplete();
   if (kind === "state") {
     expect(cleanup.removeWorkspaceDirs.mock.lastCall?.[2]).toMatchObject({

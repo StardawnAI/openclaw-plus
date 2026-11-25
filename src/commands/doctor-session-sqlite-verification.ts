@@ -124,9 +124,7 @@ export function createRecoveryDestinationVerifier(
             ).some((key) => file?.[key] !== expected.files[index]?.[key]),
           ))
       ) {
-        throw new Error(
-          `Recovery destination database changed (stage=file-stat, ownedMutation=${Boolean(options.allowOwnedMutation)}); preview cleanup again.`,
-        );
+        throw new Error("Recovery destination database changed; preview cleanup again.");
       }
       const identity = target.databaseIdentity;
       const deviceChanged = identity !== undefined && identity.dev !== String(files[0]!.dev);
@@ -158,9 +156,7 @@ export function createRecoveryDestinationVerifier(
               generation[key]?.sha256 !== expected.generation?.[key]?.sha256),
         )
       ) {
-        throw new Error(
-          `Recovery destination database changed (stage=generation, ownedMutation=${Boolean(options.allowOwnedMutation)}); preview cleanup again.`,
-        );
+        throw new Error("Recovery destination database changed; preview cleanup again.");
       }
       if (identity && deviceChanged) {
         // An inode can collide across volumes. Without a remount witness, older manifests can

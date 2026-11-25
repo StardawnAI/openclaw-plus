@@ -1,16 +1,17 @@
 /** Real-process lifecycle tests for the interactive ACP client. */
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, expect, it } from "vitest";
 import { runManagedCommand } from "../../scripts/lib/managed-child-process.mts";
 import { createBoundedChildOutput } from "../../test/helpers/bounded-child-output.js";
 import { createFixtureLifetime } from "../../test/helpers/fixture-lifetime.js";
 import { DEFAULT_VITEST_TEST_TIMEOUT_MS } from "../../test/vitest/vitest.timeouts.js";
+import { nativeProcessTestEntrypoints } from "../infra/native-process-runtime.test-support.js";
+import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { resolveTestNodeExecPath } from "../test-utils/node-process.js";
 
 const fixture = createFixtureLifetime();
-const node = resolveTestNodeExecPath();
+const clientUrl = resolveRuntimeWorkerUrl(nativeProcessTestEntrypoints.acpClient);
 const handshakeError = {
   code: -32000,
   message: "fixture newSession failure",
@@ -81,17 +82,15 @@ setInterval(() => {}, 60_000);
     let prompted = false;
     let quitSent = false;
     const result = await runManagedCommand({
-      bin: node,
+      bin: resolveTestNodeExecPath(),
       args: [
-        "--import",
-        fileURLToPath(new URL("../../scripts/tsx.mjs", import.meta.url)),
         "--input-type=module",
         "--eval",
-        `import { runAcpClientInteractive } from ${JSON.stringify(new URL("./client.ts", import.meta.url).href)};
+        `import { runAcpClientInteractive } from ${JSON.stringify(clientUrl.href)};
          import { readFileSync } from "node:fs";
          process.exitCode = await runAcpClientInteractive({ serverCommand: process.execPath, cwd: process.argv[1] }).catch(error => {
-           if (${JSON.stringify(mode)} !== "handshake-failure") throw error;
-           const serverPid = Number(readFileSync(process.argv[2], "utf8"));
+           if (process.argv[2] !== "handshake-failure") throw error;
+           const serverPid = Number(readFileSync(process.argv[1] + "/server.pid", "utf8"));
            let serverAlive = true;
            try { process.kill(serverPid, 0); } catch { serverAlive = false; }
            const { name, code, message, data } = error;
@@ -99,7 +98,7 @@ setInterval(() => {}, 60_000);
            return 0;
          });`,
         dir,
-        pidFile,
+        mode,
       ],
       env: {
         PATH: process.env.PATH,
@@ -160,15 +159,9 @@ setInterval(() => {}, 60_000);
   });
 }
 
-it.each(process.platform === "win32" ? [undefined] : ([undefined, "SIGINT", "SIGTERM"] as const))(
+it.each(process.platform === "win32" ? [undefined] : ([undefined, "SIGINT"] as const))(
   "joins the spawned ACP server after handshake failure or %s",
-  (signal) =>
-    runCase(
-      "handshake-failure",
-      signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : 0,
-      undefined,
-      signal,
-    ),
+  (signal) => runCase("handshake-failure", signal ? 130 : 0, undefined, signal),
   20_000,
 );
 

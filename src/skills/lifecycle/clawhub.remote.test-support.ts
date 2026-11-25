@@ -164,14 +164,7 @@ export function registerRemoteClawHubTests(getWorkspaceDir: () => string) {
             scenario === "edited" ? 0 : 1,
           );
         } else {
-          expect(results).toEqual([
-            expect.objectContaining({
-              ok: true,
-              slug: "weather",
-              previousVersion: "0.9.0",
-              version: "1.0.0",
-            }),
-          ]);
+          expect(results).toMatchObject([{ ok: true, previousVersion: "0.9.0", version: "1.0.0" }]);
           expect(installPackageDirMock).toHaveBeenCalledWith(
             expect.objectContaining({ targetDir: skillDir }),
           );

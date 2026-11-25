@@ -174,9 +174,12 @@ suite.define(() => {
         await composer.fill("Prepare a garden plan in the background.");
         await composer.press("Control+Shift+Enter");
         await gateway.waitForRequest("agent.wait");
+        // Dismiss the creation notice before releasing the separate completion notice.
+        await page.getByRole("button", { name: "Dismiss", exact: true }).click();
+        await expect.poll(() => page.locator(".app-toast").count()).toBe(0);
         await composer.fill("Keep this unsent draft in the current tab.");
         await gateway.resolveDeferred("agent.wait", { status: "ok", endedAt: Date.now() });
-        const action = page.locator(".app-toast__action");
+        const action = page.getByRole("link", { name: "Open session", exact: true });
         await action.waitFor();
         await action.hover();
         if (captureUiProof) {
@@ -185,6 +188,8 @@ suite.define(() => {
         await action.click({ button: "right" });
         expect(new URL(page.url()).pathname).toBe("/new");
         expect(await action.isVisible()).toBe(true);
+        // Escape on a focused toast dismisses it; close the context menu from outside.
+        await action.blur();
         await page.keyboard.press("Escape");
         for (const activation of [
           { button: "middle" as const },
@@ -227,13 +232,6 @@ suite.define(() => {
         });
         await installMockGateway(page, { awaitInitialRoster: false });
         await page.goto(`${suite.server.baseUrl}settings/notifications`);
-        if (captureUiProof) {
-          const nativeSection = page.locator(".settings-section").filter({
-            has: page.getByRole("heading", { name: "Notifications", exact: true }),
-          });
-          await nativeSection.getByRole("button").waitFor();
-          await page.screenshot({ path: path.join(suite.artifactDir, "native-test-idle.png") });
-        }
         const send = page.getByRole("button", { name: "Send test", exact: true });
         await send.click();
         const pending = page.getByRole("button", { name: "Sending test…", exact: true });

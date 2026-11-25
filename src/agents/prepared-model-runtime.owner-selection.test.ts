@@ -5,20 +5,15 @@ import {
   usePreparedModelRuntimeHarness,
   getPreparedModelRuntimeTestApi,
 } from "./prepared-model-runtime.test-harness.js";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { retainLegacyDefaultAgentId } from "../config/legacy.default-agent-owner.js";
 import {
   createPluginMetadataSnapshot,
   makeRegistry,
 } from "../config/plugin-auto-enable.test-helpers.js";
-import {
-  clearRuntimeConfigSnapshot,
-  setRuntimeConfigSnapshot,
-} from "../config/runtime-snapshot.js";
 import * as pluginMetadata from "../plugins/plugin-metadata-snapshot.js";
 import * as legacyAuth from "./legacy-inherited-auth-dir.js";
-import { getPreparedModelRuntimePolicyConfigReader } from "./prepared-model-runtime-auth.js";
 import {
   scopePreparedModelRuntimeLease,
   withPreparedModelRuntimePluginGenerationScope,
@@ -74,8 +69,6 @@ function liveCatalog() {
   });
   return discovered;
 }
-
-afterEach(() => clearRuntimeConfigSnapshot());
 
 function gatewayConfig() {
   return retainLegacyDefaultAgentId(
@@ -295,15 +288,7 @@ describe("prepared model runtime owner selection", () => {
       matchingPendingA,
       pendingB,
     ]);
-    expect(matchingLeaseA.snapshot).not.toBe(leaseA.snapshot);
-    expect(matchingLeaseA.snapshot.config).toBe(leaseA.snapshot.config);
-    expect(matchingLeaseA.snapshot.observationConfig).toBe(leaseA.snapshot.observationConfig);
-    expect(matchingLeaseA.snapshot.modelCatalog).toBe(leaseA.snapshot.modelCatalog);
-    expect(matchingLeaseA.snapshot.metadataSnapshot).toBe(leaseA.snapshot.metadataSnapshot);
-    expect(matchingLeaseA.snapshot.pluginRegistry).toBe(leaseA.snapshot.pluginRegistry);
-    expect(matchingLeaseA.snapshot.createStores).toBe(leaseA.snapshot.createStores);
-    expect(matchingLeaseA.snapshot.isCurrent).toBe(leaseA.snapshot.isCurrent);
-    expect(getPreparedModelRuntimePolicyConfigReader(matchingLeaseA.snapshot)!()).toBe(config);
+    expect(matchingLeaseA.snapshot).toBe(leaseA.snapshot);
     expect(rejectedGeneration).toEqual(
       expect.objectContaining({ message: expect.stringContaining("superseded") }),
     );
@@ -340,7 +325,6 @@ describe("prepared model runtime owner selection", () => {
       workspaceDir: "/tmp/unused-workspace",
     });
 
-    setRuntimeConfigSnapshot(previousConfig);
     await publishGateway(previousConfig, publicationOptions);
     const admitted = await publishedRuntime();
     const generation = admitted!.pluginGeneration;
@@ -351,11 +335,9 @@ describe("prepared model runtime owner selection", () => {
     const previousSnapshot = getPreparedModelRuntimeSnapshot(previousInput);
 
     await using outerLease = scopePreparedModelRuntimeLease(await acquirePrevious());
-    expect(outerLease.snapshot).not.toBe(previousSnapshot);
-    expect(outerLease.snapshot.modelCatalog).toBe(previousSnapshot!.modelCatalog);
+    expect(outerLease.snapshot).toBe(previousSnapshot);
 
     await refreshPreparedModelRuntimeSnapshots(committedConfig, publicationOptions);
-    setRuntimeConfigSnapshot(committedConfig);
     const committedSnapshot = getPreparedModelRuntimeSnapshot(committedInput);
     const registryLoads = mocks.loadAgentRuntimePluginRegistryHandle.mock.calls.length;
     expect(committedSnapshot).toBeDefined();
@@ -370,19 +352,13 @@ describe("prepared model runtime owner selection", () => {
           acquirePrevious,
         );
 
-        expect(resumed.snapshot).toBe(outerLease.snapshot);
-        expect(getPreparedModelRuntimePolicyConfigReader(resumed.snapshot)!()).toBe(
-          committedConfig,
-        );
+        expect(resumed.snapshot).toBe(previousSnapshot);
         expect(getPreparedModelRuntimeSnapshot(committedInput)).toBe(committedSnapshot);
         expect(mocks.loadAgentRuntimePluginRegistryHandle).toHaveBeenCalledTimes(registryLoads);
         await resumed[Symbol.asyncDispose]();
         {
-          const clonedConfig = structuredClone(previousConfig);
-          await using cloned = await acquirePrevious(runInput(clonedConfig));
-          expect(cloned.snapshot).not.toBe(outerLease.snapshot);
-          expect(cloned.snapshot.modelCatalog).toBe(outerLease.snapshot.modelCatalog);
-          expect(getPreparedModelRuntimePolicyConfigReader(cloned.snapshot)!()).toBe(clonedConfig);
+          await using cloned = await acquirePrevious(runInput(structuredClone(previousConfig)));
+          expect(cloned.snapshot).toBe(previousSnapshot);
         }
         for (const [input, requestedGeneration] of [
           [{ ...previousInput, workspaceDir: "/tmp/different-workspace" }, generation],
@@ -404,12 +380,8 @@ describe("prepared model runtime owner selection", () => {
     await expect(acquirePrevious()).rejects.toThrow("plugin generation was superseded");
     expect(getPreparedModelRuntimeSnapshot(committedInput)).toBe(committedSnapshot);
 
-    await using next = await acquireAgentRunPreparedModelRuntime({
-      ...previousInput,
-      readPolicyConfig: () => previousConfig,
-    });
+    await using next = await acquireAgentRunPreparedModelRuntime(committedInput);
     expect(next.snapshot).toBe(committedSnapshot);
-    expect(getPreparedModelRuntimePolicyConfigReader(next.snapshot)!()).toBe(committedConfig);
   });
 
   it("does not choose between configured owners sharing one agent directory", async () => {

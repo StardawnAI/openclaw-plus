@@ -300,7 +300,7 @@ describe("runDoctorSessionSqlite", () => {
       expect(entry("work")?.entry.sessionId).toBe("work-session");
       expectMissing(file("main-session"), file("work-session"), file("orphan"));
       closeDatabases();
-      const preview = inspectSessionSqliteRecovery({ cfg, env });
+      const preview = await inspectSessionSqliteRecovery({ cfg, env });
       const cleanup = await retireSessionSqliteRecovery({
         env,
         preview,

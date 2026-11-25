@@ -1,17 +1,14 @@
 import fs from "node:fs";
-import { format } from "node:util";
 import type { DeferredPluginMigration } from "../infra/deferred-plugin-migrations.contract.js";
 import { withLeasePinnedDeferredPluginMigrations } from "../infra/deferred-plugin-migrations.js";
 import { loadDotEnvAsync } from "../infra/dotenv.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { tryProcessCwd } from "../infra/safe-cwd.js";
-import { writeRootConsoleLine } from "../logging/console.js";
 import {
   cloneEnvWithPlatformSemantics,
   createConfigRuntimeEnvBase,
   prepareConfigRuntimeEnvLoad,
 } from "./config-env-vars.js";
-import { resolveManagedUnsetPathsForWrite } from "./config-path-mutation.js";
 import { assertConfigWriteAllowedInCurrentMode } from "./config-write-guard.js";
 import { getDeferredPluginMigrationConfigFacts } from "./deferred-plugin-migration-config.js";
 import { resolveWriteEnvSnapshotForPath } from "./env-preserve.js";
@@ -311,19 +308,7 @@ export async function readBestEffortConfigSnapshot(options?: {
 }
 
 export async function readSourceConfigBestEffort(): Promise<OpenClawConfig> {
-  // Source-only routing/status reads precede state admission. Diagnostics belong
-  // on the console, not in a file sink inside the profile being inspected.
-  const diagnostic = (method: "warn" | "error", args: unknown[]) => {
-    if (!writeRootConsoleLine(method, format(...args))) {
-      console[method](...args);
-    }
-  };
-  return await createConfigIO({
-    logger: {
-      warn: (...args) => diagnostic("warn", args),
-      error: (...args) => diagnostic("error", args),
-    },
-  }).readSourceConfigBestEffort();
+  return await createConfigIO().readSourceConfigBestEffort();
 }
 
 export async function readConfigFileSnapshot(
@@ -397,8 +382,10 @@ export async function recoverConfigFromJsonRootSuffix(
   return await createConfigIO().recoverConfigFromJsonRootSuffix(snapshot, assertRecoveryCandidate);
 }
 
-export async function readSourceConfigSnapshot(): Promise<ConfigFileSnapshot> {
-  return await readConfigFileSnapshot();
+export async function readSourceConfigSnapshot(
+  options?: Pick<ConfigSnapshotReadOptions, "observe">,
+): Promise<ConfigFileSnapshot> {
+  return await readConfigFileSnapshot(options);
 }
 
 export async function readConfigFileSnapshotForRuntimeTransaction(
@@ -515,7 +502,6 @@ export async function writeConfigFile(
           expectedConfigPath: options.expectedConfigPath,
           envSnapshotForRestore: options.envSnapshotForRestore,
         }),
-        unsetPaths: resolveManagedUnsetPathsForWrite(options.unsetPaths),
         explicitSetValueSource: options.explicitSetPaths
           ? (options.explicitSetValueSource ?? cfg)
           : undefined,

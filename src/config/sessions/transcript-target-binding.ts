@@ -11,7 +11,6 @@ type StorageEnvironment = Readonly<SqliteWorkerStateContext["environment"]>;
 
 const storageEnvironmentKeys = new Set([
   "OPENCLAW_STATE_DIR",
-  "OPENCLAW_PROFILE",
   "OPENCLAW_SUPERVISOR_MODE",
   "OPENCLAW_HOME",
   "HOME",

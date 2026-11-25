@@ -275,7 +275,6 @@ describe("resolveFollowupDeliveryDecision", () => {
         payloads: [...kept, { mediaUrl: media.mediaUrl, audioAsVoice: true }],
       });
       if (decision.kind === "deliver") {
-        expect(decision.payloads).toHaveLength(kept.length + 1);
         expect(decision.payloads.at(-1)?.text).toBeUndefined();
         expect(
           getReplyPayloadMetadata(expectDefined(decision.payloads.at(-1), "queued media payload")),

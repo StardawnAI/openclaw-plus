@@ -5,7 +5,6 @@ import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.
 import { normalizeAcceptedSessionSpawnResult } from "../accepted-session-spawn.js";
 import { setCompactionSafeguardRuntime } from "../agent-hooks/compaction-safeguard-runtime.js";
 import compactionSafeguardExtension, {
-  executeCompactionSafeguard,
   runCompactionSafeguard,
 } from "../agent-hooks/compaction-safeguard.js";
 import { resolveEffectiveCompactionMode } from "../agent-settings.js";
@@ -20,7 +19,7 @@ import type { ExtensionFactory, SessionManager } from "../sessions/index.js";
 import { isToolResultError } from "../tool-result-error.js";
 import { recordEmbeddedToolReceipt } from "./tool-send-receipts.js";
 
-/** The builtin loader exposes the same configuration to array and prepared execution. */
+/** The private loader knows the builtin it installs; generic extension paths do not. */
 export function resolveEmbeddedCompactionSafeguard(params: {
   cfg: OpenClawConfig | undefined;
   workspaceDir: string;
@@ -34,7 +33,6 @@ export function resolveEmbeddedCompactionSafeguard(params: {
   return {
     factory: compactionSafeguardExtension,
     execute: runCompactionSafeguard,
-    executePrepared: executeCompactionSafeguard,
     runtime: {
       identifierPolicy: compactionCfg?.identifierPolicy,
       qualityGuardEnabled: qualityGuardCfg?.enabled ?? true,

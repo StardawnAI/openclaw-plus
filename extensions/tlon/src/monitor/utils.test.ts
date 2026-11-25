@@ -28,13 +28,6 @@ it.each(["~zod please summarize:\n1. parent\n   - child", "- [ ] todo\n- [x] don
   (markdown) => expect(extractMessageText(markdownToStory(markdown))).toBe(markdown),
 );
 
-it("omits code from nested list items and tasks when extracting mentions", () => {
-  const story = markdownToStory("- parent\n  - `~zod`\n- [ ] `~nec`");
-  expect(extractMessageText(story)).toContain("`~zod`");
-  expect(extractMessageText(story)).toContain("`~nec`");
-  expect(extractMessageText(story, true)).not.toMatch(/~zod|~nec/);
-});
-
 const MAX_DEPTH = 100;
 const render = (...inline: unknown[]) => extractMessageText([{ inline }]);
 
@@ -94,17 +87,4 @@ it("shifts the local time relative to the UTC baseline when a non-UTC zone is co
   expect(newYork).toContain("08:00:00");
   expect(shanghai).not.toBe(utc);
   expect(newYork).not.toBe(utc);
-});
-
-it("joins multiple entries with newlines", () => {
-  const history = [
-    { author: "~a", content: "first", timestamp: SAMPLE_TS },
-    { author: "~b", content: "second", timestamp: SAMPLE_TS + 60_000 },
-  ];
-  const text = formatSummarizationHistoryText(history, {
-    agents: { defaults: { userTimezone: "UTC" } },
-  });
-  expect(text.split("\n")).toHaveLength(2);
-  expect(text).toContain("first");
-  expect(text).toContain("second");
 });

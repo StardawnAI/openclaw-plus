@@ -18,7 +18,6 @@ import {
   parseCommandArgs,
   resolveCommandArgChoices,
   resolveCommandArgMenu,
-  resolveCommandArgMenuAsync,
   resolveTextCommand,
   shouldHandleTextCommands,
 } from "./commands-registry.js";
@@ -28,12 +27,6 @@ import type {
   CommandArgChoiceContext,
   NativeCommandSpec,
 } from "./commands-registry.types.js";
-
-const { loadMenuCatalog } = vi.hoisted(() => ({ loadMenuCatalog: vi.fn() }));
-vi.mock("./command-arg-menu-catalog.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./command-arg-menu-catalog.js")>()),
-  loadCommandArgMenuModelCatalog: loadMenuCatalog,
-}));
 
 type NativeNameParams = { commandKey: string; defaultName: string };
 const ollamaModel = { id: "glm-5.2:cloud", name: "GLM 5.2 Cloud", reasoning: true };
@@ -88,7 +81,6 @@ function installOllamaThinkingProvider() {
 }
 
 beforeEach(() => {
-  loadMenuCatalog.mockReset();
   vi.doUnmock("../channels/plugins/index.js");
   resetPluginRuntimeStateForTest();
   setActivePluginRegistry(createTestRegistry([]));
@@ -394,6 +386,21 @@ describe("commands registry", () => {
 });
 
 describe("commands registry args", () => {
+  it("leaves bare ACP to its help handler instead of offering incomplete actions", () => {
+    const command = chatCommand("acp");
+    expect(resolveCommandArgMenu({ command, cfg: {} })).toBeNull();
+    expect(buildCommandTextFromArgs(command, parseCommandArgs(command, "spawn claude"))).toBe(
+      "/acp spawn claude",
+    );
+    const action = expectDefined(
+      command.args?.find((arg) => arg.name === "action"),
+      "ACP action",
+    );
+    expect(resolveCommandArgChoices({ command, arg: action })).toContainEqual({
+      value: "spawn",
+      label: "spawn",
+    });
+  });
   it("parses positional args and captureRemaining", () => {
     const command = commandFixture("debug", [
       commandArg("action"),
@@ -447,8 +454,11 @@ describe("commands registry args", () => {
       command: { key: "think" },
       arg: { name: "level" },
       agentRuntime: "codex",
-      catalog: [],
     });
+    // The default model's bundled row supplies its thinking facts.
+    expect(seenChoice.catalog).toEqual([
+      expect.objectContaining({ provider: seenChoice.provider, id: seenChoice.model }),
+    ]);
     expect(typeof seenChoice.provider).toBe("string");
     expect(seenChoice.provider?.trim().length).toBeGreaterThan(0);
     expect(typeof seenChoice.model).toBe("string");
@@ -468,6 +478,15 @@ describe("commands registry args", () => {
       agentRuntime,
     });
     expect(menu.choices.some((choice) => choice.value === "ultra")).toBe(true);
+  });
+  it("builds the /think menu for the configured default model's bundled row", () => {
+    const command = nativeCommand("think");
+    const menu = argMenu({
+      command,
+      cfg: { agents: { defaults: { model: { primary: "moonshot/kimi-k3" } } } },
+    });
+    expect(menuValues(menu)).toContain("max");
+    expect(menuValues(menu)).not.toContain("low");
   });
   it.each<[unknown, CommandArgChoiceContext["catalog"]]>([
     [modelConfig("ollama", ollamaModel), undefined],
@@ -503,51 +522,6 @@ describe("commands registry args", () => {
     });
     expect(menuValues(menu)).toContain("xhigh");
     expect(formatCommandArgMenuTitle({ command, menu })).toContain("xhigh");
-  });
-  it("loads published thinking metadata once for choices and channel status", async () => {
-    installOllamaThinkingProvider();
-    const catalog = [{ provider: "ollama", ...ollamaModel }];
-    loadMenuCatalog.mockResolvedValue(catalog);
-    const cfg = agentModels({ "ollama/*": {} });
-    const menu = expectDefined(
-      await resolveCommandArgMenuAsync({
-        command: nativeCommand("think"),
-        cfg,
-        session: { agentId: "target", sessionKey: "agent:target:main" },
-        provider: "ollama",
-        model: ollamaModel.id,
-      }),
-      "thinking menu",
-    );
-    expect(menuValues(menu)).toEqual(["default", "off", "low", "medium", "high", "max"]);
-    expect(menu.modelCatalog).toBe(catalog);
-    expect(loadMenuCatalog).toHaveBeenCalledExactlyOnceWith({ cfg, agentId: "target" });
-  });
-  it("preserves an explicitly supplied empty thinking catalog without loading", async () => {
-    installOllamaThinkingProvider();
-    const menu = expectDefined(
-      await resolveCommandArgMenuAsync({
-        command: nativeCommand("think"),
-        cfg: agentModels({ "ollama/*": {} }),
-        provider: "ollama",
-        model: ollamaModel.id,
-        catalog: [],
-      }),
-      "thinking menu",
-    );
-    expect(menuValues(menu)).toEqual(["default", "off"]);
-    expect(loadMenuCatalog).not.toHaveBeenCalled();
-  });
-  it("does not load thinking metadata when the argument is already supplied", async () => {
-    const command = nativeCommand("think");
-    expect(
-      await resolveCommandArgMenuAsync({
-        command,
-        cfg: {},
-        args: parseCommandArgs(command, "high"),
-      }),
-    ).toBeNull();
-    expect(loadMenuCatalog).not.toHaveBeenCalled();
   });
   it("does not show menus when args were provided as raw text only", () => {
     const command = commandFixture(

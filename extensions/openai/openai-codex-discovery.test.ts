@@ -44,7 +44,7 @@ describe("OpenAI discovered subscription models", () => {
     ["2025.12.31", "99.0.0"],
     ["10000.1.1", "99.0.0"],
     ["2026.11", "99.0.0"],
-    ["2026.11.5garbage", "99.0.0"],
+    ["2026.11.5garbage", "2026.11.5"],
   ])("lists with OpenClaw version %s or its safe fallback", async (version, expected) => {
     vi.stubEnv("OPENCLAW_VERSION", version);
     const { fetch, provider } = await discoverCodexModels([

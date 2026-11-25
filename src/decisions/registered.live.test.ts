@@ -20,9 +20,10 @@ import { getPluginInstance } from "../plugins/plugin-instance-scope.js";
 import { resetPluginRuntimeStateForTest } from "../plugins/runtime.js";
 import { withEnvAsync } from "../test-utils/env.js";
 import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
-import { prepareDecisionProviderReload } from "./runtime.js";
-import type { DecisionBatchV2, DecisionOutcomeV2 } from "./types-v2.js";
-import type { DecisionBatch, DecisionOutcome } from "./types.js";
+import type { DecisionOutcome, DecisionOutcomeV2 } from "./host-outcomes.js";
+import { prepareDecisionProviderReload } from "./provider-reload.js";
+import type { DecisionBatchV2 } from "./types-v2.js";
+import type { DecisionBatch } from "./types.js";
 
 const routes = [
   {
@@ -157,8 +158,9 @@ describe.skipIf(routes.length === 0)("registered Decision live flow", () => {
               };
               const reply = await tool.execute("live-decision", batch);
               const outcome = reply.details as DecisionOutcome;
+              expect(outcome.status).toBe("ok");
               if (outcome.status !== "ok") {
-                throw new Error(`${plugin} text Decision unavailable: ${outcome.reason}`);
+                throw new Error("Decision unavailable: " + outcome.reason);
               }
               const { answers, usage, model } = outcome.result;
               expect(model).toBe(modelId);
@@ -205,10 +207,9 @@ describe.skipIf(routes.length === 0)("registered Decision live flow", () => {
                 ...batch,
               });
               const outcome = reply.details as DecisionOutcomeV2;
+              expect(outcome.status).toBe("ok");
               if (outcome.status !== "ok") {
-                throw new Error(
-                  `${plugin} ${image.mimeType} Decision unavailable: ${outcome.reason}`,
-                );
+                throw new Error("Image Decision unavailable: " + outcome.reason);
               }
               const { answers, usage, model } = outcome.result;
               expect(outcome.provenance.providerId).toBe(plugin);

@@ -1,10 +1,4 @@
-import type {
-  AssistantMessage,
-  HistoryUsage,
-  ImageContent,
-  TextContent,
-  Usage,
-} from "../llm/types.js";
+import type { AssistantMessage, ImageContent, TextContent, Usage } from "../llm/types.js";
 
 function projectWorkerTextContent(part: TextContent) {
   return {
@@ -43,9 +37,7 @@ export function projectWorkerAssistantContent(part: AssistantMessage["content"][
   };
 }
 
-export function projectWorkerTokenUsage(usage: Usage): Omit<Usage, "contextUsage">;
-export function projectWorkerTokenUsage(usage: HistoryUsage): Omit<HistoryUsage, "contextUsage">;
-export function projectWorkerTokenUsage(usage: HistoryUsage) {
+export function projectWorkerTokenUsage(usage: Usage) {
   return {
     input: usage.input,
     output: usage.output,
@@ -53,17 +45,13 @@ export function projectWorkerTokenUsage(usage: HistoryUsage) {
     cacheWrite: usage.cacheWrite,
     totalTokens: usage.totalTokens,
     ...(usage.usageReport ? { usageReport: { ...usage.usageReport } } : {}),
-    ...(usage.cost
-      ? {
-          cost: {
-            input: usage.cost.input,
-            output: usage.cost.output,
-            cacheRead: usage.cost.cacheRead,
-            cacheWrite: usage.cost.cacheWrite,
-            total: usage.cost.total,
-            ...(usage.cost.totalOrigin ? { totalOrigin: usage.cost.totalOrigin } : {}),
-          },
-        }
-      : {}),
+    cost: {
+      input: usage.cost.input,
+      output: usage.cost.output,
+      cacheRead: usage.cost.cacheRead,
+      cacheWrite: usage.cost.cacheWrite,
+      total: usage.cost.total,
+      ...(usage.cost.totalOrigin ? { totalOrigin: usage.cost.totalOrigin } : {}),
+    },
   };
 }

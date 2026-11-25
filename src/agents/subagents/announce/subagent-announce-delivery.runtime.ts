@@ -15,7 +15,6 @@ import {
 } from "../../../config/sessions/session-entry-read-runtime.js";
 import { resolvePersistedSessionStoreOwnerForKey } from "../../../config/sessions/session-store-owner.js";
 import type { OpenClawConfig } from "../../../config/types.openclaw.js";
-import type { GatewayContextResolver } from "../../../gateway/server-methods/types.js";
 import {
   isIncognitoSessionKey,
   normalizeAgentId,
@@ -27,13 +26,6 @@ import { resolveActiveSessionRunId } from "../../../sessions/session-controller.
 import { captureSessionTarget } from "../../../sessions/session-controller.target.js";
 import { withSubagentSessionSource } from "../spawn/subagent-session-source.js";
 import { resolveRequesterStoreKey } from "./subagent-requester-store-key.js";
-export { resolveQueueSettings } from "../../../auto-reply/reply/queue.js";
-export { resolveExternalBestEffortDeliveryTarget } from "../../../infra/outbound/best-effort-delivery.js";
-export { resolveBoundDeliveryDestination } from "../../../infra/outbound/bound-delivery-router.js";
-export { resolveConversationIdFromTargets } from "../../../infra/outbound/conversation-id.js";
-export { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
-export { getRuntimeConfig as getSubagentAnnounceRuntimeConfig } from "../../../config/config.js";
-export { sendMessage as sendSubagentAnnounceMessage } from "../../../infra/outbound/message.js";
 
 type RequesterSessionEntryResult = {
   cfg: ReturnType<typeof getRuntimeConfig>;
@@ -317,15 +309,4 @@ export async function loadSessionEntryByKey(sessionKey: string, explicitAgentId?
         ? undefined
         : readSessionEntryReadOnlyInWorker({ storePath, sessionKey, agentId, projection: "list" }),
   );
-}
-
-export function isRequesterGatewayClosed(
-  resolveGatewayContext: GatewayContextResolver | undefined,
-  hadGatewayContext: boolean,
-): boolean {
-  try {
-    return hadGatewayContext && !resolveGatewayContext?.();
-  } catch {
-    return hadGatewayContext;
-  }
 }

@@ -322,12 +322,15 @@ describe("resolvePlaybackTranscode", () => {
 
   it.each([
     ["mkv", "video/x-matroska", "matroska,webm", 0, 1],
+    ["mkv", "video/matroska", "matroska,webm", 0, 1],
     ["mp4", "video/mp4", "mov", 2, 3],
     ["m4v", "video/x-m4v", "mov", 2, 3],
   ] as const)(
     "single-flights %s conversion and reuses its store entry",
     async (extension, mimeType, format, videoIndex, audioIndex) => {
-      const source = await createSource(`single-flight.${extension}`);
+      const source = await createSource(
+        `single-flight-${mimeType.replaceAll("/", "-")}.${extension}`,
+      );
       if (extension !== "mkv") {
         probePlaybackMediaFileDescriptor.mockResolvedValueOnce(
           videoProbe({

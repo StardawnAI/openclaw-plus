@@ -1,4 +1,4 @@
-import type { HistoryUsage } from "@openclaw/llm-core";
+import type { Usage } from "@openclaw/llm-core";
 import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { AgentMessage } from "../../types.js";
 import {
@@ -33,6 +33,7 @@ import {
   MAX_LATEST_USER_REQUEST_CHARS,
   parseCompactionDetails,
 } from "./compaction-details.js";
+import { stripSummaryFloor } from "./compaction-floor.js";
 import type {
   CompactionPreparation,
   CompactionSettings,
@@ -62,13 +63,13 @@ function extractLatestUserRequest(messages: AgentMessage[]): string | undefined 
   return `${truncateUtf16Safe(source, headBudget)}${LATEST_USER_REQUEST_TRUNCATED_MARKER}${sliceUtf16Safe(source, -(contentBudget - headBudget))}`;
 }
 
-export function calculateContextTokens(usage: HistoryUsage): number {
+export function calculateContextTokens(usage: Usage): number {
   if (usage.contextUsage?.state === "available") {
     return usage.contextUsage.totalTokens;
   }
   return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
 }
-function getAssistantUsage(msg: AgentMessage): HistoryUsage | undefined {
+function getAssistantUsage(msg: AgentMessage): Usage | undefined {
   return msg.role === "assistant" &&
     "usage" in msg &&
     msg.stopReason !== "aborted" &&
@@ -93,7 +94,7 @@ function isUnavailableContextBarrier(message: AgentMessage): boolean {
   );
 }
 
-export function getLastAssistantUsage(entries: SessionTreeEntry[]): HistoryUsage | undefined {
+export function getLastAssistantUsage(entries: SessionTreeEntry[]): Usage | undefined {
   for (const entry of entries.toReversed()) {
     if (entry.type === "message") {
       if (isUnavailableContextBarrier(entry.message)) {
@@ -220,7 +221,7 @@ export function prepareCompactionEntries(
     previous: (entry) =>
       entry.type === "compaction"
         ? {
-            summary: entry.summary,
+            summary: stripSummaryFloor(entry.summary),
             details: parseCompactionDetails(entry.details),
           }
         : {},
@@ -268,6 +269,7 @@ export function collectCompactionPreparationEntryFact(
   const contextMessage = projectSessionContextMessage({
     entry,
     context: "reset-retained",
+    placement: context.pendingBackground ? entry : undefined,
   });
   const collect = (value: AgentMessage): CompactionPreparationMessageFact => {
     const request = extractLatestUserRequest([value]);
@@ -290,7 +292,7 @@ export function collectCompactionPreparationEntryFact(
     ...(entry.type === "compaction"
       ? {
           fromHook: entry.fromHook,
-          previousSummary: entry.summary,
+          previousSummary: stripSummaryFloor(entry.summary),
           previousSummaryDetails: parseCompactionDetails(entry.details),
         }
       : {}),

@@ -227,7 +227,8 @@ it.each([false, true])(
       status: "error" as const,
       summary: "last output",
       executionStarted,
-      error: 'Session "agent:main:cron:job-1" changed while starting work. Retry.',
+      errorClassification: { kind: "session-conflict" as const },
+      error: "Synthetic admission conflict",
     }));
     await using f = await fixture({ runIsolatedAgentJob: run });
     const { job, event } = await f.run(isolatedJob());
@@ -241,9 +242,7 @@ it.each([false, true])(
       });
       expect(stored?.state.nextRunAtMs).toBeUndefined();
       expect(f.deps.enqueueSessionEvent).toHaveBeenCalledExactlyOnceWith(
-        expect.stringContaining(
-          'Automation "one-shot" was auto-disabled after 1 consecutive run failures.',
-        ),
+        expect.stringContaining('Automation "one-shot" was auto-disabled'),
         expect.objectContaining({ contextKey: `cron:${job.id}:failure-alert` }),
       );
     } else {

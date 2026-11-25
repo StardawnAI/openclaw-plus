@@ -38,6 +38,7 @@ import {
 import type { CronCreatorAuthorityGrant } from "../cron-creator-authority-grant.types.js";
 import { bindGatewayDeviceRevocation } from "../device-revocation.js";
 import { assertActiveAgentRuntimeAuthority } from "./agent-runtime-authority.js";
+import { assertHumanCronJobAccess, assertHumanCronExecutionAccess } from "./cron-human-owner.js";
 import type {
   GatewayClient,
   GatewayRequestContext,
@@ -144,7 +145,7 @@ export function resolveCronMutationCommitGuard(
       : undefined;
   if (
     !validatesAuthority &&
-    !jobScope?.callerScope &&
+    !jobScope &&
     !manageAll &&
     !requesterGrant &&
     !callerAuthority?.sessionMutationCommitGuard &&
@@ -159,6 +160,16 @@ export function resolveCronMutationCommitGuard(
       throw new TypeError("Gateway caller authority is no longer active.");
     }
     manageAll?.();
+    if (jobScope) {
+      const job = context.cron.getJob(jobScope.jobId);
+      if (!job) {
+        throw new TypeError("Automation no longer exists.");
+      }
+      assertHumanCronJobAccess(client, job);
+      if (callerAuthority?.modelJobPolicy) {
+        assertHumanCronExecutionAccess(client, job, callerAuthority.modelJobPolicy.patch);
+      }
+    }
     if (identity && callerAuthority?.modelJobPolicy) {
       const { config, jobId, patch } = callerAuthority.modelJobPolicy;
       const job = context.cron.getJob(jobId);
@@ -394,7 +405,7 @@ export function cronTrustedJobOwnedByCaller(
   );
 }
 
-/** Whether the caller holds a live scheduled-run claim for this job. */
+/** Whether the caller holds a live scheduled-run claim (signed, short-lived) for this job. */
 export function cronCallerRunsJob(
   job: CronJob,
   callerScope: Pick<CronCallerScope, "agentId" | "currentJobId"> | undefined,
@@ -428,8 +439,8 @@ export function cronJobMatchesCallerScope(params: {
   const effectiveAgentId = tryResolveCronJobEffectiveAgentId(params.job, params.defaultAgentId);
   const policy = params.job.scheduledToolPolicy;
   // A signed scheduled-run claim restores only the cron tool's historical
-  // current-job surface. Callers must opt in per read/self-remove/self-scratch operation;
-  // its delivery account need not match the account that created the job.
+  // current-job surface. Its delivery account need not be its creator account.
+  // Callers must opt in per read/self-remove/self-scratch operation.
   if (
     params.allowCurrentJob === true &&
     cronCallerRunsJob(params.job, params.callerScope, params.defaultAgentId)

@@ -1,10 +1,8 @@
 import { createHash } from "node:crypto";
 import { appendCurrentInboundContext } from "../../../agents/embedded-agent-runner/run/runtime-context-prompt.js";
 import { runAgentHarnessBeforeMessageWriteHook } from "../../../agents/harness/hook-helpers.js";
-import { normalizeChatType } from "../../../channels/chat-type.js";
 import { compareChannelAdmissionParticipants } from "../../../channels/message-access/admission-evidence.js";
 import { racePromiseWithAbortSignal } from "../../../infra/abort-signal.js";
-import { channelRouteDedupeKey } from "../../../plugin-sdk/channel-route.js";
 import { PluginInstanceUnavailableError } from "../../../plugins/plugin-instance-error.js";
 import {
   getGatewayRestartDrainSignal,
@@ -32,14 +30,14 @@ import {
 import { createUserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.js";
 import { AgentDatabaseExecutionAdmissionClosedError } from "../../../state/agent-database-admission-error.js";
 import { buildCollectPrompt, previewQueueSummaryPrompt } from "../../../utils/queue-helpers.js";
+import { bindCommandOwnerAuthority } from "../../command-owner-authority.js";
 import { attachAmbientOverflowContext } from "./ambient-context.js";
 import {
   collectCurrentInboundContext,
   collectRuntimeMetadata,
-  resolveFollowupReplyAnchor,
   resolveFollowupReplyDeliveryKey,
 } from "./delivery-context.js";
-import { runOutsideAdmittedGenerationScopes } from "./drain-admission-scope.js";
+import { runOutsideAdmittedTurnScopes } from "./drain-admission-scope.js";
 import {
   buildCollectTranscriptInput,
   collectQueuedPromptMedia,
@@ -57,11 +55,7 @@ import {
   updateFollowupRetryHeartbeats,
 } from "./lifecycle.js";
 import { followupQueueSources, followupSourceRunners } from "./state.js";
-import {
-  isFollowupOperatorAuthorityCurrent,
-  isFollowupRunAborted,
-  type FollowupRun,
-} from "./types.js";
+import { isFollowupRunAborted, type FollowupRun } from "./types.js";
 
 type AdmissionSessionRebind = { from: string; to: string };
 
@@ -96,29 +90,29 @@ export function handoffCompletedSourceReply(operation: ReplyOperation, source: F
 }
 
 function consumeQueueSummaryDelivery(
-  queue: Pick<
-    SessionControllerMailbox,
-    "summarySources" | "summaryLines" | "summaryElisions" | "droppedCount"
-  >,
+  queue: Pick<SessionControllerMailbox, "summaryEntries" | "summaryElisions" | "droppedCount">,
   delivery: { droppedCount: number; sources: readonly FollowupRun[] },
   completeLifecycles = true,
 ): void {
   let consumedCount = delivery.sources.length === 0 ? delivery.droppedCount : 0;
   for (const source of delivery.sources) {
-    const sourceIndex = queue.summarySources.indexOf(source);
+    const sourceIndex = queue.summaryEntries.findIndex((summary) => summary.source === source);
     const entry =
       sourceIndex < 0
         ? queue.summaryElisions.find(
-            (candidate) => candidate.sources.includes(source) || candidate.sourceRefs.has(source),
+            (candidate) =>
+              candidate.entries.some((summary) => summary.source === source) ||
+              candidate.sourceRefs.has(source),
           )
         : undefined;
     if (sourceIndex >= 0 || entry) {
       const index = entry
-        ? entry.sources.indexOf(entry.sourceRefs.get(source) ?? source)
+        ? entry.entries.findIndex(
+            (summary) => summary.source === (entry.sourceRefs.get(source) ?? source),
+          )
         : sourceIndex;
       if (index >= 0) {
-        (entry?.sources ?? queue.summarySources).splice(index, 1);
-        (entry?.summaryLines ?? queue.summaryLines).splice(index, 1);
+        (entry?.entries ?? queue.summaryEntries).splice(index, 1);
       }
       consumedCount += 1;
       if (entry) {
@@ -127,8 +121,7 @@ function consumeQueueSummaryDelivery(
             entry.sourceRefs.delete(original);
           }
         }
-        entry.count = entry.sources.length;
-        if (entry.sources.length === 0) {
+        if (entry.entries.length === 0) {
           queue.summaryElisions.splice(queue.summaryElisions.indexOf(entry), 1);
         }
       }
@@ -145,19 +138,7 @@ function consumeQueueSummaryDelivery(
 function buildOverflowTranscriptIdempotencyKey(source: FollowupRun, prompt: string): string {
   const promptHash = createHash("sha256").update(prompt).digest("hex");
   const routeHash = createHash("sha256")
-    .update(
-      JSON.stringify([
-        channelRouteDedupeKey({
-          channel: source.originatingChannel,
-          to: source.originatingTo,
-          accountId: source.originatingAccountId,
-          threadId: source.originatingThreadId,
-        }),
-        resolveFollowupReplyAnchor(source) ?? "",
-        source.originatingReplyToMode ?? "",
-        normalizeChatType(source.originatingChatType) ?? "",
-      ]),
-    )
+    .update(resolveFollowupReplyDeliveryKey(source))
     .digest("hex");
   return `followup-overflow:${source.run.sessionId}:${routeHash}:${source.messageId ?? source.enqueuedAt}:${promptHash}`;
 }
@@ -176,7 +157,7 @@ function resolveCollectedRun(items: readonly FollowupRun[], source: FollowupRun[
   }
   // Mixed or unverifiable people share no downstream sender authority. The
   // opaque admission aggregate records unknown identity at the run boundary.
-  return {
+  const collected = {
     ...source,
     senderId: undefined,
     senderName: undefined,
@@ -185,7 +166,14 @@ function resolveCollectedRun(items: readonly FollowupRun[], source: FollowupRun[
     senderIsOwner: false,
     traceAuthorized: false,
     ownerNumbers: [],
+    requesterOrigin: source.requesterOrigin
+      ? { ...source.requesterOrigin, senderId: undefined, senderE164: undefined }
+      : undefined,
   };
+  // Spreading the source also copies its private owner grant. Replace it with
+  // a source-free denial so no requester identity or recovery reference survives.
+  bindCommandOwnerAuthority(collected, { isCurrent: () => false });
+  return collected;
 }
 
 /** Executes an already-selected claim. This adapter never chooses a successor. */
@@ -231,14 +219,14 @@ async function executeClaim(
   // A summary prompt shows only the newest cap lines; source context pairs with those lines.
   const summarizedSources = queue.cap > 0 ? sources.slice(-queue.cap) : sources;
   const summaryLines = summarizedSources.map((item) => {
-    const index = queue.summarySources.indexOf(item);
-    if (index >= 0) {
-      return queue.summaryLines[index] ?? "";
+    const summary = queue.summaryEntries.find((entry) => entry.source === item);
+    if (summary) {
+      return summary.line;
     }
     for (const elision of queue.summaryElisions) {
-      const elisionIndex = elision.sources.indexOf(item);
-      if (elisionIndex >= 0) {
-        return elision.summaryLines[elisionIndex] ?? "";
+      const entry = elision.entries.find((candidate) => candidate.source === item);
+      if (entry) {
+        return entry.line;
       }
     }
     return item.summaryLine ?? item.prompt;
@@ -363,7 +351,6 @@ async function executeClaim(
       claim.retryBeforeExecution && !pluginUnavailable
         ? sources.filter(
             (item) =>
-              isFollowupOperatorAuthorityCurrent(item) &&
               !isFollowupRunAborted(item) &&
               !item.controllerInput?.retirementRequested &&
               (!adoptionRefused || !item.controllerInput?.custody.adopted) &&
@@ -439,7 +426,7 @@ export function rememberFollowupDrainCallback(
       // after the request that triggered the drain has closed its own scope.
       await runWithGatewayDetachedWorkContinuation(
         () =>
-          runOutsideAdmittedGenerationScopes(() => {
+          runOutsideAdmittedTurnScopes(() => {
             entered = true;
             // Consume this request; a kick during execution re-enables dispatch.
             mailbox.dispatchEnabled = false;

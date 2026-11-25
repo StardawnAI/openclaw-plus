@@ -634,59 +634,6 @@ it("copies external directory and file links under an aliased state root without
   );
 });
 
-it.skipIf(process.platform === "win32")(
-  "bounds external file links inside a shared package scope",
-  async () => {
-    await writeText(root, "package.json", "{}");
-    const plugin = path.join(root, "plugin");
-    const source = path.join(root, "assets", "config.txt");
-    await writeText(plugin, "package.json", '{"name":"plugin"}');
-    await writeText(path.dirname(source), path.basename(source), "preserved");
-    await link(path.join(root, "missing-target"), path.join(root, "assets", "unrelated"));
-    await link(source, path.join(plugin, "config.txt"));
-    const params = {
-      config: pluginConfig([plugin]),
-      stateDir: path.join(root, "source-state"),
-      targetStateDir: path.join(root, "snapshot"),
-      candidateRoot: root,
-    };
-    const paths = await copyUpdateCandidatePlugins(
-      await prepareUpdateCandidatePlugins(params),
-      params,
-    );
-    const copied = path.join(paths[plugin]!, "config.txt");
-    expect(await fs.readFile(copied, "utf8")).toBe("preserved");
-    expect((await fs.realpath(copied)).startsWith(params.targetStateDir + path.sep)).toBe(true);
-    expect(
-      (await listDirectoryTreeStrict(params.targetStateDir)).some(
-        ({ relativePath }) => path.basename(relativePath) === "unrelated",
-      ),
-    ).toBe(false);
-  },
-);
-
-it.skipIf(process.platform === "win32")(
-  "refuses file links into private snapshot state",
-  async () => {
-    const plugin = path.join(root, "plugin");
-    const targetStateDir = path.join(root, "snapshot");
-    await writeText(root, "package.json", "{}");
-    await writeText(plugin, "package.json", '{"name":"plugin"}');
-    const source = path.join(targetStateDir, "private.txt");
-    await writeText(targetStateDir, "private.txt", "private snapshot bytes");
-    await link(source, path.join(plugin, "config.txt"));
-    await expect(
-      prepareUpdateCandidatePlugins({
-        config: pluginConfig([plugin]),
-        stateDir: path.join(root, "source-state"),
-        targetStateDir,
-        candidateRoot: root,
-      }),
-    ).rejects.toThrow("Plugin copy source overlaps update state");
-    expect(await fs.readFile(source, "utf8")).toBe("private snapshot bytes");
-  },
-);
-
 it.each([
   { alias: true, shadow: false, linkedModules: false, sharedOrder: "none" },
   { alias: false, shadow: true, linkedModules: false, sharedOrder: "none" },
@@ -828,3 +775,68 @@ it("rejects an ordinary link that would repeatedly copy an immutable host packag
   expect(await fs.readFile(path.join(host, "docs", "marker.txt"), "utf8")).toBe("source");
   expect(await fs.realpath(path.join(plugin, "node_modules", "openclaw"))).toBe(host);
 }, 20_000);
+
+it.skipIf(process.platform === "win32")(
+  "copies an external file link without traversing unrelated siblings",
+  async () => {
+    // A surrounding Node package scope must not turn a single file edge into
+    // a recursive copy of its unrelated siblings or the private snapshot.
+    await fs.writeFile(path.join(root, "package.json"), "{}");
+    const plugin = path.join(root, "plugin");
+    const assets = path.join(root, "assets");
+    await fs.mkdir(plugin);
+    await fs.mkdir(assets);
+    await fs.writeFile(path.join(plugin, "package.json"), '{"name":"plugin"}');
+    const source = path.join(assets, "config.txt");
+    await fs.writeFile(source, "preserved");
+    await fs.symlink(path.join(root, "missing-unrelated-target"), path.join(assets, "unrelated"));
+    await fs.symlink(source, path.join(plugin, "config.txt"));
+    const rehearsal = await prepareUpdateCandidateRehearsal({
+      config: { plugins: { load: { paths: [plugin] } } },
+      stateDir: path.join(root, "source-state"),
+      candidateRoot: root,
+    });
+    try {
+      const config: OpenClawConfig = JSON.parse(await fs.readFile(rehearsal.configPath, "utf8"));
+      const copied = path.join(config.plugins!.load!.paths![0]!, "config.txt");
+      expect(await fs.readFile(copied, "utf8")).toBe("preserved");
+      expect((await fs.realpath(copied)).startsWith(rehearsal.stateDir + path.sep)).toBe(true);
+      expect(
+        (await listDirectoryTreeStrict(rehearsal.stateDir)).some(
+          ({ relativePath }) => path.basename(relativePath) === "unrelated",
+        ),
+      ).toBe(false);
+      await fs.writeFile(copied, "private");
+      expect(await fs.readFile(source, "utf8")).toBe("preserved");
+      expect(await fs.readlink(path.join(plugin, "config.txt"))).toBe(source);
+    } finally {
+      await rehearsal.cleanup();
+    }
+  },
+);
+
+it.skipIf(process.platform === "win32")(
+  "still refuses an external file link into private snapshot state",
+  async () => {
+    const plugin = path.join(root, "plugin");
+    const targetStateDir = path.join(root, "snapshot");
+    await fs.mkdir(plugin);
+    await fs.mkdir(targetStateDir);
+    await fs.writeFile(path.join(root, "package.json"), "{}");
+    await fs.writeFile(path.join(plugin, "package.json"), '{"name":"plugin"}');
+    const source = path.join(targetStateDir, "private.txt");
+    await fs.writeFile(source, "private snapshot bytes");
+    const configLink = path.join(plugin, "config.txt");
+    await fs.symlink(source, configLink);
+    await expect(
+      prepareUpdateCandidatePlugins({
+        config: { plugins: { load: { paths: [plugin] } } },
+        stateDir: path.join(root, "source-state"),
+        targetStateDir,
+        candidateRoot: root,
+      }),
+    ).rejects.toThrow("Plugin copy source overlaps update state");
+    expect(await fs.readFile(source, "utf8")).toBe("private snapshot bytes");
+    expect(await fs.readlink(configLink)).toBe(source);
+  },
+);

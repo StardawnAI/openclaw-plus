@@ -2,7 +2,11 @@ import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runti
 
 export const OPENAI_CODEX_RESPONSES_BASE_URL = "https://chatgpt.com/backend-api/codex";
 
-/** ChatGPT model listing and Responses turns share the attribution-owned numeric gate version. */
+/**
+ * ChatGPT model-list URL. The backend hides models whose `minimal_client_version` is above
+ * `client_version`, so list as the numeric OpenClaw release that Responses turns send in their
+ * `version` header (provider attribution owns that value and its `99.0.0` fallback).
+ */
 export async function resolveOpenAICodexModelsEndpoint(): Promise<string> {
   const { resolveProviderRequestPolicy } = await import("openclaw/plugin-sdk/provider-http");
   const clientVersion =

@@ -11,7 +11,6 @@ import {
   parseWorkerWorkspaceManifest,
   type WorkerWorkspaceManifest,
   type WorkerWorkspaceManifestEntry,
-  type WorkerWorkspaceReconciliationJournal,
 } from "./workspace-manifest.js";
 import {
   assertWorkspaceMatchesManifest,
@@ -19,6 +18,7 @@ import {
   MAX_RECONCILIATION_TOTAL_BYTES,
   changedPaths,
   recoverWorkerWorkspaceReconciliation,
+  type WorkerWorkspaceReconciliationJournal,
 } from "./workspace-reconcile.js";
 import {
   applyWorkspace,
@@ -521,7 +521,7 @@ describe("worker workspace manifest validation and transfer", () => {
     expect(workerWorkspaceTransferPaths(extra, current)).toEqual([lastFile.path, "link"]);
   });
 
-  it("accepts a directory replacement spanning two complete supported inventories", () => {
+  it("retains the full directory replacement diff without transferring directory bytes", () => {
     const manifest = (prefix: string): WorkerWorkspaceManifest => ({
       version: 1,
       baseCommit: null,

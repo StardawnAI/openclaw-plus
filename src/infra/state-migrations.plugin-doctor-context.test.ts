@@ -8,6 +8,7 @@ import {
   setRuntimeConfigSnapshot,
 } from "../config/runtime-snapshot.js";
 import { replaceSessionEntry } from "../config/sessions/session-accessor.js";
+import { markCanonicalSessionValidationPending } from "../config/sessions/session-canonical-key.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { observePluginStateReads } from "../plugin-state/plugin-state-fixtures.test-support.js";
 import type { PluginDoctorStateMigration } from "../plugins/doctor-contract-module.js";
@@ -25,7 +26,6 @@ import {
   readDeferredPluginMigrations,
   recordDeferredPluginMigrations,
 } from "./deferred-plugin-migrations.js";
-import * as querySync from "./kysely-sync.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import type { EngineConnection } from "./sql-connection.js";
 import * as sqliteSnapshot from "./sqlite-snapshot.js";
@@ -133,33 +133,6 @@ it(
     expect((await reader.listPending()).map((row) => row.id)).toEqual(["pending"]);
     expect(await reader.listClaims()).toEqual([]);
     expect(outcome).toMatchObject({ message: expect.stringContaining("repair owner expired") });
-  }),
-);
-
-it(
-  "paginates Doctor keys without a NUL cursor in SQL bindings",
-  inDoctorState(async ({ env }) => {
-    const context = doctorContext(env);
-    const namespace = "doctor-portable-pagination";
-    const store = context.openPluginStateKeyedStore({ namespace, maxEntries: 10 });
-    for (const key of ["binding:a", "binding:a0", "binding:b", "other"]) {
-      await store.register(key, { key });
-    }
-    const queries = vi.spyOn(querySync, "executeSqliteQuerySync");
-    const read = (after?: string, limit = 10) =>
-      context.readPluginStateEntriesInKeyRange!(namespace, { prefix: "binding:", after, limit });
-    expect(read(undefined, 1).map((entry) => entry.key)).toEqual(["binding:a"]);
-    expect(read("binding:a").map((entry) => entry.key)).toEqual(["binding:a0", "binding:b"]);
-    expect(read("binding:b")).toEqual([]);
-    const ranges = queries.mock.calls
-      .map(([, query]) => query.compile())
-      .filter((query) => query.sql.includes('order by "entry_key"'));
-    expect(ranges).toHaveLength(3);
-    for (const query of ranges) {
-      expect(
-        query.parameters.some((value) => typeof value === "string" && value.includes("\0")),
-      ).toBe(false);
-    }
   }),
 );
 
@@ -276,13 +249,14 @@ describe("plugin doctor session identity evidence", () => {
   it.each([
     ["entry_json", "{broken", "broken-session"],
     ["current_session_id", "wrong-session", "wrong-session"],
-  ])("keeps corrupt %s fixed-store rows unknown", async (column, value, sessionId) => {
+  ])("keeps uncertified repair %s fixed-store rows unknown", async (column, value, sessionId) => {
     await withDoctorState(async ({ env, root }) => {
       const storePath = path.join(root, "fixed.sqlite");
       const sessionKey = "agent:main:broken";
       await putSession(env, sessionKey, "broken-session", storePath);
-      const database = openOpenClawAgentDatabase({ agentId: "main", env, path: storePath }).db;
-      database
+      const database = openOpenClawAgentDatabase({ agentId: "main", env, path: storePath });
+      markCanonicalSessionValidationPending(database, [sessionKey]);
+      database.db
         .prepare(`UPDATE session_nodes SET ${column} = ? WHERE session_key = ?`)
         .run(value, sessionKey);
       const context = doctorContext(env, { config: { session: { store: storePath } } });

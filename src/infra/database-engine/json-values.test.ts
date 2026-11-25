@@ -11,8 +11,8 @@ import {
   jsonPickObject,
   jsonRemovePaths,
   jsonSetPath,
+  jsonType,
   jsonValid,
-  jsonValue,
 } from "./json-values.js";
 
 it("preserves ordered row objects, JSON text fields, and empty projection results", () => {
@@ -61,6 +61,10 @@ it("projects nested JSON and reparents without changing opaque data or scalar ty
       jsonSetPath(db, projected, sql.lit("$.parentId"), sql.val(null)).as("event"),
       jsonPathValue(db, event, sql.lit("$.message.tokens"), "number").as("tokens"),
       jsonPathValue(db, event, sql.lit("$.message.role")).as("role"),
+      jsonType(db, event).as("eventType"),
+      jsonType(db, event, sql.lit("$.message.role")).as("roleType"),
+      jsonType(db, event, sql.lit("$.message.private")).as("nullType"),
+      jsonType(db, event, sql.lit("$.absent")).as("absentType"),
       jsonPickObject(db, event, ["data", "absent"]).as("picked"),
       jsonValid(db, sql.val("malformed")).as("valid"),
     ]),
@@ -72,6 +76,10 @@ it("projects nested JSON and reparents without changing opaque data or scalar ty
   });
   expect(result.tokens).toBe(3);
   expect(result.role).toBe("assistant");
+  expect(result.eventType).toBe("object");
+  expect(result.roleType).toBe("text");
+  expect(result.nullType).toBe("null");
+  expect(result.absentType).toBeNull();
   expect(JSON.parse(result.picked)).toEqual({ data: { text: "λ🦞", flag: true } });
   expect(result.valid).toBe(0);
 });
@@ -94,25 +102,4 @@ it("aggregates typed tuples in key order without quoting nested arrays", () => {
   expect(executeSqliteQuerySync(db, aggregate.where("id", "=", "missing")).rows).toEqual([
     { value: "[]" },
   ]);
-});
-
-it("preserves JSON boolean types for retained cron enable transitions", () => {
-  const { DatabaseSync } = requireNodeSqlite();
-  using db = new DatabaseSync(":memory:");
-  const query = getNodeSqliteKysely<Record<string, never>>(db);
-  for (const enabled of [true, false]) {
-    const result = executeSqliteQuerySync(
-      db,
-      query.selectNoFrom(
-        jsonSetPath(
-          db,
-          sql.val('{"enabled":true,"opaque":"kept"}'),
-          sql.val("$.enabled"),
-          jsonValue(db, sql.val(String(enabled))),
-          true,
-        ).as("job"),
-      ),
-    ).rows[0]!;
-    expect(JSON.parse(result.job)).toEqual({ enabled, opaque: "kept" });
-  }
 });

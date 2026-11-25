@@ -1,4 +1,3 @@
-import { createRuntimeConfigReader, readRuntimeConfig } from "../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { prepareModelPricingContext } from "../model-catalog/pricing.js";
@@ -13,7 +12,10 @@ import {
 } from "../model-catalog/remote-overlay.js";
 import { prepareSharedAuthStoreOwnership } from "./auth-profiles/path-resolve.js";
 import { PreparedModelRuntimePublicationSupersededError } from "./prepared-model-runtime.errors.js";
-import { retirePreparedModelRuntimeGeneration } from "./prepared-model-runtime.lifecycle.js";
+import {
+  recordPreparedModelCatalogReplacement,
+  retirePreparedModelRuntimeGeneration,
+} from "./prepared-model-runtime.lifecycle.js";
 import {
   advancePreparedModelRuntimeOwnerConfig,
   ownerKey,
@@ -152,12 +154,6 @@ export async function refreshPreparedModelRuntimeSnapshotsNow(
     progress?: Parameters<typeof publishPreparedModelRuntimeOwnerBatch>[0]["progress"];
   },
 ): Promise<void> {
-  // Configured Gateway publication can precede runtime-config publication. Its authority is
-  // explicit; identity matching against the previous live config would misclassify it as scoped.
-  // Standalone configured refreshes do not acquire Gateway authority merely by being configured.
-  const readPolicyConfig = context.gatewayLifecycleActive
-    ? readRuntimeConfig
-    : createRuntimeConfigReader(config);
   await prepareSharedAuthStoreOwnership();
   const { owners, agentBuildCompletions, gatewayLifecycleActive, isPublicationCurrent, progress } =
     context;
@@ -180,7 +176,7 @@ export async function refreshPreparedModelRuntimeSnapshotsNow(
     }
     knownKeys.add(key);
     const owner = owners.get(key);
-    entries.push({ owner, input: { ...input, readPolicyConfig } });
+    entries.push({ owner, input });
   }
   for (const [key, owner] of owners) {
     if (!isPreparedModelRuntimeOwnerInRefreshScope(owner, options.agentIds)) {
@@ -217,6 +213,9 @@ export async function refreshPreparedModelRuntimeSnapshotsNow(
     // candidates, while a newer config epoch stops every remaining build in this publication.
     isBuildCurrent: isPublicationCurrent,
     onBuildStats: options.onBuildStats,
+    selectPluginGeneration: options.preservePluginGenerations
+      ? (owner) => owner.pluginGeneration
+      : undefined,
     pluginMetadataSnapshot: options.pluginMetadataSnapshot,
     registerEntriesAfterBuildStart: true,
     progress,
@@ -379,7 +378,8 @@ async function publishPreparedModelRuntimeCatalogReplacement(
           owner.needsRefresh = true;
         }
       }
-      for (const { owner } of claims) {
+      for (const [index, { owner }] of claims.entries()) {
+        recordPreparedModelCatalogReplacement(owner.snapshot!, candidates[index]!.snapshot!);
         owner.generation += 1;
         retirePreparedModelRuntimeGeneration(owner);
         releasePreparedPluginPublication(owner);

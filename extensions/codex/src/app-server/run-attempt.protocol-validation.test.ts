@@ -1,8 +1,6 @@
 import { symlink } from "node:fs/promises";
 import path from "node:path";
-import { registerAgentWorkspaceAccess } from "openclaw/plugin-sdk/agent-workspace-runtime";
 import { initializeGlobalHookRunner } from "openclaw/plugin-sdk/hook-runtime";
-import { readMediaBuffer } from "openclaw/plugin-sdk/media-store";
 import {
   createMockPluginRegistry,
   loadUserTurnTranscriptRecorderFactoryForTest,
@@ -14,10 +12,7 @@ import { expect, it, vi } from "vitest";
 import type { CodexSessionCatalogControl } from "../session-catalog-types.js";
 import { nativeCommandItem } from "./codex-app-server.test-fixtures.js";
 import { CODEX_TURN_START_TEXT_INPUT_MAX_CHARS } from "./context-engine-projection.js";
-import {
-  assertCodexTurnStartResponse,
-  prepareCodexServerNotification,
-} from "./protocol-validators.js";
+import { assertCodexTurnStartResponse } from "./protocol-validators.js";
 import type { CodexTurnStartParams, JsonObject } from "./protocol.js";
 import { itemNotification, turnCompleted } from "./protocol.test-helpers.js";
 import {
@@ -155,71 +150,6 @@ it("forks a sender-attributed turn through a database alias using exact submitte
     await run.catch(() => {});
   }
 });
-it("stages an oversized current request through the connection without changing its transcript", async () => {
-  const params = createTestParams();
-  const instruction = "Find the codeword in the complete request.";
-  const opening = '<<<EXTERNAL_UNTRUSTED_CONTENT id="oversized">>>';
-  const closing = '<<<END_EXTERNAL_UNTRUSTED_CONTENT id="oversized">>>';
-  const prompt = [
-    instruction,
-    opening,
-    "x".repeat(CODEX_TURN_START_TEXT_INPUT_MAX_CHARS),
-    "MIDDLE_ONLY_CODEWORD_4217",
-    "y".repeat(CODEX_TURN_START_TEXT_INPUT_MAX_CHARS),
-    closing,
-    "Reply with only the codeword.",
-  ].join("\n");
-  params.prompt = prompt;
-  setCodexTestModelSupportsTools(params, false);
-  await bindProductionHarnessHostCapabilitiesForTest(params);
-  let attachmentPath: string | undefined;
-  const note = "Attachment file: /fixture/managed/current-request.txt";
-  const release = registerAgentWorkspaceAccess(params.workspaceDir, {
-    bridge: {
-      readFile: async () => Buffer.alloc(0),
-      writeFile: async () => {},
-      stat: async () => null,
-    },
-    prepareTurnAttachments: async (turn, assertCurrent) => {
-      assertCurrent();
-      attachmentPath = turn.media?.[0]?.path;
-      return attachmentPath ? note : undefined;
-    },
-  });
-  try {
-    const harness = createStartedThreadHarness();
-    const run = runCodexAppServerAttempt(params);
-    await Promise.race([
-      harness.waitForMethod("turn/start"),
-      run.then(() => {
-        throw new Error("Attempt settled before dispatch");
-      }),
-    ]);
-    await harness.completeTurn({ threadId: "thread-1", turnId: "turn-1" });
-    const result = await run;
-    const input = turnInput(harness);
-    const inputText = input
-      .filter((item) => item.type === "text")
-      .map((item) => item.text)
-      .join("\n");
-    expect(inputText.length).toBeLessThanOrEqual(CODEX_TURN_START_TEXT_INPUT_MAX_CHARS);
-    expect(inputText).toContain(instruction);
-    expect(inputText).toContain(opening);
-    expect(inputText).toContain(closing);
-    expect(inputText).toContain("The complete request is attached as current-request.txt");
-    expect(inputText).toContain(note);
-    expect(attachmentPath).toMatch(/^media:\/\/inbound\//);
-    const saved = await readMediaBuffer(attachmentPath!.slice("media://inbound/".length));
-    expect(saved.buffer.toString("utf8")).toBe(prompt);
-    const user = result.messagesSnapshot.find((message) => message.role === "user");
-    expect(JSON.stringify(user?.content)).toContain("MIDDLE_ONLY_CODEWORD_4217");
-    expect(JSON.stringify(user?.content)).not.toContain(note);
-    expect(params.prompt).toBe(prompt);
-  } finally {
-    release();
-  }
-});
-
 it("delivers prepared document paths alongside native images without changing the canonical prompt", async () => {
   const params = createTestParams();
   const prompt = params.prompt;
@@ -344,75 +274,6 @@ it("drains bound command output without one macrotask per notification", async (
   const result = await run;
   expect(JSON.stringify(result.messagesSnapshot)).toContain('"toolCallId":"cmd-burst"');
 });
-// Wire examples from rust-v0.170.0 protocol/v2/tests.rs and the supported 0.169.0 schema.
-it.each<{ version: string; display: JsonObject }>([
-  {
-    version: "0.170.0",
-    display: {
-      version: 1,
-      mode: "show",
-      trustedContacts: "check",
-      annotation: { kind: "wellbeingHelpline", subject: "prompt" },
-    },
-  },
-  {
-    version: "0.170.0",
-    display: { version: 1, mode: "hide", replacement: { kind: "wellbeingPromptHelpline" } },
-  },
-  {
-    version: "0.170.0",
-    display: {
-      version: 1,
-      mode: "block",
-      reason: { kind: "protection", protectionType: "omnimod" },
-    },
-  },
-  {
-    version: "0.170.0",
-    display: { version: 1, mode: "block", reason: { kind: "cyber", trustedAccess: false } },
-  },
-  {
-    version: "0.169.0",
-    display: {
-      action: "show",
-      blockType: null,
-      cyberTrustedAccess: null,
-      checkTrustedContacts: null,
-    },
-  },
-])("settles a $version display-bearing terminal snapshot: $display", async ({ display }) => {
-  const harness = createStartedThreadHarness();
-  const params = createTestParams();
-  const abort = new AbortController();
-  params.abortSignal = abort.signal;
-  const run = runCodexAppServerAttempt(params);
-  try {
-    await run.waitForTurnAccepted();
-    const turn: JsonObject = {
-      id: "turn-1",
-      status: "completed",
-      items: [
-        {
-          id: "answer-1",
-          type: "agentMessage",
-          phase: "final_answer",
-          text: "Done.",
-          moderation: { moderated: true, display },
-        },
-      ],
-    };
-    const notification = turnCompleted(turn);
-    // Fail at the real admission boundary instead of waiting for a lost terminal snapshot.
-    expect(prepareCodexServerNotification(notification).completedTurn).toEqual(turn);
-    await harness.notify(notification);
-    // The production validator must retain completedTurn for both projection and settlement.
-    expect(await run).toMatchObject({ terminal: { kind: "ok" }, assistantTexts: ["Done."] });
-  } finally {
-    abort.abort();
-    await run.catch(() => {});
-  }
-});
-
 it.each<{ label: string; turn: JsonObject }>([
   { label: "nonterminal status", turn: { status: "inProgress", items: [] } },
   {

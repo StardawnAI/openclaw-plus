@@ -6,7 +6,6 @@ import { resolveExecConfigState } from "../exec-defaults.js";
 import { resolveSandboxRuntimeStatusAsync } from "../sandbox/runtime-status.js";
 import { normalizeToolPolicyName } from "../tool-policy.js";
 import { finalizeCliMcpGrant } from "./mcp-grant-context.js";
-import { resolveCliMcpMemoryAudience } from "./mcp-memory-audience.js";
 import { projectNativeMcpRunContext } from "./native-mcp-context.js";
 import { admitCliRunParams } from "./run-admission.js";
 import type { RunCliAgentParams } from "./types.js";
@@ -63,7 +62,7 @@ export async function prepareCliMcpToolProjection(
   params: RunCliAgentParams,
   options: {
     agentId: string;
-    context: McpScope["context"] | undefined;
+    context: McpScope["context"];
     runtimeToolsAllowPolicy?: string[];
     defaultMediatedToolNames?: readonly string[];
     scope: Pick<
@@ -74,14 +73,12 @@ export async function prepareCliMcpToolProjection(
       | "authProfileStore"
       | "authProfileStoreAgentDir"
     >;
-    memoryAudience: { agentId: string; resources: Pick<DisposableStack, "defer"> };
+    /** The memory audience a loopback grant on a session carries. */
+    forGrant: (sessionKey: string) => Promise<Pick<McpScope, "memoryAudience">>;
     resolvePolicyTools: ResolveMcpTools;
     resolveScopedTools: ResolveMcpTools;
   },
 ) {
-  if (!options.context) {
-    return { params, tools: [], grantAudience: undefined };
-  }
   const requestedToolsAllow =
     options.runtimeToolsAllowPolicy ?? params.cliToolAvailability?.openClaw;
   const context =
@@ -93,16 +90,12 @@ export async function prepareCliMcpToolProjection(
       ? options.resolvePolicyTools
       : options.resolveScopedTools;
   const admittedParams = await admitCliRunParams(params, options.agentId);
-  // Project names with the same admitted audience the loopback grant will carry.
-  const { memoryAudience, release } = await resolveCliMcpMemoryAudience(
-    { ...admittedParams, config: options.scope.cfg },
-    { agentId: options.memoryAudience.agentId, sessionKey: context.sessionKey },
-  );
-  options.memoryAudience.resources.defer(release);
-  const grantAudience = memoryAudience ? { memoryAudience } : {};
+  // The projected names become the grant's allowlist, so audience-gated tools are
+  // built with the audience the grant will carry; the grant mints with this same value.
+  const grantAudience = await options.forGrant(context.sessionKey);
   const { tools } = await resolveTools({
     ...options.scope,
-    ...grantAudience,
+    ...(grantAudience.memoryAudience ? { memoryAudience: grantAudience.memoryAudience } : {}),
     defaultMediatedToolNames: options.defaultMediatedToolNames,
     signal: admittedParams.abortSignal,
     context,

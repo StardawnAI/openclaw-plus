@@ -4,10 +4,6 @@ import {
   IncognitoSessionSyncAccessError,
 } from "../../../state/incognito-session-error.js";
 import type { AgentMessage } from "../../runtime/index.js";
-import {
-  makeAgentAssistantMessage,
-  makeAgentUserMessage,
-} from "../../test-helpers/agent-message-fixtures.js";
 import { createEventBus } from "../event-bus.js";
 import type { ModelRegistry } from "../model-registry.js";
 import { SessionMetadataCommittedError } from "../session-manager-metadata-error.js";
@@ -78,13 +74,11 @@ async function expectFatal(runner: ExtensionRunner, invoke: Invoke, failure: Err
   expect(report).not.toHaveBeenCalled();
 }
 
-const buildMessages = (): [
-  ReturnType<typeof makeAgentUserMessage>,
-  ReturnType<typeof makeAgentAssistantMessage>,
-] => [
-  makeAgentUserMessage({ content: [{ type: "text", text: "hello" }] }),
-  makeAgentAssistantMessage({ content: [{ type: "text", text: "hi" }] }),
-];
+const buildMessages = (): [AgentMessage, AgentMessage] =>
+  [
+    { role: "user", content: [{ type: "text", text: "hello" }] },
+    { role: "assistant", content: [{ type: "text", text: "hi" }] },
+  ] as [AgentMessage, AgentMessage];
 
 it("ExtensionRunner warns once for legacy binding; async binding stays silent", () => {
   const runner = buildRunner();

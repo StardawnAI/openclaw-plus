@@ -31,6 +31,35 @@ type FollowupRuntimeParams = {
   agentHarnessId?: string;
 };
 
+/** One source classification supplies both workspace and persistence-tool eligibility. */
+export async function resolveMemoryFlushSandbox(
+  params: Pick<
+    MemoryFlushRunParams,
+    "cfg" | "followupRun" | "sessionKey" | "runtimePolicySessionKey"
+  >,
+  assertCurrent: () => void,
+) {
+  if (!params.sessionKey) {
+    return { writable: true, toolPolicy: undefined };
+  }
+  return await withSandboxRuntimeStatusInWorker(
+    {
+      cfg: params.cfg,
+      agentId: params.followupRun.run.agentId,
+      sessionKey: params.sessionKey,
+      classificationSessionKey:
+        params.runtimePolicySessionKey ?? params.followupRun.run.runtimePolicySessionKey,
+    },
+    { env: process.env, cwd: process.cwd(), assertCurrent },
+    async ({ sandboxed, toolPolicy, workspaceAccess: access, classificationAgentId: agentId }) => ({
+      writable:
+        !sandboxed ||
+        (access ?? resolveSandboxConfigForAgent(params.cfg, agentId).workspaceAccess) === "rw",
+      toolPolicy: sandboxed ? toolPolicy : undefined,
+    }),
+  );
+}
+
 export function followupUsesCliRuntime(params: FollowupRuntimeParams, runtimeId: string): boolean {
   const provider = params.followupRun.run.provider;
   if (params.agentHarnessId) {
@@ -190,26 +219,5 @@ export async function defersTokenCompactionToChatGPTBoundary(
       // Native Responses always replays checkpoints, independent of credentials.
       compactionReplayEnabled: true,
     })
-  );
-}
-
-export function hasWritableMemoryFlushWorkspace(
-  params: Pick<
-    MemoryFlushRunParams,
-    "cfg" | "followupRun" | "sessionKey" | "runtimePolicySessionKey"
-  >,
-  assertCurrent: () => void,
-): Promise<boolean> {
-  return withSandboxRuntimeStatusInWorker(
-    {
-      cfg: params.cfg,
-      agentId: params.followupRun.run.agentId,
-      sessionKey: params.sessionKey,
-      classificationSessionKey: params.runtimePolicySessionKey,
-    },
-    { env: process.env, cwd: process.cwd(), assertCurrent },
-    async ({ sandboxed, workspaceAccess: access, classificationAgentId: agentId }) =>
-      !sandboxed ||
-      (access ?? resolveSandboxConfigForAgent(params.cfg, agentId).workspaceAccess) === "rw",
   );
 }

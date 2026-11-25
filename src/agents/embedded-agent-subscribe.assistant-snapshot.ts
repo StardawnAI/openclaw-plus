@@ -1,16 +1,16 @@
-import type { AssistantHistoryMessage } from "../llm/types.js";
+import type { AssistantMessage } from "../llm/types.js";
 
 /** Detached reasoning from this exact message's synchronous model snapshot. */
 export type AssistantSnapshotReasoning = {
-  readonly source: AssistantHistoryMessage;
+  readonly source: AssistantMessage;
   readonly thinking: readonly (string | undefined)[];
 };
 
 /** Preserve native clone semantics and share only previously detached reasoning. */
-export function snapshotAssistantMessage<T extends AssistantHistoryMessage>(
-  message: T,
+export function snapshotAssistantMessage(
+  message: AssistantMessage,
   prepared?: AssistantSnapshotReasoning,
-): { snapshot: T; reasoning: AssistantSnapshotReasoning } {
+): { snapshot: AssistantMessage; reasoning: AssistantSnapshotReasoning } {
   const snapshot = structuredClone(message);
   // Raw terminal text has a different lifetime: reusing its detached copy grows
   // long text-only replies. Keep text on the existing native-clone path.

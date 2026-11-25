@@ -20,7 +20,6 @@ async function withRelayTestDeps(
   deps: NativeHookRelayCliTestDeps,
   run: () => Promise<number>,
 ): Promise<number> {
-  const gateway = deps.callGateway ? await import("../gateway/call.js") : undefined;
   const restore: Array<() => void> = [];
   try {
     // The relay deadline counts from process start (the performance.now() origin),
@@ -43,7 +42,8 @@ async function withRelayTestDeps(
         .mockImplementation(deps.invokeBridge);
       restore.push(() => spy.mockRestore());
     }
-    if (deps.callGateway && gateway) {
+    if (deps.callGateway) {
+      const gateway = await import("../gateway/call.js");
       const spy = vi.spyOn(gateway, "callGateway").mockImplementation(deps.callGateway);
       restore.push(() => spy.mockRestore());
     }

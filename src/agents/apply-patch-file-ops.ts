@@ -72,7 +72,7 @@ export async function resolvePatchFileOps(options: ApplyPatchFileOptions): Promi
     return withPatchMemoryWriteProvenance(options.memoryWriteProvenance, {
       readFile: (filePath) =>
         runWithAgentToolSourceExecutionScope(assertCurrent, async () => {
-          const buf = await bridge.readFile({ filePath, cwd: root, signal: options.signal });
+          const buf = await bridge.readFile({ filePath, cwd: root });
           assertCurrent();
           return decodeUtf8Input(buf, `File ${filePath}`);
         }),

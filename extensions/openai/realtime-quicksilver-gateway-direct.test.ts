@@ -51,10 +51,7 @@ function createHarness(overrides: Partial<GatewayConfig> = {}) {
     start: async () => {
       const connection = bridge.connect();
       await vi.waitFor(() => expect(socket?.sent).toHaveLength(1));
-      if (!socket) {
-        throw new Error("expected direct socket");
-      }
-      return { socket, connection };
+      return { socket: socket!, connection };
     },
   };
 }

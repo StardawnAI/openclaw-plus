@@ -37,6 +37,7 @@ export {
   REALTIME_VOICE_AGENT_CONTROL_TOOL_NAME,
   resolveRealtimeVoiceAgentControlIntent,
   shouldAutoControlRealtimeVoiceAgentText,
+  type RealtimeVoiceAgentControlProviderResult,
   type RealtimeVoiceAgentControlResult,
 } from "./agent-run-control-shared.js";
 

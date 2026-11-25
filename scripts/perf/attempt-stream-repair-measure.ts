@@ -132,12 +132,13 @@ async function run(turnCount: number) {
           lifecycle: { readYieldState: () => ({ yieldDetected: false }) },
         } as unknown as EmbeddedAttemptExecutionPhaseInput;
         owner.installEmbeddedAttemptStreamGuards(input, {
-          isToolBoundarySafe: () => true,
           onRejectedProviderReplayRepaired: () => assert.fail("unexpected repair"),
           onIdleTimeout: (error) => {
             throw error;
           },
           diagnosticOwner: createDiagnosticEmbeddedRunOwner(attempt),
+          // This measurement fixture does not certify safe tool boundaries.
+          isToolBoundarySafe: () => false,
         });
         const stream = await activeSession.agent.streamFn(
           model,

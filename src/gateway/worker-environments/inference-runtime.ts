@@ -294,6 +294,13 @@ export const executePreparedWorkerInference = async (
       return inferenceError("cancelled");
     }
 
+    const costConfig = isDiagnosticsEnabled(config)
+      ? await resolveModelCostConfig({ provider: model.provider, model: model.id, config })
+      : undefined;
+    if (signal.aborted || !params.isCurrent()) {
+      return inferenceError("cancelled");
+    }
+
     const startedAt = Date.now();
     const trace = createDiagnosticTraceContextFromActiveScope();
     let modelCallSeq = 0;
@@ -322,14 +329,7 @@ export const executePreparedWorkerInference = async (
       // One call prices exactly in any tier; an all-zero transport cost is only a placeholder.
       const costUsd = hasRecordedUsageCost(usage.cost)
         ? usage.cost?.total
-        : estimateUsageCost({
-            usage,
-            cost: resolveModelCostConfig({
-              provider: model.provider,
-              model: model.id,
-              config,
-            }),
-          });
+        : estimateUsageCost({ usage, cost: costConfig });
       emitTrustedDiagnosticEvent({
         type: "model.usage",
         trace: freezeDiagnosticTraceContext(trace),

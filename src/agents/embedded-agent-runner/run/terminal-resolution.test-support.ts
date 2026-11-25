@@ -1,5 +1,4 @@
 import { expect, vi } from "vitest";
-import type { AssistantHistoryMessage } from "../../../llm/types.js";
 import { resolveRawAssistantAnswerText } from "../../../shared/assistant-answer-text.js";
 import { prepareAgentRunTerminalReply } from "../../agent-run-terminal-reply.js";
 import {
@@ -37,7 +36,7 @@ export function textAssistant(
 }
 
 export function assistantAttempt(
-  assistant: AssistantHistoryMessage | undefined,
+  assistant: ReturnType<typeof buildEmbeddedRunnerAssistant> | undefined,
   overrides: Parameters<typeof makeEmbeddedRunnerAttempt>[0] = {},
 ) {
   return makeEmbeddedRunnerAttempt({
@@ -103,7 +102,6 @@ export function makeTerminalInput(input: TerminalInputOverrides = {}): TerminalI
       activateCompactionContinuation: vi.fn(),
       clearCompactionContinuation: vi.fn(),
     },
-    armPostCompactionGuard: vi.fn(),
     readTerminalToolPresentation: () => undefined,
     resolveReplayInvalid: () => false,
     setTerminalLifecycleMeta: vi.fn(),

@@ -3,11 +3,8 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
 import { resolveAgentConfig } from "../agents/agent-scope-config.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
-import type { ModelCatalogEntry } from "../agents/model-catalog.types.js";
-import {
-  buildConfiguredModelCatalog,
-  resolveConfiguredModelRef,
-} from "../agents/model-selection.js";
+import { resolveConfiguredModelRef } from "../agents/model-selection.js";
+import { buildThinkingCatalog } from "../agents/model-thinking-default-core.js";
 import { getChannelPlugin, getLoadedChannelPlugin } from "../channels/plugins/index.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import { loadSessionEntryReadOnly } from "../config/sessions/session-accessor.js";
@@ -15,7 +12,6 @@ import { readSessionEntryReadOnlyInWorker } from "../config/sessions/session-ent
 import type { OpenClawConfig } from "../config/types.js";
 import { warnPluginSdkDeprecation } from "../plugins/sdk-deprecation.js";
 import type { SkillCommandSpec } from "../skills/types.js";
-import { loadCommandArgMenuModelCatalog } from "./command-arg-menu-catalog.js";
 import type { CommandTurnContext } from "./command-turn-context.js";
 import { listChatCommands, listChatCommandsForConfig } from "./commands-registry-list.js";
 import { resolveTextCommand } from "./commands-registry-normalize.js";
@@ -325,14 +321,16 @@ export function resolveCommandArgChoices(
       defaultProvider: DEFAULT_PROVIDER,
       defaultModel: DEFAULT_MODEL,
     });
+    const provider = params.provider ?? defaults.provider ?? DEFAULT_PROVIDER;
+    const model = params.model ?? defaults.model ?? DEFAULT_MODEL;
     choices = choices({
       cfg,
       command: params.command,
       arg,
-      provider: params.provider ?? defaults.provider ?? DEFAULT_PROVIDER,
-      model: params.model ?? defaults.model ?? DEFAULT_MODEL,
+      provider,
+      model,
       agentRuntime: params.agentRuntime,
-      catalog: params.catalog ?? (cfg ? buildConfiguredModelCatalog({ cfg }) : undefined),
+      catalog: params.catalog ?? (cfg ? buildThinkingCatalog({ cfg, provider, model }) : undefined),
     });
   }
   return choices.map((choice) =>
@@ -369,8 +367,6 @@ type ResolvedCommandArgMenu = {
   arg: CommandArgDefinition;
   choices: ResolvedCommandArgChoice[];
   title?: string;
-  /** Published rows used by this menu, also available for channel-specific status text. */
-  modelCatalog?: ModelCatalogEntry[];
 };
 
 /** @deprecated Use resolveCommandArgMenuAsync. Supported through 2026-12-31. Removal in the first January 2027 stable release. */
@@ -397,30 +393,7 @@ export function resolveCommandArgMenu(params: CommandArgMenuParams): ResolvedCom
 export async function resolveCommandArgMenuAsync(
   params: CommandArgMenuParams,
 ): Promise<ResolvedCommandArgMenu | null> {
-  if (!canResolveCommandArgMenu(params)) {
-    return null;
-  }
-  // Menus follow the published generation without discovery or exact-config selection.
-  // An explicitly supplied catalog, including an empty one, remains authoritative.
-  const modelCatalog =
-    params.command.key === "think" &&
-    params.cfg &&
-    params.catalog === undefined &&
-    params.command.args.some(
-      (arg) => typeof arg.choices === "function" && params.args?.values?.[arg.name] == null,
-    )
-      ? await loadCommandArgMenuModelCatalog({
-          cfg: params.cfg,
-          agentId: params.session?.agentId,
-        })
-      : undefined;
-  const menu = resolveCommandArgMenuChoices({
-    ...params,
-    catalog: params.catalog ?? modelCatalog,
-  });
-  if (menu && modelCatalog) {
-    menu.modelCatalog = modelCatalog;
-  }
+  const menu = resolveCommandArgMenuChoices(params);
   if (menu && params.command.key === "verbose" && params.cfg && params.session) {
     const { agentId, sessionKey } = params.session;
     const entry = await readSessionEntryReadOnlyInWorker({
@@ -449,7 +422,11 @@ function resolveCommandArgMenuChoices(params: CommandArgMenuParams): ResolvedCom
     return null;
   }
   const { command, args, cfg, provider, model, agentRuntime, catalog } = params;
-  const resolvedCatalog = catalog ?? (cfg ? buildConfiguredModelCatalog({ cfg }) : undefined);
+  // Without an explicit model, resolveCommandArgChoices resolves the default first and builds
+  // the catalog for it.
+  const resolvedCatalog =
+    catalog ??
+    (cfg && provider && model ? buildThinkingCatalog({ cfg, provider, model }) : undefined);
   const resolveChoices = (arg: CommandArgDefinition) =>
     resolveCommandArgChoices({
       command,

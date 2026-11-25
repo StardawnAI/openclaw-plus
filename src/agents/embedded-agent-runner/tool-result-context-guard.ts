@@ -8,15 +8,9 @@ import { projectRecordedModelPrompt } from "../../sessions/user-turn-transcript.
 import { mapArrayIfChanged } from "../../shared/map-array-if-changed.js";
 import { resolveEffectiveCompactionReserveTokens } from "../agent-compaction-constants.js";
 import type { Agent, AgentMessage } from "../runtime/index.js";
-import {
-  SAFETY_MARGIN,
-  createFreshLlmBoundaryTokenEstimator,
-} from "../sessions/context-token-pressure.js";
+import { createFreshLlmBoundaryTokenEstimator } from "../sessions/context-token-pressure.js";
 import { resolveToolResultContextMaxChars } from "../tool-result-limits.js";
-import {
-  formatContextLimitTruncationNotice,
-  forMessage as toolResultTruncationNotice,
-} from "./context-truncation-notice.js";
+import { formatContextLimitTruncationNotice } from "./context-truncation-notice.js";
 import {
   TOOL_IMAGE_CHARS,
   TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE,
@@ -65,11 +59,6 @@ function truncateToolResultToChars(
     const isText = (block: unknown): block is { type: "text"; text: string } =>
       isToolResultTextBlock(block) && block.type === "text";
     const imageCount = content.filter(isImage).length;
-    const sourceTextLength = content.reduce<number>(
-      (sum, block) => sum + (isText(block) ? block.text.length : 0),
-      0,
-    );
-    const fullOmissionNoticeLength = toolResultTruncationNotice(msg)(sourceTextLength).length;
     const omissionNotice = (retainedImages: number) => {
       const omittedImages = imageCount - retainedImages;
       return (
@@ -92,7 +81,13 @@ function truncateToolResultToChars(
       const boundedContent = (bounded as { content: unknown[] }).content;
       return {
         message: replaceToolResultContent(msg, [...boundedContent, ...notice]),
-        compactedText: boundedContent.length < retainedContent.length,
+        // A notice-only replacement is not a useful prefix. Try fewer images
+        // rather than dropping the remaining semantic text to keep them.
+        compactedText:
+          boundedContent.length < retainedContent.length &&
+          boundedContent.some(
+            (block) => isText(block) && block.text && retainedContent.includes(block),
+          ),
         boundedContent,
       };
     };
@@ -109,20 +104,12 @@ function truncateToolResultToChars(
         retainedContent,
         retainedImages < imageCount ? omissionNotice(retainedImages) : undefined,
       );
-      // A compacted result has one notice. It must contain source text beyond
-      // that notice, not just a nonempty (possibly clipped) omission marker.
       if (
-        compactedText
-          ? boundedContent.reduce<number>(
-              (sum, block) => sum + (isText(block) ? block.text.length : 0),
-              0,
-            ) <= fullOmissionNoticeLength
-          : retainedContent.some((block, index) => {
-              const projectedBlock = boundedContent[index];
-              return (
-                isText(block) && block.text && (!isText(projectedBlock) || !projectedBlock.text)
-              );
-            })
+        !compactedText &&
+        retainedContent.some((block, index) => {
+          const projectedBlock = boundedContent[index];
+          return isText(block) && block.text && (!isText(projectedBlock) || !projectedBlock.text);
+        })
       ) {
         continue;
       }
@@ -164,8 +151,7 @@ function resolveMidTurnHistoryTokenBudget(params: {
   tools?: RequestToolSchemas;
   pendingMessages: AgentMessage[];
 }): number {
-  // Mirror the precheck: its reserve cap, and one estimator pricing the system
-  // prompt, tool schemas and pending exchange with the safety margin applied.
+  // Price fixed content and assembled history in the precheck's nominal units.
   // The pending exchange already carries the active prompt.
   const promptBudget =
     Math.max(1, Math.floor(params.tokenBudget)) -
@@ -177,12 +163,12 @@ function resolveMidTurnHistoryTokenBudget(params: {
     systemPrompt: params.systemPrompt,
     tools: params.tools,
     retainCompletionUsage: true,
+    safetyMargin: 1,
   })({
     messages: params.pendingMessages.map((message) => projectRecordedModelPrompt(message)),
     prompt: "",
   });
-  // The precheck also multiplies assembled history by the margin.
-  return Math.max(1, Math.floor((promptBudget - fixedTokens) / SAFETY_MARGIN));
+  return Math.max(1, Math.floor(promptBudget - fixedTokens));
 }
 
 /**
@@ -342,6 +328,9 @@ export function installContextEngineLoopHook(params: {
 
   return () => {
     mutableAgent.transformContext = originalTransformContext;
+    // The removed hook stays reachable from retained run callbacks; drop its assembled history.
+    lastAssembledView = null;
+    lastSourceMessages = null;
   };
 }
 

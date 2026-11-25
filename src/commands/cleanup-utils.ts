@@ -17,7 +17,6 @@ import {
 import { removeCompletionRegistrations } from "../cli/completion-runtime.js";
 import { resolveGatewayLockDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { resolveIdentityPathViaExistingAncestorSync } from "../infra/boundary-path.js";
 import { formatErrorMessage, isMissingPathError } from "../infra/errors.js";
 import { movePathToTrash } from "../infra/fs-safe.js";
 import {
@@ -26,7 +25,10 @@ import {
   type GatewayLockHandle,
 } from "../infra/gateway-lock.js";
 import { realpathViaExistingPrefix } from "../infra/path-containment.js";
-import { pathEntryExists as pathExists } from "../infra/path-existence.js";
+import {
+  pathEntryExists as pathExists,
+  resolveIdentityPathViaExistingAncestorSync,
+} from "../infra/path-existence.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { prepareOpenClawStateDatabaseRemoval } from "../state/openclaw-state-db-cache.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
@@ -293,8 +295,9 @@ async function removePathPreserving(
       }
       runtime.log(`Removed contents of ${displayLabel}`);
     } else {
+      const existed = await pathExists(resolved);
       await fs.rm(resolved, { recursive: true, force: true });
-      runtime.log(`Removed ${displayLabel}`);
+      runtime.log(existed ? `Removed ${displayLabel}` : `Not found: ${displayLabel}`);
     }
     return { ok: true };
   } catch (err) {

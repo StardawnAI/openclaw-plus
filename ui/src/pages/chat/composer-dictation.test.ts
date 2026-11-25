@@ -762,7 +762,7 @@ describe("ComposerDictationOwner", () => {
       expect(onError).toHaveBeenCalledExactlyOnceWith(
         outcome === "disconnect"
           ? "Dictation stopped because the Gateway disconnected."
-          : "Dictation failed.",
+          : "Couldn’t transcribe your voice.",
         { kind: "interrupted", preservesText: false },
       );
     },
@@ -877,7 +877,7 @@ describe("ComposerDictationOwner", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await expect(finished).resolves.toBe(false);
     expect(controller.locksComposer).toBe(false);
-    expect(request).not.toHaveBeenCalledWith("talk.session.close", expect.anything());
+    expect(request.mock.calls.map(([method]) => method)).not.toContain("talk.session.close");
     created.resolve(sessionResult("late-session"));
     await waitForFast(() => expectClosed("late-session"));
   });
@@ -929,7 +929,7 @@ describe("composer microphone button", () => {
 
     await releaseLatched(target);
     expect(controller.active).toBe(true);
-    expect(request).not.toHaveBeenCalledWith("talk.session.close", expect.anything());
+    expect(request.mock.calls.map(([method]) => method)).not.toContain("talk.session.close");
     expect(onCommit).not.toHaveBeenCalled();
 
     click(target);
@@ -961,3 +961,31 @@ it("placeComposerDictation spaces inserted and replaced selections", () => {
   expect(place(6, 6, "brave new")).toMatchObject({ value: "hello brave new world", caret: 16 });
   expect(place(6, 11, "there")).toMatchObject({ value: "hello there", caret: 11 });
 });
+
+it.each([false, true])(
+  "waits for a prepared session before recording (cancel: %s)",
+  async (cancel) => {
+    const pending = createDeferred<string>();
+    const prepareSession = vi.fn(() => pending.promise);
+    const { controller } = createHarness({ prepareSession, dictationAvailable: false });
+    expect(controller.startDirect()).toBe(true);
+    expect(prepareSession).toHaveBeenCalledOnce();
+    expect(request).not.toHaveBeenCalledWith("talk.session.create", expect.anything());
+    if (cancel) {
+      controller.cancel();
+    }
+    pending.resolve("agent:main:prepared-draft");
+    await vi.dynamicImportSettled();
+    if (cancel) {
+      expect(request).not.toHaveBeenCalledWith("talk.session.create", expect.anything());
+      expect(controller.active).toBe(false);
+    } else {
+      expect(request).toHaveBeenCalledWith(
+        "talk.session.create",
+        expect.objectContaining({
+          sessionKey: "agent:main:prepared-draft",
+        }),
+      );
+    }
+  },
+);

@@ -194,7 +194,9 @@ export function resolveSessionCatalogProfiles(
   const profileId = sessionEntry?.authProfileOverride?.trim();
   const runtime = sessionEntry?.agentRuntimeOverride?.trim();
   const provider =
-    sessionEntry?.providerOverride ??
+    (sessionEntry?.modelOverrideSource === "default"
+      ? undefined
+      : sessionEntry?.providerOverride) ??
     (runtime
       ? resolveSessionModelRef(config, sessionEntry, agentId, {
           allowPluginNormalization: false,

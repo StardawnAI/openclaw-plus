@@ -1,16 +1,7 @@
 import { once } from "node:events";
-import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
-import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createDeferred, withinTest } from "../../test/helpers/promise.js";
-import { loadPersistedPluginModelCatalogs } from "../agents/plugin-model-catalog-execution.js";
-import { preparePluginModelCatalogSave } from "../agents/plugin-model-catalog-save.js";
-import {
-  encodePluginModelCatalogRelativePath,
-  PLUGIN_MODEL_CATALOG_GENERATED_BY,
-  replacePersistedPluginModelCatalogs,
-} from "../agents/plugin-model-catalog.js";
 import { loadSessionEntry, loadTranscriptEvents } from "../config/sessions/session-accessor.js";
 import * as sessionInputActors from "../config/sessions/session-input-actor.js";
 import { listSessionPendingInputs } from "../config/sessions/session-pending-input-history.js";
@@ -39,17 +30,17 @@ import { rpcReq } from "./test-helpers.js";
 const dispatch = vi.hoisted(() => ({ start: vi.fn<(params: StartChatDispatchParams) => void>() }));
 const turnBoundary = vi.hoisted(() => ({
   committing: false,
-  afterPrepare: undefined as (() => void | Promise<void>) | undefined,
+  afterPrepare: undefined as (() => void) | undefined,
   afterCommit: undefined as (() => void) | undefined,
 }));
 vi.mock("../state/openclaw-agent-execution.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../state/openclaw-agent-execution.js")>();
   return {
     ...actual,
-    captureOpenClawAgentDatabaseExecution: (
-      ...args: Parameters<typeof actual.captureOpenClawAgentDatabaseExecution>
-    ): ReturnType<typeof actual.captureOpenClawAgentDatabaseExecution> => {
-      const owner = actual.captureOpenClawAgentDatabaseExecution(...args);
+    captureOpenClawAgentDatabaseExecutionAsync: async (
+      ...args: Parameters<typeof actual.captureOpenClawAgentDatabaseExecutionAsync>
+    ): ReturnType<typeof actual.captureOpenClawAgentDatabaseExecutionAsync> => {
+      const owner = await actual.captureOpenClawAgentDatabaseExecutionAsync(...args);
       return {
         ...owner,
         get fileIdentity() {
@@ -73,7 +64,7 @@ vi.mock("../state/openclaw-agent-execution.js", async (importOriginal) => {
                   }
                   turnBoundary.committing = true;
                   try {
-                    await turnBoundary.afterPrepare?.();
+                    turnBoundary.afterPrepare?.();
                     const result = await worker.execute(command, commandOptions);
                     turnBoundary.afterCommit?.();
                     return result;
@@ -258,7 +249,7 @@ test("persists and dispatches concurrent Gateway inputs while participant writes
   try {
     const created = await Promise.all(
       inputs.map((params) =>
-        rpcReq<{ sessionId: string; runStarted: boolean }>(ws, "sessions.create", params, 60_000),
+        rpcReq<{ sessionId: string; runStarted: boolean }>(ws, "sessions.create", params),
       ),
     );
     for (const [index, response] of created.entries()) {
@@ -301,38 +292,6 @@ test.for([
   const message = "Only retain this initial input after its admission commits.";
   const failure = new Error(`initial input ${fault}`);
   const hit = vi.fn();
-  const catalogAgentDir = path.join(path.dirname(fixture.storePath), "unrelated-catalog-agent");
-  const catalog = {
-    pluginId: "durability-test",
-    contents: JSON.stringify({
-      generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-      providers: {
-        fixture: {
-          baseUrl: "https://fixture.example/v1",
-          api: "openai-completions",
-          models: [],
-        },
-      },
-    }),
-  };
-  if (fault === "idle-commit-refused") {
-    // Warm this independent database before the fault hook observes worker admissions.
-    await replacePersistedPluginModelCatalogs({
-      agentDir: catalogAgentDir,
-      pluginCatalogWrites: {
-        [encodePluginModelCatalogRelativePath(catalog.pluginId)]: JSON.stringify({
-          generatedBy: PLUGIN_MODEL_CATALOG_GENERATED_BY,
-          providers: {},
-        }),
-      },
-    });
-    const saveCatalog = await preparePluginModelCatalogSave(catalogAgentDir, process.env);
-    turnBoundary.afterPrepare = async () => {
-      turnBoundary.afterPrepare = undefined;
-      // Reproduce discovery settling inside the input-command interval, without timing sleeps.
-      await saveCatalog([catalog]);
-    };
-  }
   const initial = captureInitial(key, () => {
     if (fault === "before-input") {
       hit();
@@ -340,17 +299,11 @@ test.for([
     }
   });
   const refuse = probe.admission(workerAdmission, (request, grant, callback) => {
-    const facts = isRecord(request.facts) ? request.facts.publication : undefined;
-    // Model-catalog and other worker writes may settle while the input command waits.
-    // Refuse only this session actor, not every commit during that interval.
-    const committingInput =
+    if (
+      fault === "permission-revoked-at-commit" &&
       turnBoundary.committing &&
-      isRecord(facts) &&
-      facts.kind === "session-actor-admission" &&
-      isRecord(facts.snapshot) &&
-      isRecord(facts.snapshot.target) &&
-      facts.snapshot.target.sessionKey === key;
-    if (fault === "permission-revoked-at-commit" && committingInput && request.stage === "commit") {
+      request.stage === "commit"
+    ) {
       hit();
       const options = initial.options;
       invalidateGatewayDeviceRevocation(
@@ -360,7 +313,7 @@ test.for([
       );
     }
     if (
-      committingInput &&
+      turnBoundary.committing &&
       ((fault === "transaction-refused" && request.stage === "transaction") ||
         ((fault === "commit-refused" || fault === "idle-commit-refused") &&
           request.stage === "commit"))
@@ -419,10 +372,6 @@ test.for([
       created = await fixture.create({ message }, false);
     }
     expect(hit).toHaveBeenCalledOnce();
-    if (fault === "idle-commit-refused") {
-      const catalogs = await loadPersistedPluginModelCatalogs(catalogAgentDir);
-      expect(catalogs).toEqual([catalog]);
-    }
     expect(dispatch.start).not.toHaveBeenCalled();
     const before = fixture.read();
     if (created) {

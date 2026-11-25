@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createDeferred, withinTest } from "../../../test/helpers/promise.js";
 import { makeAssistantMessageFixture } from "../../agents/test-helpers/assistant-message-fixtures.js";
-import type { AssistantHistoryMessage } from "../../llm/types.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import type { resolveFollowupDeliveryDecision } from "./followup-delivery.js";
@@ -72,21 +71,16 @@ const state = getFollowupTurnTestState();
 const key = "followup-turn-callback-ownership";
 
 function createObservers() {
-  const observers = {
+  return {
     onDeliberateSilentTerminalReply: vi.fn(),
     onPreparedAgentRunStart: vi.fn<Observers["onPreparedAgentRunStart"]>(),
     onAgentRunTerminalOutcome: vi.fn<Observers["onAgentRunTerminalOutcome"]>(),
     onModelSelected: vi.fn<Observers["onModelSelected"]>(),
-    prepareAssistantTranscriptMessage<T extends AssistantHistoryMessage>(
-      this: void,
-      message: T,
-    ): T {
-      return message;
-    },
+    prepareAssistantTranscriptMessage: vi.fn<Observers["prepareAssistantTranscriptMessage"]>(
+      (message) => message,
+    ),
     resolveReplyDelivery: vi.fn<Observers["resolveReplyDelivery"]>(async () => "delivered"),
   };
-  vi.spyOn(observers, "prepareAssistantTranscriptMessage");
-  return observers;
 }
 
 beforeEach(() => {
@@ -213,14 +207,11 @@ it.for(["before drain", "enqueue during drain", "deferred restart"] as const)(
       for (const [index, item] of ["B", "C"].entries()) {
         const own = observers[index]!;
         expect(own.onDeliberateSilentTerminalReply).toHaveBeenCalledOnce();
-        expect(own.prepareAssistantTranscriptMessage).toHaveBeenCalledExactlyOnceWith(
-          message,
-          item,
-        );
         expectCalls(
           [own.onPreparedAgentRunStart, [[{ runId: `execution-${item}`, transcriptStart: null }]]],
           [own.onModelSelected, [[{ provider: "test", model: item, thinkLevel: undefined }]]],
           [own.onAgentRunTerminalOutcome, [["completed"]]],
+          [own.prepareAssistantTranscriptMessage, [[message, item]]],
           [own.resolveReplyDelivery, [[1], [2]]],
         );
       }
@@ -229,9 +220,7 @@ it.for(["before drain", "enqueue during drain", "deferred restart"] as const)(
       expect(ownedEvent.onTerminal).toHaveBeenCalledExactlyOnceWith("execution-B", "completed");
       expectCallCounts(0, decoyEvent.onStarted, decoyEvent.onTerminal);
       for (const decoy of decoys) {
-        for (const callback of Object.values(decoy)) {
-          expect(callback).not.toHaveBeenCalled();
-        }
+        expectCallCounts(0, ...Object.values(decoy));
       }
     } finally {
       releaseFirst.resolve();

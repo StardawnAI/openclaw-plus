@@ -92,7 +92,11 @@ function attachFile(container: Element, file: File, entry: "clipboard" | "file p
   if (entry === "clipboard") {
     const paste = new Event("paste", { bubbles: true, cancelable: true });
     Object.defineProperty(paste, "clipboardData", {
-      value: { items: [{ type: file.type, getAsFile: () => file }], getData: () => "" },
+      value: {
+        files: [file],
+        items: [{ type: file.type, getAsFile: () => file }],
+        getData: () => "",
+      },
     });
     getComposerTextarea(container).dispatchEvent(paste);
   } else if (entry === "file picker") {
@@ -110,6 +114,41 @@ function attachFile(container: Element, file: File, entry: "clipboard" | "file p
 }
 
 describe("chat attachment paste", () => {
+  it("removes upload controls and rejects file paste/drop while preserving plain text paste", async () => {
+    const uploadConfig = createApplicationConfigCapability({ resourceBasePath: "" });
+    const onAttachmentsChange = vi.fn();
+    const container = renderChatView({ uploadConfig, onAttachmentsChange });
+    expect(container.querySelector("input[type=file]")).not.toBeNull();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json({ uploadsEnabled: false })),
+    );
+    await uploadConfig.refresh();
+    const disabled = renderChatView({ uploadConfig, onAttachmentsChange });
+    expect(disabled.querySelector("input[type=file]")).toBeNull();
+    expect(disabled.querySelector(".agent-chat__attach-menu-option")).toBeNull();
+    const textarea = getComposerTextarea(disabled);
+    const textPaste = createPasteEvent("ordinary text ".repeat(200));
+    textarea.dispatchEvent(textPaste);
+    expect(textPaste.defaultPrevented).toBe(false);
+    const imagePaste = createPasteEvent("data:image/png;base64,YWJj");
+    textarea.dispatchEvent(imagePaste);
+    expect(imagePaste.defaultPrevented).toBe(true);
+    const drop = new Event("drop", { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, "dataTransfer", {
+      value: {
+        types: ["Files"],
+        files: [new File(["proof"], "proof.txt")],
+      },
+    });
+    disabled.querySelector("section.chat")!.dispatchEvent(drop);
+    expect(drop.defaultPrevented).toBe(true);
+    expect(onAttachmentsChange).not.toHaveBeenCalled();
+    // Retained enabled render handlers also consume the current policy.
+    getComposerTextarea(container).dispatchEvent(createPasteEvent("data:image/png;base64,YWJj"));
+    expect(onAttachmentsChange).not.toHaveBeenCalled();
+  });
+
   it.each(["dropped", "inserted", "inserted-then-cleared", "unfocused"] as const)(
     "recovers a %s native text paste once from the event snapshot",
     async (mode) => {
@@ -167,41 +206,6 @@ describe("chat attachment paste", () => {
       setTimeout(resolve, 0);
     });
     expect(textarea.value).toBe("Draft: dic");
-  });
-
-  it("removes upload controls and rejects file paste/drop while preserving plain text paste", async () => {
-    const uploadConfig = createApplicationConfigCapability({ resourceBasePath: "" });
-    const onAttachmentsChange = vi.fn();
-    const container = renderChatView({ uploadConfig, onAttachmentsChange });
-    expect(container.querySelector("input[type=file]")).not.toBeNull();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => Response.json({ uploadsEnabled: false })),
-    );
-    await uploadConfig.refresh();
-    const disabled = renderChatView({ uploadConfig, onAttachmentsChange });
-    expect(disabled.querySelector("input[type=file]")).toBeNull();
-    expect(disabled.querySelector(".agent-chat__attach-menu-option")).toBeNull();
-    const textarea = getComposerTextarea(disabled);
-    const textPaste = createPasteEvent("ordinary text ".repeat(200));
-    textarea.dispatchEvent(textPaste);
-    expect(textPaste.defaultPrevented).toBe(false);
-    const imagePaste = createPasteEvent("data:image/png;base64,YWJj");
-    textarea.dispatchEvent(imagePaste);
-    expect(imagePaste.defaultPrevented).toBe(true);
-    const drop = new Event("drop", { bubbles: true, cancelable: true });
-    Object.defineProperty(drop, "dataTransfer", {
-      value: {
-        types: ["Files"],
-        files: [new File(["proof"], "proof.txt")],
-      },
-    });
-    disabled.querySelector("section.chat")!.dispatchEvent(drop);
-    expect(drop.defaultPrevented).toBe(true);
-    expect(onAttachmentsChange).not.toHaveBeenCalled();
-    // Retained enabled render handlers also consume the current policy.
-    getComposerTextarea(container).dispatchEvent(createPasteEvent("data:image/png;base64,YWJj"));
-    expect(onAttachmentsChange).not.toHaveBeenCalled();
   });
 
   it("preserves pasted-text presentation and restore behavior across handoff", async () => {

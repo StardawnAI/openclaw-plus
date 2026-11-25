@@ -1,11 +1,10 @@
 /** Lifecycle-owned auth/model discovery snapshots for agent runs. */
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { throwSettledAggregate } from "../infra/error-graph-internal.js";
-import { readOnlyWorkerScope } from "../infra/sqlite-readonly-worker-context.js";
+import { materializeErrorStack, throwSettledAggregate } from "../infra/error-graph-internal.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { enqueueKeyedTask } from "../plugin-sdk/keyed-async-queue.js";
-import { pluginInvocationContext } from "../plugins/plugin-instance-scope.js";
+import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { getPreparedSharedAuthStoreOwnership } from "./auth-profiles/path-resolve.js";
 import { registerRuntimeAuthProfileStoreMutationListener } from "./auth-profiles/runtime-snapshots.js";
 import type { ModelCatalogSnapshot } from "./model-catalog.types.js";
@@ -15,10 +14,6 @@ import {
   invalidatePreparedModelRuntimeOwnersForAuthMutation,
   type PreparedModelRuntimeAuthMutation,
 } from "./prepared-model-runtime-auth-publication.js";
-import {
-  isPreparedModelRuntimeGatewayLifecycleActive,
-  setPreparedModelRuntimeGatewayLifecycleActive,
-} from "./prepared-model-runtime-gateway-lifecycle.js";
 import { acquirePreparedModelRuntimeLeaseFromOwners } from "./prepared-model-runtime-lease.js";
 import {
   configuredOwnersAreRequestVisible,
@@ -43,6 +38,8 @@ import {
   publishPreparedModelRuntimeOwnerBatch,
   publishModelRuntimeSnapshot,
   resolveConfiguredOwner,
+  isPreparedModelRuntimeGatewayLifecycleActive,
+  setPreparedModelRuntimeGatewayLifecycleActive,
   readPublishedModelRuntimeSnapshot,
   resolvePreparedModelRuntimeOwnerBySnapshot,
   preparedModelRuntimeConfigsMatch,
@@ -419,6 +416,7 @@ export function markPreparedModelRuntimeSnapshotsStale(
     waitForReplacement?: boolean;
     preserveReplacementWait?: boolean;
     agentIds?: ReadonlySet<string>;
+    preservePluginGenerations?: boolean;
   } = {},
 ): PreparedModelRuntimeReplacementGateId | undefined {
   captureModelRuntimeLifetime();
@@ -449,10 +447,11 @@ export function markPreparedModelRuntimeSnapshotsStale(
   const staleError = new Error(reason);
   updateOwnersForScopedRefresh(owners, options.agentIds, staleError, {
     retireStandalone: true,
-    resetPluginGeneration: true,
+    resetPluginGeneration: !options.preservePluginGenerations,
   });
   // Fence epochs and admission before cancellation can reenter a plugin callback.
   previousCancellation.abort(new PreparedModelRuntimePublicationSupersededError(reason));
+  materializeErrorStack(previousCancellation.signal.reason);
   const replacement = getBlockingReplacement();
   notifyPreparedModelRuntimePublication({
     phase: "invalidated",
@@ -520,6 +519,7 @@ export function refreshPreparedModelRuntimeSnapshots(
   markPreparedModelRuntimeSnapshotsStale(undefined, {
     waitForReplacement: true,
     agentIds: initialAgentIds,
+    preservePluginGenerations: options.preservePluginGenerations,
   });
   if (options.gatewayLifecycle === true) {
     setPreparedModelRuntimeGatewayLifecycleActive(true);
@@ -559,7 +559,7 @@ export function refreshPreparedModelRuntimeSnapshots(
       // A lost external claim can leave partially built owners; fence them even without a successor.
       updateOwnersForScopedRefresh(owners, publicationAgentIds, error, {
         clearPending: true,
-        resetPluginGeneration: true,
+        resetPluginGeneration: !options.preservePluginGenerations,
       });
     }
     rejectPendingPreparedModelRuntimeReplacement(replacement?.gateId, error);
@@ -719,9 +719,9 @@ function invalidateForAuthMutation(event: PreparedModelRuntimeAuthMutation): voi
     });
   };
   // Wait for plugin replacement without occupying its queue. Publication owns its reads
-  // and plugin calls, independently of the auth emitter's finite invocation and reader scopes.
-  const publication = pluginInvocationContext.exit(() =>
-    readOnlyWorkerScope.exit(() => modelRuntimeDrain.runAfter(publicationQueue, publish)),
+  // and must outlive the auth emitter's temporary SQLite and plugin invocation scopes.
+  const publication = runInDetachedAsyncContext(() =>
+    modelRuntimeDrain.runAfter(publicationQueue, publish),
   );
   notifyPreparedModelRuntimePublication({ phase: "invalidated" });
   void publication.catch((error: unknown) => {
@@ -756,7 +756,11 @@ if (process.env.VITEST || process.env.NODE_ENV === "test") {
       resetPreparedModelRuntimeSnapshotsForTest,
       getPreparedModelRuntimeOwnerCountForTest: () => owners.size,
       setModelRuntimeBuildTimeoutMsForTest: (timeoutMs: number) => {
+        const previous = modelRuntimeBuildTimeoutMs;
         modelRuntimeBuildTimeoutMs = timeoutMs;
+        return () => {
+          modelRuntimeBuildTimeoutMs = previous;
+        };
       },
     };
 }

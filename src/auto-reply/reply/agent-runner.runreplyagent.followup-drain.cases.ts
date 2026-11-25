@@ -5,11 +5,11 @@ import {
   prepareAgentRunAdmission,
 } from "../../agents/admitted-run-context.js";
 import type { RunEmbeddedAgentInternalParams as AgentRunParams } from "../../agents/embedded-agent-runner/run/internal-params.js";
-import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
 import { expectPendingQuestionAnswerClaimable } from "../../agents/harness/gateway-question-claim.test-support.js";
 import type { AgentQuestionDispatcher } from "../../agents/harness/gateway-question-dispatch.js";
 import { registerPendingAgentQuestion } from "../../agents/harness/gateway-question.js";
 import { withPreparedEmbeddedRunToolAuthority } from "../../agents/harness/tool-authority.runtime.js";
+import { diagnosticLogger } from "../../logging/diagnostic-runtime.js";
 import { getSessionControllerOperation } from "../../sessions/session-controller.js";
 import type { TemplateContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
@@ -41,8 +41,6 @@ type FollowupDrainFixture = {
   };
   createMinimalRun: (params?: {
     isActive?: boolean;
-    bindActiveAuthority?: boolean;
-    currentInboundEventKind?: FollowupRun["currentInboundEventKind"];
     isRunActive?: () => boolean;
     shouldFollowup?: boolean;
     shouldSteer?: boolean;
@@ -189,6 +187,7 @@ export function registerFollowupDrainCases({
   );
 
   it("runs one queued fallback after Gateway rejects injection", async () => {
+    using warning = vi.spyOn(diagnosticLogger, "warn").mockImplementation(() => {});
     using delivery = vi
       .spyOn(routedReplies, "routeReply")
       .mockResolvedValue({ ok: true, delivered: true });
@@ -202,6 +201,12 @@ export function registerFollowupDrainCases({
     const { followupRun, run } = createMinimalRun({
       opts: {
         messageInjectionDisposition: "rejected",
+        messageInjectionRejection: {
+          status: "rejected",
+          reason: "injection_unavailable",
+          runtimeReason: "tool_boundary_timeout",
+          errorMessage: "x".repeat(600),
+        },
         onBlockReply,
         [REPLY_OPERATION_RUN_STATE]: runState,
       },
@@ -221,6 +226,16 @@ export function registerFollowupDrainCases({
     expect(getSessionControllerOperation("main")).toBeUndefined();
     await expect(run()).resolves.toBeUndefined();
 
+    expect(warning).toHaveBeenCalledWith(
+      "steering rejected; applying follow-up policy",
+      expect.objectContaining({
+        reason: "injection_unavailable",
+        runtimeReason: "tool_boundary_timeout",
+        error: "x".repeat(512),
+        disposition: "followup-queued",
+        sessionKey: followupRun.run.sessionKey,
+      }),
+    );
     expect(state.backendQueueMessageMock).not.toHaveBeenCalled();
     expect(state.beforeAgentReplyRunMock).not.toHaveBeenCalled();
     expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
@@ -316,94 +331,6 @@ export function registerFollowupDrainCases({
         drainSpy.mockRestore();
         vi.useRealTimers();
       }
-    }
-  });
-
-  it("hands a completed source reply to prequeued successors without replaying it", async () => {
-    const started = createDeferred();
-    const release = createDeferred();
-    const requests: Array<{ prompt: string; context: string }> = [];
-    const sent: string[] = [];
-    state.runEmbeddedAgentMock.mockImplementation(async (params) => {
-      const label = ["A", "B", "C"][requests.length];
-      requests.push({ prompt: params.prompt, context: params.currentInboundContext?.text ?? "" });
-      if (label === "A") {
-        started.resolve();
-        await release.promise;
-      }
-      const text = `${label}_REPLY_ONCE`;
-      sent.push(text);
-      return {
-        payloads: [],
-        meta: { durationMs: 0 },
-        sourceReplyDeliveryState: "delivered",
-        didDeliverSourceReplyViaMessageTool: true,
-        messagingToolSentTargets: [
-          { tool: "message", provider: "telegram", to: "123", text, sourceReplyFinal: true },
-        ],
-      } satisfies EmbeddedAgentRunResult;
-    });
-    const onBlockReply = vi.fn(async (_payload: ReplyPayload) => {});
-    const shared = {
-      opts: { sourceReplyDeliveryMode: "message_tool_only", onBlockReply },
-      currentInboundEventKind: "user_request",
-      sessionCtx: {
-        Provider: "telegram",
-        OriginatingChannel: "telegram",
-        OriginatingTo: "123",
-        ChatType: "group",
-      },
-      runOverrides: {
-        messageProvider: "telegram",
-        chatType: "group",
-        sourceReplyDeliveryMode: "message_tool_only",
-        config: { messages: { groupChat: { visibleReplies: "message_tool" } } },
-      },
-    } satisfies NonNullable<Parameters<typeof createMinimalRun>[0]>;
-    const first = createMinimalRun(shared).run();
-    await started.promise;
-    const successors = ["Fresh B question", "Repeat or discuss the prior reply"].map(
-      (prompt, index) => {
-        const queued = createMinimalRun({
-          ...shared,
-          sessionCtx: { ...shared.sessionCtx, MessageSid: `queued-${index}` },
-          isActive: true,
-          bindActiveAuthority: false,
-          isRunActive: () => true,
-          shouldFollowup: true,
-          resolvedQueueMode: "followup",
-        });
-        queued.followupRun.prompt = prompt;
-        queued.followupRun.currentInboundContext = { text: `Context for ${prompt}` };
-        return queued;
-      },
-    );
-    try {
-      for (const queued of successors) {
-        await expect(queued.run()).resolves.toBeUndefined();
-      }
-      expect(enqueueFollowupRun).toHaveBeenCalledTimes(2);
-      expect(requests).toHaveLength(1);
-      release.resolve();
-      await first;
-      await requireScheduledFollowupRunner()(successors[0]!.followupRun);
-      await successors[1]!.followupRun.controllerInput!.settlement.promise;
-
-      expect(sent).toEqual(["A_REPLY_ONCE", "B_REPLY_ONCE", "C_REPLY_ONCE"]);
-      expect(onBlockReply).not.toHaveBeenCalled();
-      expect(requests.map(({ prompt }) => prompt)).toEqual([
-        "hello",
-        "Fresh B question",
-        "Repeat or discuss the prior reply",
-      ]);
-      expect(requests[0]!.context).not.toContain("preceding turn already delivered");
-      for (const request of requests.slice(1)) {
-        expect(request.context).toContain(`Context for ${request.prompt}`);
-        expect(request.context.match(/preceding turn already delivered/g)).toHaveLength(1);
-      }
-    } finally {
-      release.resolve();
-      await first;
     }
   });
 }

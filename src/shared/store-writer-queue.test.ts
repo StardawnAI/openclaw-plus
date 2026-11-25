@@ -221,17 +221,17 @@ it.each([0, 10])("shares I/O turns across chunks (writer cost %s)", async (cost)
 });
 
 it("admits disjoint keys without bypassing an earlier overlapping waiter", async () => {
-  const clock = vi.spyOn(performance, "now").mockReturnValue(0);
+  vi.useFakeTimers();
   const { record, held, order } = createQueue();
   const first = held("first", ["a"]);
-  clock.mockReturnValue(5); // Exhaust the writer budget before disjoint admission.
   const joined = held("joined", ["a", "b"]);
   const follower = record("follower", ["b"]);
   const independent = record("independent", ["c"]);
-  await independent;
+  await vi.advanceTimersByTimeAsync(0);
   expect(order).toEqual(["first", "independent"]);
   first.release();
   await joined.entered;
+  await independent;
   expect(order).toEqual(["first", "independent", "joined"]);
   joined.release();
   await Promise.all([first.pending, joined.pending, follower]);

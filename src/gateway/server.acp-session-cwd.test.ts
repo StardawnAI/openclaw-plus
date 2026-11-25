@@ -17,8 +17,6 @@ import { rpcReq, testState } from "./test-helpers.js";
 
 const { createSessionStoreDir, openClient } = setupPersistentSessionCreateTestHarness();
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-// First creation starts worker-backed session state on loaded CI runners.
-const sessionCreateTimeoutMs = 30_000;
 
 test.each(["fresh", "fresh-reset", "adopt"])(
   "ACP session/new keeps the Gateway-owned directory (%s)",
@@ -38,22 +36,12 @@ test.each(["fresh", "fresh-reset", "adopt"])(
     const existingKey = "agent:main:acp-bridge:existing-project";
     try {
       if (adoptExisting) {
-        const created = await rpcReq(
-          ws,
-          "sessions.create",
-          { key: existingKey, cwd: existingCwd },
-          sessionCreateTimeoutMs,
-        );
+        const created = await rpcReq(ws, "sessions.create", { key: existingKey, cwd: existingCwd });
         expect(created.ok, JSON.stringify(created.error)).toBe(true);
       }
       const sessionStore = createInMemorySessionStore();
       const request = async (method: string, params: unknown) => {
-        const result = await rpcReq(
-          ws,
-          method,
-          params,
-          method === "sessions.create" ? sessionCreateTimeoutMs : undefined,
-        );
+        const result = await rpcReq(ws, method, params);
         if (!result.ok) {
           throw new Error(result.error?.message ?? "Gateway request failed");
         }

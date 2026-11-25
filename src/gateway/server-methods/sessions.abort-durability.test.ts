@@ -146,9 +146,7 @@ it.each([
       const releaseWriter = createDeferred();
       let heldWriter: Promise<unknown> | undefined;
       let request: Promise<void> | undefined;
-      let replacement:
-        | ReturnType<typeof lifecycleState.persistGatewaySessionLifecycleEvent>
-        | undefined;
+      let replacement: Promise<void> | undefined;
       const writeFailure = new Error("terminal session write failed");
       let persistenceSpy:
         | MockInstance<typeof lifecycleState.prepareGatewaySessionLifecycleEvent>

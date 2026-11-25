@@ -197,13 +197,7 @@ describe("buildCodexUserPromptMessage", () => {
 
 describe("mirrorTranscript", () => {
   it("hides current memory-maintenance messages without hiding replayed turns", async () => {
-    const prepareSpy = vi.fn<(message: Extract<AgentMessage, { role: "assistant" }>) => void>();
-    const prepareAssistantTranscriptMessage: NonNullable<
-      EmbeddedRunAttemptParams["prepareAssistantTranscriptMessage"]
-    > = (message) => {
-      prepareSpy(message);
-      return message;
-    };
+    const prepareAssistantTranscriptMessage = vi.fn((message: AssistantMessage) => message);
     beforeMessageWrite((event) => {
       const { display: _display, ...message } = (event as { message: Record<string, unknown> })
         .message;
@@ -251,18 +245,16 @@ describe("mirrorTranscript", () => {
     expect(
       persistedMessages.slice(1).every((message) => asOptionalRecord(message)?.display === false),
     ).toBe(true);
-    expect(prepareSpy).not.toHaveBeenCalled();
+    expect(prepareAssistantTranscriptMessage).not.toHaveBeenCalled();
   });
 
-  it("preserves mirror identity across redaction from prompt append through final snapshot", async () => {
-    const target = await createTarget("openclaw-codex-mirror-redacted-identity-");
-    const config = { logging: { redactPatterns: [String.raw`^codex-app-server:.*$`] } };
+  it("preserves mirror identity from prompt append through final snapshot", async () => {
+    const target = await createTarget("openclaw-codex-mirror-identity-");
     const userMessage = mirroredUser("client prompt", "turn-1:prompt", Date.now());
     const assistantMessage = mirroredAssistant("final answer", "turn-1:assistant", Date.now() + 1);
     const mirrorParams = {
       ...target,
       idempotencyScope: "codex-app-server:thread-1",
-      config,
     };
 
     await mirrorTranscript({ ...mirrorParams, messages: [userMessage] });
@@ -830,7 +822,7 @@ describe("mirrorTranscript", () => {
         {
           role: "assistant",
           content: [{ type: "thinking", thinking: "checking the answer" }],
-          __openclaw: { mirrorIdentity: "turn-1:reasoning", runId: "run-1" },
+          __openclaw: { mirrorIdentity: "turn-1:reasoning:reason-1", runId: "run-1" },
         },
         {
           role: "assistant",

@@ -1,10 +1,8 @@
 import { sanitizeTerminalText } from "../../packages/terminal-core/src/safe-text.js";
+import type { McpToolCatalogDiagnostic } from "../agents/agent-bundle-mcp-catalog.types.js";
 import { assignSafeServerNames, TOOL_NAME_SEPARATOR } from "../agents/agent-bundle-mcp-names.js";
 import { loadSessionMcpConfig } from "../agents/agent-bundle-mcp-runtime-config.js";
-import type {
-  BundleMcpToolRuntime,
-  McpToolCatalogDiagnostic,
-} from "../agents/agent-bundle-mcp-types.js";
+import type { BundleMcpToolRuntime } from "../agents/agent-bundle-mcp-types.js";
 import { resolveEffectiveToolPolicy } from "../agents/agent-tools.policy.js";
 import { resolveConversationCapabilityProfile } from "../agents/conversation-capability-profile.js";
 import { applyFinalEffectiveToolPolicy } from "../agents/embedded-agent-runner/effective-tool-policy.js";
@@ -170,14 +168,13 @@ export async function collectRuntimeToolSchemaFindings(
   ]);
   const cfg = captureRuntimeConfig(sourceConfig);
   const env = options.env ?? process.env;
-  await using resources = new AsyncDisposableStack();
-  const runWithPluginMetadataSnapshot =
-    options.runWithPluginMetadataSnapshot ??
-    resources.use(
-      (
+  await using ownedMetadataScope = options.runWithPluginMetadataSnapshot
+    ? undefined
+    : (
         await import("../commands/doctor/shared/plugin-metadata-snapshot-scope.js")
-      ).createDoctorPluginMetadataSnapshotScope({ env }),
-    ).run;
+      ).createDoctorPluginMetadataSnapshotScope({ env });
+  const runWithPluginMetadataSnapshot =
+    options.runWithPluginMetadataSnapshot ?? ownedMetadataScope!.run;
   const { frames, findings } = await prepareDoctorToolSchemaFrames(cfg, {
     ...options,
     env,
@@ -432,18 +429,7 @@ export async function collectRuntimeToolSchemaFindings(
     }
     if (inspection && options.deferInspectionDisposal) {
       const resource = inspection;
-      // The deferred inspection retains the metadata that admitted its plugin callbacks.
-      resources.defer(() => resource.release());
-      const deferredResources = resources.move();
-      let disposalDeferred = false;
-      try {
-        options.deferInspectionDisposal(() => deferredResources.disposeAsync());
-        disposalDeferred = true;
-      } finally {
-        if (!disposalDeferred) {
-          await deferredResources.disposeAsync();
-        }
-      }
+      options.deferInspectionDisposal(() => resource.release());
     } else {
       try {
         await inspection?.release();

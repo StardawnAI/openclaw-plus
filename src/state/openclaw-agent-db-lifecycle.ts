@@ -3,6 +3,8 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { isMainThread, threadId } from "node:worker_threads";
 import { isPathInside } from "../infra/path-guards.js";
+import { registerProcessExitCleanup } from "../infra/process-exit-cleanup.js";
+import { revokeSqliteDatabaseAdmissionsForPath } from "../infra/sqlite-database-admission.js";
 import { resolveAgentDatabaseIdleHandleTtlMs } from "../infra/sqlite-handle-lifecycle.js";
 import type { SqliteIntegrityDiagnostics } from "../infra/sqlite-integrity.js";
 import {
@@ -10,22 +12,19 @@ import {
   hasSqlitePostCommitScope,
 } from "../infra/sqlite-post-commit.js";
 import { createSqliteTerminalOpenLatch } from "../infra/sqlite-terminal-open-latch.js";
-import { registerSqliteCacheExitClose } from "../infra/sqlite-wal.js";
-import {
-  inspectDatabasePathIdentitySync,
-  normalizeDatabasePath,
-} from "../infra/sqlite-worker-identity.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGatewayShutdownCleanupSignal } from "../process/gateway-work-admission.js";
 import { runInDetachedAsyncContext } from "../shared/detached-async-context.js";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
 import { agentDatabaseBorrowers, retainAgentDatabase } from "./openclaw-agent-db-borrower.js";
-import { createAgentDatabaseHandleCloser } from "./openclaw-agent-db-close.js";
+import {
+  createAgentDatabaseHandleCloser,
+  stopAgentDatabaseWalMaintenance,
+} from "./openclaw-agent-db-close.js";
 import type {
   OpenClawAgentDatabase,
   OpenClawAgentDatabaseOptions,
 } from "./openclaw-agent-db-contract.js";
-import { findOpenClawAgentDatabaseIdentity } from "./openclaw-agent-db-identity.js";
 import {
   hasAgentDatabaseMaintenanceAuthority,
   readOpenClawAgentDatabaseWorkerLeaseReceiptFromClaim,
@@ -35,7 +34,9 @@ import {
 import { assertAgentDatabaseMaintenanceAuthority } from "./openclaw-agent-db-maintenance-authority.js";
 import {
   drainAgentDatabaseResources,
+  hasOpenClawAgentDatabaseAsyncResources,
   matchesAgentDatabaseClose,
+  registerAgentDatabaseResourceReleaseHandler,
   revokeAgentDatabaseResources,
   withAgentDatabaseCloseFence,
 } from "./openclaw-agent-db-resources.js";
@@ -97,6 +98,17 @@ const cache = resolveGlobalSingleton<AgentDatabaseLifecycle>(
 
 // Install the activity owner before publishing handles, including reads with no timer yet.
 agentDatabaseBorrowers.refreshIdleTimer = refreshAgentDatabaseIdleTimer;
+registerAgentDatabaseResourceReleaseHandler((resource) => {
+  if (!getGatewayShutdownCleanupSignal().aborted) {
+    return;
+  }
+  // Resource owners settle their accepted work before waking deferred idle writers.
+  for (const database of cache.databases.values()) {
+    if (matchesAgentDatabaseClose({ path: database.path }, resource)) {
+      cache.idleTimers.get(database.db)?.refresh();
+    }
+  }
+});
 
 export const closeCachedOpenClawAgentDatabase = createAgentDatabaseHandleCloser(cache);
 
@@ -160,15 +172,18 @@ export function startAgentDatabaseOpenTiming(
     phaseDurationsMs[phase] = completedMs - elapsedMs;
     elapsedMs = completedMs;
     if (phase === "validation" && diagnostics.integrityGateReason) {
-      agentDbLog.info("agent database integrity gate", {
-        agentId,
-        path: pathname,
-        pid: process.pid,
-        threadId,
-        isMainThread,
-        admissionMode,
-        ...diagnostics,
-      });
+      agentDbLog.info(
+        `agent database integrity gate for ${agentId}: reason=${diagnostics.integrityGateReason}, mode=${diagnostics.integrityGateMode}, outcome=${diagnostics.integrityGateOutcome}, elapsedMs=${diagnostics.integrityGateMs ?? phaseDurationsMs.validation}`,
+        {
+          agentId,
+          path: pathname,
+          pid: process.pid,
+          threadId,
+          isMainThread,
+          admissionMode,
+          ...diagnostics,
+        },
+      );
     }
     // Registration is the final checkpoint; intermediate phases never emit a partial summary.
     if (phase === "registration" && elapsedMs >= OPENCLAW_AGENT_DB_SLOW_OPEN_MS) {
@@ -204,7 +219,7 @@ export function retainFailedAgentDatabaseClose(
   };
   cache.retainedCloses.add(retained);
   getOpenClawDatabaseMaintenanceScope()?.own(retained, "agent-handles", retained.close);
-  cache.unregisterExitClose ??= registerSqliteCacheExitClose(closeOpenClawAgentDatabases);
+  cache.unregisterExitClose ??= registerProcessExitCleanup(closeOpenClawAgentDatabases);
 }
 
 export function revokePendingAgentDatabaseOpen(pathname: string, expectedAgentId?: string): void {
@@ -242,6 +257,10 @@ export function refreshAgentDatabaseIdleTimer(database: OpenClawAgentDatabase): 
     }
     if (database.db.isOpen && database.db.isTransaction) {
       timer.refresh();
+      return;
+    }
+    // Their owners retire readers/workers; revoking here would cancel accepted native writes.
+    if (cleanupSignal.aborted && hasOpenClawAgentDatabaseAsyncResources({ path: database.path })) {
       return;
     }
     try {
@@ -282,7 +301,7 @@ export function refreshAgentDatabaseIdleTimer(database: OpenClawAgentDatabase): 
 export async function closeMaintenanceAgentDatabase(
   database: OpenClawAgentDatabase,
 ): Promise<void> {
-  await database.walMaintenance.stop();
+  await stopAgentDatabaseWalMaintenance(database);
   if (cache.databases.get(database.path) !== database) {
     return;
   }
@@ -376,7 +395,7 @@ export async function settleOpenClawAgentDatabaseWorkerClose(
   if (database) {
     try {
       // Join sidecar inspection before native close; a guarded close is not a failed owner.
-      await database.walMaintenance.stop();
+      await stopAgentDatabaseWalMaintenance(database);
       closeCachedOpenClawAgentDatabase(database);
     } catch (error) {
       errors.push(error instanceof Error ? error : new Error(String(error)));
@@ -439,9 +458,10 @@ export function closeOpenClawAgentDatabases(rootPath?: string): void {
 
 /** Latch integrity refusals so later opens fail without rescanning. */
 export function recordOpenClawAgentDatabaseOpenFailure(pathname: string, error: Error): void {
-  cache.terminal.record(pathname, error);
   // Quarantine revokes this process's trust because doctor may replace the file.
   invalidateOpenClawAgentDatabaseValidation(pathname);
+  revokeSqliteDatabaseAdmissionsForPath(pathname);
+  cache.terminal.record(pathname, error);
 }
 
 /** Release fixture handles and pathname trust before a test root is recreated. */
@@ -495,42 +515,10 @@ export async function closeOpenClawAgentDatabaseByPathAsync(
     await Promise.allSettled(pending.map((owner) => owner.promise));
     const database = cache.databases.get(selection.path);
     if (database && (expectedAgentId === undefined || database.agentId === expectedAgentId)) {
-      await database.walMaintenance.stop();
+      await stopAgentDatabaseWalMaintenance(database);
     }
     return closeOpenClawAgentDatabaseByPath(selection.path, expectedAgentId);
   });
-}
-
-/** Drain physical aliases through their captured lexical close owners before rollback. */
-export async function closeOpenClawAgentDatabaseAliasesByPathAsync(
-  pathname: string,
-): Promise<void> {
-  const resolvedPath = path.resolve(pathname);
-  const selected = cache.databases.get(resolvedPath);
-  const owned = selected && findOpenClawAgentDatabaseIdentity(selected);
-  // A retargeted locator selects its admitted owner, never its current destination.
-  // Without that owner, only a canonical path can discover an unlisted local alias.
-  const observed = owned ? undefined : inspectDatabasePathIdentitySync(resolvedPath);
-  const identity =
-    typeof owned?.identity === "string"
-      ? { key: `file:${owned.identity}`, birthtime: owned.birthtime }
-      : observed?.canonicalPath === normalizeDatabasePath(resolvedPath)
-        ? observed
-        : undefined;
-  const paths = new Set([resolvedPath]);
-  for (const database of cache.databases.values()) {
-    const captured = findOpenClawAgentDatabaseIdentity(database);
-    if (
-      typeof captured?.identity === "string" &&
-      identity?.key === `file:${captured.identity}` &&
-      identity.birthtime === captured.birthtime
-    ) {
-      paths.add(database.path);
-    }
-  }
-  for (const capturedPath of paths) {
-    await closeOpenClawAgentDatabaseByPathAsync(capturedPath);
-  }
 }
 
 export { cache as agentDatabaseLifecycle };

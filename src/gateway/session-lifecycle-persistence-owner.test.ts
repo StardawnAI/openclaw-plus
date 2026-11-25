@@ -45,7 +45,7 @@ describe("session lifecycle persistence owner", () => {
   });
 
   it.each([false, true])("separates distinct runtime events (new claim: %s)", async (newClaim) => {
-    persistLifecycle.mockResolvedValue("failure-notice-recorded");
+    persistLifecycle.mockResolvedValue(undefined);
     const owner = createSessionLifecyclePersistenceOwner();
     const first = {
       ...terminal,
@@ -61,7 +61,7 @@ describe("session lifecycle persistence owner", () => {
 
     expect(successorPrepared).not.toBe(firstPrepared);
     expect(owner.persist(successor)).toBe(successorPrepared);
-    expect(await Promise.all([firstPrepared, successorPrepared])).toEqual([undefined, undefined]);
+    await Promise.all([firstPrepared, successorPrepared]);
     expect(persistLifecycle).toHaveBeenCalledTimes(2);
     await owner.drain();
   });

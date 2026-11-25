@@ -34,9 +34,7 @@ export function updateMessage(
 
 export function endMessage(context: Context, event: { message: unknown }) {
   // Message-end coverage includes malformed content and partial provider usage.
-  return handleMessageEnd(context, { type: "message_end", ...event } as Parameters<
-    typeof handleMessageEnd
-  >[1]);
+  return handleMessageEnd(context, { type: "message_end", ...event } as MessageEvent);
 }
 
 export function createMessageUpdateContext(

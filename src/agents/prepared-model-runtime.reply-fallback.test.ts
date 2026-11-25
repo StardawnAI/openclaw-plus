@@ -25,7 +25,6 @@ import {
 import { ensureSelectedAgentHarnessPlugin } from "./harness/runtime-plugin.js";
 import { resolveModelCandidateChain } from "./model-fallback-candidates.js";
 import * as modelSelectionConfig from "./model-selection-config.js";
-import { getPreparedModelRuntimePolicyConfigReader } from "./prepared-model-runtime-auth.js";
 import {
   getPreparedModelRuntimeBorrowedSnapshot,
   getPreparedModelRuntimePluginGeneration,
@@ -231,11 +230,11 @@ describe("prepared reply fallback ownership", () => {
       allowGatewaySubagentBinding: true,
     });
     const dispatch = (await loadPublishedGatewayReplyDispatchRuntime({ agentId: "default" }))!;
-    const catalogs = new Set<PreparedModelRuntimeSnapshot["modelCatalog"]>();
+    const snapshots = new Set<PreparedModelRuntimeSnapshot>();
     reply.execute.mockImplementation(async (context: { workspaceDir: string }) => {
       const pluginGeneration = getPreparedModelRuntimePluginGeneration()!;
       const prepared = getPreparedModelRuntimeBorrowedSnapshot(pluginGeneration)!;
-      catalogs.add(prepared.modelCatalog);
+      snapshots.add(prepared);
       // Embedded runs receive an equivalent config projection, not the published object.
       const runConfig = structuredClone(config);
       const workspaces = resolvePreparedRuntimeWorkspaces({
@@ -258,11 +257,7 @@ describe("prepared reply fallback ownership", () => {
         },
         { pluginGeneration },
       );
-      // Scoped policy gets a projection; the prepared inventory and generation stay shared.
-      expect(nested.pluginGeneration).toBe(pluginGeneration);
-      expect(nested.snapshot.modelCatalog).toBe(prepared.modelCatalog);
-      expect(nested.snapshot.catalogOwner).toBe(prepared.catalogOwner);
-      expect(getPreparedModelRuntimePolicyConfigReader(nested.snapshot)!()).toBe(runConfig);
+      expect(nested.snapshot).toBe(prepared);
       return { text: context.workspaceDir };
     });
     const execute = bindPreparedReplyDispatchRuntime(dispatch, () =>
@@ -282,7 +277,7 @@ describe("prepared reply fallback ownership", () => {
       buildsAfterFirst ??= mocks.loadAgentRuntimePluginRegistryHandle.mock.calls.length;
       expect(mocks.loadAgentRuntimePluginRegistryHandle).toHaveBeenCalledTimes(buildsAfterFirst);
     }
-    expect(catalogs.size).toBe(1);
+    expect(snapshots.size).toBe(1);
   });
 
   it.each([

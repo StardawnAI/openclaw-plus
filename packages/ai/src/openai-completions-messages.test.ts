@@ -260,7 +260,7 @@ describe("convertMessages relocatable region", () => {
         ],
         { tools: tools("read") },
       ),
-      { ...imageModel, compat: { supportsDeveloperRole: true } },
+      imageModel,
       [
         system,
         expectedToolCall("image_call", "read", '{"path":"image.png"}'),

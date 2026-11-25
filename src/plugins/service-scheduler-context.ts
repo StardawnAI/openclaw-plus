@@ -1,10 +1,11 @@
 import { runOutsideOperatorToolGatewayAuthority } from "../gateway/operator-tool-gateway-authority.js";
+import { runOutsidePluginSessionWorkAuthority } from "../gateway/plugin-session-work-authority.js";
 import { createScheduledGatewayRunner } from "../gateway/scheduled-run-gateway-context.js";
 import type { PluginRuntimeCapabilityLease } from "./capability-lease.js";
 import { withPluginHttpRouteRegistry } from "./http-registry.js";
 import { getBoundLegacyPluginSdkResourceHost } from "./legacy-sdk-resource-host.js";
 import { pluginInstanceInvocation } from "./plugin-instance-invocation.js";
-import { pluginInvocationContext, type PluginInstanceHandle } from "./plugin-instance-scope.js";
+import type { PluginInstanceHandle } from "./plugin-instance-scope.js";
 import { getPluginRecordRegistry } from "./registry-lifecycle.js";
 import { getPluginRegistryRuntime } from "./registry-runtime-binding.js";
 import type { PluginRecord, PluginRegistry } from "./registry-types.js";
@@ -12,7 +13,6 @@ import {
   getGatewayContextResolver,
   withPluginRuntimeGatewayContextResolver,
 } from "./runtime/gateway-request-scope.js";
-import { runOutsidePluginRuntimeGenerationScope } from "./runtime/generation-scope.js";
 
 export function createPluginServiceSchedulerRunner(owner: {
   registry: PluginRegistry;
@@ -28,37 +28,39 @@ export function createPluginServiceSchedulerRunner(owner: {
         inheritRequestScope: false,
       });
   const runScheduled = createScheduledGatewayRunner(resolveGatewayContext);
+  const authority =
+    owner.instance?.owner?.record.generationOverlap === true
+      ? owner.instance.retainOwnerWork()
+      : undefined;
+  if (authority) {
+    owner.lease.retain(authority.release);
+  }
   return (work: () => void | Promise<unknown>) =>
     runOutsideOperatorToolGatewayAuthority(() =>
-      runScheduled(async () =>
-        pluginInstanceInvocation.exit(() => {
-          const registry = owner.record
-            ? getPluginRecordRegistry(owner.registry, owner.record)
-            : owner.registry;
-          const run = () => withPluginHttpRouteRegistry(registry, work, owner.lease);
-          // The lifecycle owner joins scheduled work before disposal can finish.
-          const invoke = () =>
-            owner.instance
-              ? owner.instance.runInRegistry(registry, run, { joinDisposal: false })
-              : run();
-          return withPluginRuntimeGatewayContextResolver(
-            resolveGatewayContext,
-            () => {
-              resourceHost?.assertOpen();
-              return resourceHost ? resourceHost.run(invoke) : invoke();
-            },
-            { inheritRequestScope: false },
-          );
-        }),
+      runOutsidePluginSessionWorkAuthority(() =>
+        runScheduled(async () =>
+          pluginInstanceInvocation.exit(() => {
+            const registry = owner.record
+              ? getPluginRecordRegistry(owner.registry, owner.record)
+              : owner.registry;
+            const run = () => withPluginHttpRouteRegistry(registry, work, owner.lease);
+            // The lifecycle owner joins scheduled work before disposal can finish.
+            const invoke = () =>
+              authority
+                ? authority.run(run)
+                : owner.instance
+                  ? owner.instance.runInRegistry(registry, run, { joinDisposal: false })
+                  : run();
+            return withPluginRuntimeGatewayContextResolver(
+              resolveGatewayContext,
+              () => {
+                resourceHost?.assertOpen();
+                return resourceHost ? resourceHost.run(invoke) : invoke();
+              },
+              { inheritRequestScope: false },
+            );
+          }),
+        ),
       ),
     );
-}
-
-/** Service startup owns its callbacks, not the finite RPC or tool that requested reload. */
-export function runOutsidePluginServiceCallerContext<T>(run: () => T): T {
-  return runOutsideOperatorToolGatewayAuthority(() =>
-    runOutsidePluginRuntimeGenerationScope(() =>
-      pluginInvocationContext.exit(() => pluginInstanceInvocation.exit(run)),
-    ),
-  );
 }

@@ -1,7 +1,6 @@
 import path from "node:path";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import {
-  createRuntimeConfigReader,
   getRuntimeConfigSnapshot,
   getRuntimeConfigSnapshotMetadata,
   hashRuntimeConfigValue,
@@ -21,11 +20,7 @@ import {
 } from "./harness/runtime-plugin-load-plan.js";
 import { resolveLegacyInheritedAuthDir } from "./legacy-inherited-auth-dir.js";
 import { preparePublishedModelCatalogOwnerIdentity } from "./prepared-model-catalog-owner.js";
-import {
-  bindPreparedModelRuntimeAuth,
-  copyPreparedModelRuntimeAuthBindings,
-  getPreparedModelRuntimePolicyConfigReader,
-} from "./prepared-model-runtime-auth.js";
+import { copyPreparedModelRuntimeAuthBindings } from "./prepared-model-runtime-auth.js";
 import {
   startSerializedSnapshotBuildBatch,
   type PreparedModelRuntimeBuildResult,
@@ -39,7 +34,6 @@ import {
 } from "./prepared-model-runtime.errors.js";
 import {
   capturePreparedModelRuntimeGeneration,
-  createPreparedModelRuntimeGenerationGuard,
   retirePreparedModelRuntimeGeneration,
 } from "./prepared-model-runtime.lifecycle.js";
 import {
@@ -69,11 +63,7 @@ function publishPreparedModelRuntimeOwnerSnapshot(
   owner: PreparedModelRuntimeOwner,
   snapshot: PreparedModelRuntimeSnapshot,
 ): PreparedModelRuntimeSnapshot {
-  const published = stampPreparedModelRuntimeSnapshotConfig(
-    snapshot,
-    owner.input.config,
-    owner.input.readPolicyConfig,
-  );
+  const published = stampPreparedModelRuntimeSnapshotConfig(snapshot, owner.input.config);
   if (owner.snapshot) {
     ownersBySnapshot.delete(owner.snapshot);
   }
@@ -103,10 +93,7 @@ export function prepareModelRuntimeOwner(
 ): PreparedModelRuntimeOwner {
   // Preparation precedes async discovery; neither an old nor unpublished snapshot owns these facts.
   return Object.assign(existing ?? { generation: 0, needsRefresh: true, catalogStale: false }, {
-    input: {
-      ...input,
-      readPolicyConfig: input.readPolicyConfig ?? createRuntimeConfigReader(input.config),
-    },
+    input,
     catalogOwner: preparePublishedModelCatalogOwnerIdentity(input),
     environmentFingerprint: effectiveEnvironmentFingerprint(input),
     catalogMode,
@@ -176,7 +163,6 @@ export function rebindInputToCommittedConfiguredOwner(
     ...(agentId ? { agentId } : {}),
     agentDir: owner.input.agentDir,
     config: owner.input.config,
-    readPolicyConfig: owner.input.readPolicyConfig,
     inheritedAuthDir: owner.input.inheritedAuthDir,
     env: owner.input.env,
     workspaceDir: preserveWorkspaceDir ? input.workspaceDir : owner.input.workspaceDir,
@@ -211,17 +197,12 @@ function modelRuntimeConfigFingerprint(config: OpenClawConfig): string {
 function stampPreparedModelRuntimeSnapshotConfig(
   snapshot: PreparedModelRuntimeSnapshot,
   config: OpenClawConfig,
-  readPolicyConfig: PreparedModelRuntimeInput["readPolicyConfig"],
 ): PreparedModelRuntimeSnapshot {
-  if (
-    snapshot.config === config &&
-    getPreparedModelRuntimePolicyConfigReader(snapshot) === readPolicyConfig
-  ) {
+  if (snapshot.config === config) {
     return snapshot;
   }
   const stamped = Object.freeze({ ...snapshot, config });
   copyPreparedModelRuntimeAuthBindings(snapshot, stamped);
-  bindPreparedModelRuntimeAuth(stamped, { readPolicyConfig });
   return stamped;
 }
 
@@ -244,12 +225,8 @@ export function normalizeOptionalDir(dirname: string | undefined): string | unde
 export async function prepareModelRuntimeInput(
   input: PreparedModelRuntimeInput,
 ): Promise<PreparedModelRuntimeInput> {
-  const preparedInput = {
-    ...input,
-    readPolicyConfig: input.readPolicyConfig ?? createRuntimeConfigReader(input.config),
-  };
   await prepareSharedAuthStoreOwnership(input.env);
-  return normalizePreparedModelRuntimeInput(preparedInput);
+  return normalizePreparedModelRuntimeInput(input);
 }
 
 export function normalizePreparedModelRuntimeInput(
@@ -370,6 +347,24 @@ function configuredOwnerCandidates(
   return byAgent.get(agentId) ?? [];
 }
 
+let gatewayLifecycleActive = false;
+
+/** Gateway lifecycles own configured-agent inventory; standalone hosts stay workspace-scoped. */
+export const isPreparedModelRuntimeGatewayLifecycleActive = () => gatewayLifecycleActive;
+export const setPreparedModelRuntimeGatewayLifecycleActive = (active: boolean) => {
+  gatewayLifecycleActive = active;
+};
+
+/** Gateway inventory belongs to the configured agent; the session cwd only controls execution. */
+export function resolveInventoryInput(
+  input: PreparedModelRuntimeInput,
+  configuredOwner?: PreparedModelRuntimeOwner,
+): PreparedModelRuntimeInput {
+  return gatewayLifecycleActive
+    ? { ...input, workspaceDir: configuredOwner?.input.workspaceDir }
+    : input;
+}
+
 export function resolvePublishedOwner(
   owners: Map<string, PreparedModelRuntimeOwner>,
   input: PreparedModelRuntimeInput,
@@ -453,6 +448,20 @@ export function hasSameLifecycleInput(
     left.allowGatewaySubagentBinding === right.allowGatewaySubagentBinding &&
     JSON.stringify(left.runtimePluginSelections) === JSON.stringify(right.runtimePluginSelections)
   );
+}
+
+// Catalog callbacks retain this guard. Capture only its generation, not the batch's
+// previous catalog, candidates or transient publication callbacks.
+function createPreparedModelRuntimeGenerationGuard(
+  owner: PreparedModelRuntimeOwner,
+  generation: number,
+  key: string,
+  owners: Map<string, PreparedModelRuntimeOwner>,
+  isOwnerRegistered?: (key: string, owner: PreparedModelRuntimeOwner) => boolean,
+): () => boolean {
+  return () =>
+    owner.generation === generation &&
+    (isOwnerRegistered?.(key, owner) ?? owners.get(key) === owner);
 }
 
 // Catalog and auth loaders retain these callbacks after publication. Keep their lexical

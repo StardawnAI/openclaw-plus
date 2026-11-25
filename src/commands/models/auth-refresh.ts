@@ -7,10 +7,6 @@ import {
 } from "../../gateway/call.js";
 import { isGatewayTransportError } from "../../gateway/transport-error.js";
 import type { RuntimeEnv } from "../../runtime.js";
-import {
-  ProviderAuthConfigApplyError,
-  ProviderCredentialsSavedError,
-} from "../../shared/provider-auth-result.js";
 
 export type ModelAuthRefreshOutcome = "refreshed" | "gateway-rejected" | "gateway-unreachable";
 
@@ -34,30 +30,17 @@ export async function refreshProviderAuthAfterLogin(params: {
   }
 }
 
-/** Publish committed credentials best-effort without replacing the original login failure. */
-export async function throwProviderAuthLoginError(
-  error: unknown,
+/** Best-effort publication of committed credentials; the settings failure stays the reported result. */
+export async function refreshSavedAuthAfterSettingsFailure(
   login: Parameters<typeof refreshProviderAuthAfterLogin>[0],
-  credentialsSaved: boolean,
-): Promise<never> {
-  if (error instanceof ProviderAuthConfigApplyError) {
-    try {
-      login.signal?.throwIfAborted();
-      login.assertCurrent?.();
-      await refreshProviderAuthAfterLogin(login);
-    } catch {
-      // Ended authority publishes nothing and must not replace the settings failure.
-    }
+): Promise<void> {
+  try {
+    login.signal?.throwIfAborted();
+    login.assertCurrent?.();
+    await refreshProviderAuthAfterLogin(login);
+  } catch {
+    // Ended authority publishes nothing and must not replace the settings failure.
   }
-  if (credentialsSaved && !(error instanceof ProviderCredentialsSavedError)) {
-    throw new ProviderCredentialsSavedError(
-      error instanceof Error
-        ? `Provider credentials were saved, but sign-in did not finish: ${error.message}`
-        : "Provider credentials were saved, but sign-in did not finish.",
-      { cause: error },
-    );
-  }
-  throw error;
 }
 
 export async function refreshRunningGatewayAuthState(

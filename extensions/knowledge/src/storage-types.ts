@@ -63,13 +63,6 @@ export type Prepared = {
   metadataOnly?: boolean;
   annotationEvidence?: import("./model.js").Evidence[];
 };
-/** Shared catalog snapshot and path reservations for one atomic batch. */
-export type BatchPreparation = {
-  id: string;
-  data: Prepared["data"];
-  snapshot: string;
-  occupied?: (path: string) => boolean;
-};
 export type Row = {
   scope: string;
   request: string;

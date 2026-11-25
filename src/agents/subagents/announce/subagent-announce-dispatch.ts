@@ -1,6 +1,8 @@
+import type { AgentRunRequest } from "../../../gateway/server-methods/agent-request-types.js";
 import type { GatewayContextResolver } from "../../../gateway/server-methods/types.js";
 import type { SessionControllerInput } from "../../../sessions/session-controller.contracts.js";
 import type { UserTurnTranscriptRecorder } from "../../../sessions/user-turn-transcript.types.js";
+import type { SubagentCompletion } from "../../../shared/subagent-completion.js";
 import type { DeliveryContext } from "../../../utils/delivery-context.types.js";
 import type { AgentInternalEvent } from "../../internal-events.js";
 import type { GatewayToolCallerReceiptAdmission } from "../../tools/gateway-caller-receipt.types.js";
@@ -13,7 +15,6 @@ type SubagentAnnounceDeliveryDisposition = NonNullable<
 type SubagentAnnounceDeliveryFailureReason =
   | "completion_handoff_pending"
   | "completion_handoff_unavailable"
-  | "delivery_failed"
   | "delivery_suppressed"
   | "generated_media_missing"
   | "message_tool_delivery_missing"
@@ -65,10 +66,11 @@ export type SubagentAnnounceDirectParams = {
   targetRequesterSessionKey: string;
   triggerMessage: string;
   internalEvents?: AgentInternalEvent[];
+  subagentCompletions?: readonly SubagentCompletion[];
+  /** Exact producer-owned outputs admitted as inputs to the completion turn. */
+  inputAttachments?: AgentRunRequest["attachments"];
   expectsCompletionMessage: boolean;
   completionTarget?: "parent";
-  completionRequesterSessionId?: string;
-  completionRequesterLifecycleRevision?: string;
   requireVisibleReply?: boolean;
   requireDirectDelivery?: boolean;
   bestEffortDeliver?: boolean;
@@ -104,6 +106,6 @@ export function sourceOwnerChangedResult(): SubagentAnnounceDeliveryResult {
     reason: "source_owner_changed",
     error: "subagent source lifecycle changed before completion delivery",
     terminal: true,
-    disposition: "intentional_non_delivery",
+    disposition: "permanent_failure",
   };
 }

@@ -32,6 +32,7 @@ import {
 } from "./control-ui-session-entry-path.js";
 import { resolveControlUiSessionPath } from "./control-ui-session-path-resolve.js";
 import { resolveControlUiShareOrigin } from "./control-ui-share.js";
+import { matchesHttpIfNoneMatch } from "./http-conditional.js";
 import type { GatewayAttributedIngress } from "./ingress-attribution.js";
 import { withReadySessionRows } from "./session-row-prepared-read.js";
 import type { SessionRowProjection } from "./session-row-projection.js";
@@ -118,7 +119,7 @@ export async function servePublicSessionRepresentation(params: {
             return 503 as const;
           }
           res.setHeader("ETag", etag);
-          if (req.headers["if-none-match"] === etag) {
+          if (matchesHttpIfNoneMatch(req.headers["if-none-match"], etag)) {
             res.statusCode = 304;
             res.end();
           } else {

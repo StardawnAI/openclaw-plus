@@ -159,8 +159,17 @@ export function renderWikiMarkdown(params: {
 }
 
 function extractTitleFromMarkdown(body: string): string | undefined {
-  const match = body.match(/^#\s+(.+?)\s*$/m);
-  return normalizeOptionalString(match?.[1]);
+  // Masking keeps offsets: "# comment" lines in code cannot match, and the title is
+  // read from the unmasked line so inline code in a real heading survives.
+  for (const heading of maskMarkdownCode(body).matchAll(/^#[ \t].*$/gm)) {
+    const title = normalizeOptionalString(
+      body.slice(heading.index + 1, heading.index + heading[0].length),
+    );
+    if (title) {
+      return title;
+    }
+  }
+  return undefined;
 }
 
 function normalizeOptionalStringFields<K extends string>(
@@ -458,7 +467,15 @@ export function formatWikiLink(params: {
   const destination = /[\s()<>]/.test(linkTarget)
     ? `<${linkTarget.replace(/[<>]/g, "\\$&")}>`
     : linkTarget;
-  return `[${params.title}](${destination})`;
+  // Titles are metadata: Markdown, entities, and HTML must not change their displayed text.
+  const label = escapeWikiTitle(params.title);
+  return `[${label}](${destination})`;
+}
+
+export function escapeWikiTitle(title: string): string {
+  // Headings also need literal trailing hashes. Keep ordinary separators unchanged
+  // so generated-source recognition still identifies copied imported pages.
+  return title.replace(/[\\[\]`*_~<&#]/g, "\\$&");
 }
 
 export function renderMarkdownFence(content: string, infoString = "text"): string {

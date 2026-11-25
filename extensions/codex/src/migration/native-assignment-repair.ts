@@ -118,8 +118,10 @@ async function normalizeRow(
           sessionId: current.entry.sessionId,
           ...(requester.kind === "session-key" ? { sessionKey: current.sessionKey } : {}),
         });
-        // Native recovery requires equal lifecycle revisions, including both absent
-        // for legacy owners. A one-sided revision cannot be delivered after reset.
+        // Keep exactly what native recovery can still deliver: it requires equal
+        // revisions, including both absent on shipped legacy owners. A revision on
+        // only one side means a reset or cut minted a new lifecycle, and revisions
+        // are never reissued, so that assignment is obsolete.
         assignments = assignments.filter(
           (assignment) =>
             currentKey === entry.key &&

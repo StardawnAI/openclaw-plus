@@ -48,6 +48,29 @@ function fixture() {
   return { claims, capture, transmit, callbacks, closeRequest };
 }
 
+it("references unsettled work without making idle native custody pin process exit", async () => {
+  const { claims, capture, closeRequest } = fixture();
+  const lease = capture(1);
+  expect(claims.needsReference).toBe(true);
+  lease.receive({ type: "resource-ready", id: 1, pid: 42, generation: 1 });
+  lease.receive({ type: "resource-created", id: 1 });
+  expect(claims.needsReference).toBe(false);
+  expect(claims.hasOpenClaims).toBe(true);
+
+  const { sequence } = lease.ownerMessage("active delivery");
+  expect(claims.needsReference).toBe(true);
+  lease.receive({ type: "resource-owner-received", id: 1, sequence });
+  expect(claims.needsReference).toBe(false);
+
+  const closing = lease.close();
+  expect(claims.needsReference).toBe(true);
+  await Promise.resolve();
+  lease.receive({ type: "resource-closed", id: 1, requestId: closeRequest().requestId });
+  await closing;
+  expect(claims.needsReference).toBe(false);
+  expect(claims.hasOpenClaims).toBe(false);
+});
+
 const capacityCases = [
   { dimension: "messages", payload: "", count: 4 },
   { dimension: "bytes", payload: "x".repeat(700), count: 1 },
@@ -282,45 +305,4 @@ it("drops unsent owner delivery when native close precedes its acknowledgment", 
   sibling.abandonUnattached();
   lease.release();
   expect(claims.size).toBe(0);
-});
-
-it("unrefs passive custody but retains startup, delivery and failed close settlement", async () => {
-  const { claims, capture, closeRequest } = fixture();
-  const lease = capture(1);
-  expect(claims.hasReferencedClaims).toBe(true);
-  lease.setReferenced(false);
-  expect(claims.hasReferencedClaims).toBe(true);
-  lease.receive({ type: "resource-ready", id: 1, pid: 42, generation: 1 });
-  expect(claims.hasReferencedClaims).toBe(true);
-  lease.receive({ type: "resource-created", id: 1 });
-  expect(claims.hasReferencedClaims).toBe(false);
-  expect(claims.hasOpenClaims).toBe(true);
-
-  lease.setReferenced(true);
-  expect(claims.hasReferencedClaims).toBe(true);
-  lease.setReferenced(false);
-  const delivery = lease.ownerMessage("synthetic delivery");
-  expect(claims.hasReferencedClaims).toBe(true);
-  lease.receive({ type: "resource-owner-received", id: 1, sequence: delivery.sequence });
-  expect(claims.hasReferencedClaims).toBe(false);
-
-  const closing = lease.close();
-  expect(claims.hasReferencedClaims).toBe(true);
-  await Promise.resolve();
-  const close = closeRequest();
-  lease.receive({
-    type: "resource-close-error",
-    id: 1,
-    requestId: close.requestId,
-    error: encodeNativeWorkerFailure(new Error("synthetic close failure")),
-    resourceError: false,
-  });
-  await expect(closing).rejects.toThrow("synthetic close failure");
-  expect(claims.hasReferencedClaims).toBe(true);
-  expect(claims.hasOpenClaims).toBe(true);
-  expect(() => lease.release()).toThrow(/must close before release/);
-  lease.receive({ type: "resource-closed", id: 1, requestId: close.requestId });
-  expect(claims.hasReferencedClaims).toBe(false);
-  expect(claims.hasOpenClaims).toBe(false);
-  lease.release();
 });

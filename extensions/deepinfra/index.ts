@@ -82,7 +82,6 @@ export default defineSingleProviderPluginEntry({
           // This default-on model supports an explicit off selector. Do not
           // generalize to all DeepInfra reasoning models: some are always-on.
           return createPayloadPatchStreamWrapper(baseStreamFn, ({ payload }) => {
-            // Vendor control: https://docs.deepinfra.com/chat/reasoning.
             payload.reasoning = { enabled: false };
           })(model, context, options);
         }

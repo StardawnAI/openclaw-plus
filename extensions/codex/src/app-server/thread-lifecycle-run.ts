@@ -277,7 +277,7 @@ export async function startOrResumeThread(
         threadId: current.threadId,
         ...details,
       });
-      stageBindingReplacement("rotating a stale thread binding");
+      stageBindingReplacement(`changing ${changed}`);
     };
     const transientDelegationRestriction =
       params.params.delegationCapability === "report_only" ||
@@ -301,8 +301,7 @@ export async function startOrResumeThread(
     let restrictedResumeCandidate = false;
     if (binding?.pendingResumeConfiguration) {
       const resumed = await resumePendingCodexThread(params, {
-        ...preflight,
-        prepareRequestContext,
+        ...(await prepareRequestContext()),
         binding,
         stageBindingReplacement,
         releaseRetainedThread: (threadId, assertCurrent) =>
@@ -636,7 +635,6 @@ export async function startOrResumeThread(
           const resumeBinding = binding;
           const resumed = await resumeExistingCodexThread(params, {
             ...requestContext,
-            prepareRequestContext: async () => requestContext,
             binding: resumeBinding,
             requireRestrictedThreadConfigFingerprint: restrictedResumeCandidate,
             stageBindingReplacement,

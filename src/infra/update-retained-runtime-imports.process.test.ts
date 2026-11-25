@@ -17,12 +17,6 @@ for (const runtime of ["node", "bun", "node-short-path", "node-junction"] as con
     async () => {
       const base = directories.make("openclaw-retained-imports-");
       const root = path.join(base, "install");
-      await fs.mkdir(path.join(root, "dist"), { recursive: true });
-      await fs.mkdir(path.join(root, "node_modules", "fixture"), { recursive: true });
-      await fs.mkdir(path.join(root, "node_modules", "fixture-cjs"), { recursive: true });
-      await fs.mkdir(path.join(root, "node_modules", "fixture-commonjs-js"), { recursive: true });
-      await fs.mkdir(path.join(root, "node_modules", "fixture-preloaded"), { recursive: true });
-      await fs.mkdir(path.join(root, "node_modules", "fixture-conditional"), { recursive: true });
       const files = {
         "package.json": '{"name":"openclaw","type":"module"}',
         "node_modules/fixture/package.json": '{"type":"module","exports":"./index.js"}',
@@ -55,6 +49,7 @@ for (const runtime of ["node", "bun", "node-short-path", "node-junction"] as con
         "tooling.mjs": 'export { value } from "./dist/tool-dependency.mjs";',
       };
       for (const [file, content] of Object.entries(files)) {
+        await fs.mkdir(path.dirname(path.join(root, file)), { recursive: true });
         await fs.writeFile(path.join(root, file), content);
       }
       let importRoot = root;

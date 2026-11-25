@@ -5,25 +5,20 @@ import { invokeRemoteNativeHookRelay } from "./native-hook-relay-remote-client.j
 
 const boundary = vi.hoisted(() => ({ request: vi.fn() }));
 // mock-isolation: Supply credential bytes without reading operator files.
-vi.mock("node:fs/promises", () => ({
-  open: async () => ({
-    stat: async () => ({ isFile: () => true, size: 96 }),
-    read: async (buffer: Buffer) => ({
-      bytesRead: buffer.write(
-        JSON.stringify({
-          url: "https://relay.example/__openclaw__/native-hook/relay",
-          token: "synthetic-relay-capability",
-        }),
-      ),
-    }),
-    close: async () => {},
+vi.mock("@openclaw/fs-safe/advanced", () => ({
+  readRegularFile: async () => ({
+    buffer: Buffer.from(
+      JSON.stringify({
+        url: "https://relay.example/__openclaw__/native-hook/relay",
+        token: "synthetic-relay-capability",
+      }),
+    ),
   }),
 }));
 // mock-isolation: Control native request error and physical-close events independently.
 vi.mock("node:https", () => ({ request: boundary.request }));
 
 it.each(["response", "error"] as const)("joins the socket after %s delivery", async (mode) => {
-  vi.stubEnv("NODE_USE_ENV_PROXY", undefined);
   const entered = createDeferred();
   const response = Object.assign(new EventEmitter(), { statusCode: 200 });
   const request = Object.assign(new EventEmitter(), {

@@ -1,7 +1,7 @@
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { applyChannelAccountRemoval } from "../../channels/plugins/account-config-mutation.js";
 import { getChannelPlugin, normalizeChannelId } from "../../channels/plugins/index.js";
-import { listReadOnlyChannelPluginsForConfig } from "../../channels/plugins/read-only.js";
+import { listReadOnlyChannelPluginsForConfigAsync } from "../../channels/plugins/read-only.js";
 import { formatCliCommand } from "../../cli/command-format.js";
 import {
   formatUnknownChannelMessage,
@@ -57,7 +57,7 @@ export async function channelsRemoveCommand(
 
       if (useWizard && prompter) {
         await prompter.intro("Remove channel account");
-        const readOnlyPlugins = listReadOnlyChannelPluginsForConfig(cfg, {
+        const readOnlyPlugins = await listReadOnlyChannelPluginsForConfigAsync(cfg, {
           includeSetupFallbackPlugins: true,
         });
         const selectedChannel = await prompter.select({
@@ -92,19 +92,7 @@ export async function channelsRemoveCommand(
         return;
       }
 
-      if (useWizard || !deleteConfig) {
-        const confirm = prompter ?? createClackPrompter();
-        const channelPromptLabel = channel ? channelLabel(channel) : rawChannel;
-        const ok = await confirm.confirm({
-          message: `Disable ${channelPromptLabel} account "${accountId}"? (keeps config)`,
-          initialValue: true,
-        });
-        if (!ok) {
-          await prompter?.outro("Cancelled.");
-          return;
-        }
-      }
-
+      // Resolve the channel before asking anything, so an unknown id fails instead of prompting.
       const shouldResolveInstallablePlugin = Boolean(lookupChannel || channel);
       const resolvedPluginState = shouldResolveInstallablePlugin
         ? await (async () => {
@@ -134,6 +122,17 @@ export async function channelsRemoveCommand(
         );
         runtime.exit(1);
         return;
+      }
+      if (useWizard || !deleteConfig) {
+        const confirm = prompter ?? createClackPrompter();
+        const ok = await confirm.confirm({
+          message: `Disable ${channelLabel(resolvedChannel)} account "${accountId}"? (keeps config)`,
+          initialValue: true,
+        });
+        if (!ok) {
+          await prompter?.outro("Cancelled.");
+          return;
+        }
       }
       const removal = await applyChannelAccountRemoval({
         cfg,

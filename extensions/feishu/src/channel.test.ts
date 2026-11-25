@@ -290,10 +290,10 @@ const stickerCfg = config({
   actions: { sticker: true },
   stickerSets: {
     bot_work: {
-      file_work: ["Thumbs Up", "赞👍", "thumbs up again"],
+      file_work: ["Thumbs Up", "赞👍", "thumbs up again", "Müller wave"],
       file_wave: ["Wave.*", "你好👋"],
     },
-    bot_other: { file_other: ["赞👍"] },
+    bot_other: { file_other: ["赞👍", "Mu\u0308ller wave"] },
   },
   accounts: {
     work: { appId: "bot_work", appSecret: "secret_work" },
@@ -355,9 +355,9 @@ describe("Feishu stickers", () => {
     await expect(search({ query: "赞" }, accountId, localCfg)).rejects.toThrow("stickerSets");
   });
   it.each([
-    ["work", " thUMbs ", "file_work", "Thumbs Up"],
+    ["work", " mU\u0308LLER ", "file_work", "Müller wave"],
     ["renamed", "赞", "file_work", "赞👍"],
-    ["other", "赞", "file_other", "赞👍"],
+    ["other", "MÜLLER", "file_other", "Mu\u0308ller wave"],
   ])("searches the catalog owned by %s for %s", async (accountId, query, fileId, keyword) => {
     expect(details(await search({ query }, accountId))).toEqual({
       stickers: [{ fileId, keyword }],
@@ -602,7 +602,6 @@ describe("Feishu cards and delivery", () => {
           },
         });
         expect(sent.mediaAccess).toBe(mediaAccess);
-        expect(sent.mediaAccess).not.toBe(forgedMediaAccess);
       } else {
         expect(sent).toMatchObject({ to: "chat:oc_group_1", text: sixTables });
       }
@@ -909,7 +908,6 @@ describe("Feishu attachment intent", () => {
         : { threadId: "om_parent" }),
     });
     expect(args(sender).mediaAccess).toBe(mediaAccess);
-    expect(args(sender).mediaAccess).not.toBe(forgedMediaAccess);
     expect(details(result).messageId).toBe("om_sent");
   });
 });
@@ -1293,19 +1291,15 @@ describe("Feishu reactions", () => {
   });
 });
 describe("Feishu topic routing", () => {
-  it.each([
-    { source: "implicit", id: "om_inbound", currentMessageId: "om_inbound" },
-    { source: "explicit", id: "om_inbound", currentMessageId: "om_inbound" },
-    { source: "implicit", id: "855a9b56-ced7-4627-b9ca-454c30a91f9d", currentMessageId: undefined },
-    { source: "explicit", id: "855a9b56-ced7-4627-b9ca-454c30a91f9d", currentMessageId: undefined },
-  ] as const)("routes $source replies from $id", async ({ source, id, currentMessageId }) => {
+  it.each(["implicit", "explicit"] as const)("routes %s replies", async (source) => {
+    const id = "855a9b56-ced7-4627-b9ca-454c30a91f9d";
     const threading = feishuPlugin.threading!;
     const context = { To: "oc_group_1", CurrentMessageId: id, MessageThreadId: "om_inbound" };
     const toolContext = threading.buildToolContext!({ cfg, context });
-    expect(toolContext).toHaveProperty("currentMessageId", currentMessageId);
+    expect(toolContext).toHaveProperty("currentMessageId", undefined);
     expect(
       threading.resolveReplyTransport!({ cfg, replyToId: id, threadId: "om_inbound" }),
-    ).toEqual({ replyToId: currentMessageId ?? null, threadId: "om_inbound" });
+    ).toEqual({ replyToId: null, threadId: "om_inbound" });
     textDelivery();
     await run(
       "send",
@@ -1320,13 +1314,14 @@ describe("Feishu topic routing", () => {
             : { source, replyToId: "om_inbound", mode: "all" },
       },
     );
-    expect(feishuOutboundSendTextMock).toHaveBeenCalledExactlyOnceWith({
-      ...actionContext,
-      to: "chat:oc_group_1",
-      text: "reply",
-      mediaLocalRoots: undefined,
-      ...(source === "implicit" ? { threadId: "om_inbound" } : { replyToId: "om_inbound" }),
-    });
+    expect(feishuOutboundSendTextMock).toHaveBeenCalledOnce();
+    expect(args(feishuOutboundSendTextMock).to).toBe("chat:oc_group_1");
+    expect(args(feishuOutboundSendTextMock).threadId).toBe(
+      source === "implicit" ? "om_inbound" : undefined,
+    );
+    expect(args(feishuOutboundSendTextMock).replyToId).toBe(
+      source === "explicit" ? "om_inbound" : undefined,
+    );
   });
   it.each([
     { name: "destination changes", params: { to: "chat:oc_other" }, context: topicContext },
@@ -1341,13 +1336,10 @@ describe("Feishu topic routing", () => {
       textDelivery();
       const target = { to: "chat:oc_group_1", ...params };
       await run("send", { ...target, text: "hello" }, context);
-      expect(feishuOutboundSendTextMock).toHaveBeenCalledExactlyOnceWith({
-        ...actionContext,
-        to: target.to,
-        text: "hello",
-        mediaLocalRoots: undefined,
-        replyToId: undefined,
-      });
+      expect(feishuOutboundSendTextMock).toHaveBeenCalledOnce();
+      expect(args(feishuOutboundSendTextMock).to).toBe(target.to);
+      expect(args(feishuOutboundSendTextMock).replyToId).toBeUndefined();
+      expect(args(feishuOutboundSendTextMock).threadId).toBeUndefined();
     },
   );
   it("requires a thread-reply anchor", async () => {

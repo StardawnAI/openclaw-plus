@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionCatalogHost } from "../../packages/gateway-protocol/src/index.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
-import { ExpectedCliError } from "./failure-output.js";
+import { ExpectedCliError } from "./expected-cli-error.js";
 import { registerStatusHealthSessionsCommands } from "./program/register.status-health-sessions.js";
 
 const mocks = vi.hoisted(() => ({

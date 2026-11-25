@@ -117,7 +117,6 @@ export function loadBundledPluginPublicArtifactModuleFromCandidatesSync<T extend
         pluginId: params.owner.id,
         entrySource: params.owner.source,
         artifactBasename,
-        origin: params.owner.origin,
       });
       location = resolved
         ? {

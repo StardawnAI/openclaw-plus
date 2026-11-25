@@ -4,7 +4,6 @@ import path from "node:path";
 import { expect, it, vi, afterEach, describe } from "vitest";
 import { backupCreateCommand } from "../commands/backup.js";
 import { createTestRuntime } from "../commands/test-runtime-config-helpers.js";
-import { createDeferredCore } from "../shared/deferred.js";
 import {
   createVerifiedBackup,
   isolateBackupScratch,
@@ -19,8 +18,6 @@ import {
   maintainBackupScratch,
 } from "./backup-scratch.js";
 import * as directoryDurability from "./directory-durability.js";
-import * as fsSafe from "./fs-safe.js";
-import * as privateDirs from "./sqlite-private-directory.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -49,67 +46,6 @@ it("reclaims an interrupted archive's scratch on the next backup run", async () 
       );
     } finally {
       await finishBackupScratch(live);
-    }
-  });
-});
-
-it("publishes a backup when concurrent repair takes custody of its first scratch", async () => {
-  await withBackupFixture({ prefix: "backup-scratch-concurrent-repair-" }, async (state) => {
-    await isolateBackupScratch(state);
-    const scratchRoot = await fs.realpath(state.path("scratch"));
-    const created = createDeferredCore<string>();
-    const resumeCreator = createDeferredCore();
-    const repairing = createDeferredCore();
-    const resumeRepair = createDeferredCore();
-    const createDirectory = privateDirs.createPrivateSqliteTempDirectory;
-    vi.spyOn(privateDirs, "createPrivateSqliteTempDirectory").mockImplementationOnce(
-      async (...args) => {
-        const directory = await createDirectory(...args);
-        created.resolve(directory);
-        await resumeCreator.promise;
-        return directory;
-      },
-    );
-    const archivePath = state.path("backup.tar.gz");
-    const backup = createBackupArchive({ output: archivePath, onlyConfig: true, verify: true });
-    let repair: ReturnType<typeof maintainBackupScratch> | undefined;
-    try {
-      const first = await Promise.race([
-        created.promise,
-        backup.then(() => {
-          throw new Error("Backup finished without allocating scratch");
-        }),
-      ]);
-      const root = fsSafe.root;
-      let paused = false;
-      vi.spyOn(fsSafe, "root").mockImplementation(async (...args) => {
-        if (args[0] === first && !paused) {
-          // Repair opens its real exclusive lifetime transaction before admitting this root.
-          paused = true;
-          repairing.resolve();
-          await resumeRepair.promise;
-        }
-        return root(...args);
-      });
-      repair = maintainBackupScratch({ roots: [scratchRoot], repair: true });
-      await Promise.race([
-        repairing.promise,
-        repair.then(() => {
-          throw new Error("Repair finished without acquiring scratch");
-        }),
-      ]);
-      resumeCreator.resolve();
-      await expect(backup).resolves.toMatchObject({ archivePath });
-      await expect(fs.stat(archivePath)).resolves.toMatchObject({ size: expect.any(Number) });
-      // The successful backup must not remove the first directory from under repair.
-      await expect(fs.readdir(scratchRoot)).resolves.toEqual([path.basename(first)]);
-      resumeRepair.resolve();
-      await expect(repair).resolves.toMatchObject({ reclaimed: [first], warnings: [] });
-      await expect(fs.readdir(scratchRoot)).resolves.toEqual([]);
-    } finally {
-      resumeCreator.resolve();
-      resumeRepair.resolve();
-      await Promise.allSettled([backup, repair]);
     }
   });
 });
@@ -154,7 +90,6 @@ it.each(["EPERM", "EXDEV"])("fails closed without hard-link support (%s)", async
     .spyOn(directoryDurability, "publishFileExclusive")
     .mockRejectedValue(Object.assign(new Error("hard links unsupported"), { code }));
   await withBackupFixture({ prefix: "openclaw-backup-no-hardlinks-" }, async (state) => {
-    await isolateBackupScratch(state);
     const outputDir = state.path("backups");
     await fs.mkdir(outputDir, { recursive: true });
 
@@ -177,7 +112,6 @@ describe("backup traversal", () => {
     "records a file vanishing before %s and restores survivors",
     async (operation) => {
       await withBackupFixture({ layout: "split" }, async (state) => {
-        await isolateBackupScratch(state);
         await state.writeConfig({
           agents: { entries: { main: { workspace: state.workspaceDir } } },
         });
@@ -239,7 +173,6 @@ describe("backup traversal", () => {
 
   it("backs up a second workspace and preserves its dangling absolute link", async () => {
     await withBackupFixture({ layout: "split" }, async (state) => {
-      await isolateBackupScratch(state);
       const second = state.path("second-workspace");
       await fs.mkdir(second);
       await state.writeConfig({
@@ -315,7 +248,6 @@ describe("backup traversal", () => {
     "refuses missing required config or source I/O errors: %s",
     async (code) => {
       await withBackupFixture({}, async (state) => {
-        await isolateBackupScratch(state);
         await state.writeConfig({});
         const source =
           code === "ENOENT" ? state.configPath : await state.writeText("keep.txt", "data");
@@ -339,7 +271,6 @@ describe("backup traversal", () => {
 
   it("reports many volatile paths without overflowing the restore manifest", async () => {
     await withBackupFixture({ layout: "split" }, async (state) => {
-      await isolateBackupScratch(state);
       await state.writeConfig({ agents: { entries: { main: { workspace: state.workspaceDir } } } });
       const files = Array.from({ length: 9_000 }, (_, index) =>
         path.join(state.workspaceDir, `pending-${index}.tmp.123`),

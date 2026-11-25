@@ -18,9 +18,15 @@ import { normalizeThinkLevel, THINKING_LEVELS_HELP } from "../../auto-reply/thin
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { ADMIN_SCOPE } from "../../gateway/operator-scopes.js";
 import { resolveFilesystemPath } from "../../infra/home-dir.js";
+import { decodeUtf8Input } from "../../infra/utf8-input.js";
 import { defaultRuntime } from "../../runtime.js";
-import { AsyncWorkScope, captureAsyncWorkTracker } from "../../shared/async-work-scope.js";
+import {
+  AsyncWorkScope,
+  captureAsyncWorkTracker,
+  getAsyncWorkSignal,
+} from "../../shared/async-work-scope.js";
 import { createDeferredCore } from "../../shared/deferred.js";
+import { throwExpectedCliError } from "../expected-cli-error.js";
 import { collectOption } from "../program/helpers.js";
 import type { CapabilityEnvelope } from "./metadata.js";
 import { formatEnvelopeForText, providerSummaryText } from "./output.js";
@@ -97,7 +103,9 @@ export function registerModelCapabilityCommands(capability: Command): void {
   model
     .command("run")
     .description("Run a one-shot model turn")
-    .requiredOption("--prompt <text>", "Prompt text")
+    .option("--prompt <text>", "Prompt text")
+    .option("--prompt-file <path>", "Prompt file relative to the current directory (max 1 MiB)")
+    .option("--prompt-stdin", "Read a UTF-8 prompt from stdin (max 1 MiB)")
     .option("--file <path>", "Image file", collectOption, [])
     .option("--model <provider/model>", "Model override")
     .option("--thinking <level>", "Thinking level override")
@@ -110,14 +118,37 @@ export function registerModelCapabilityCommands(capability: Command): void {
     .option("--json", "Output JSON", false)
     .action((opts, command) =>
       runCapabilityCommand(opts.json, formatEnvelopeForText, async () => {
+        const signal = getAsyncWorkSignal();
         const { resolveCapabilityAgentOption, resolveTransport } = await import("./shared.js");
-        const prompt = opts.prompt;
+        if (
+          [opts.prompt, opts.promptFile, opts.promptStdin].filter((value) => value !== undefined)
+            .length !== 1
+        ) {
+          throwExpectedCliError("Use exactly one of --prompt, --prompt-file, or --prompt-stdin.");
+        }
+        let prompt = opts.prompt;
+        if (opts.promptFile !== undefined) {
+          const { root } = await import("../../infra/fs-safe.js");
+          const promptRoot = await root(process.cwd());
+          prompt = decodeUtf8Input(
+            await promptRoot.readBytes(opts.promptFile, { maxBytes: 1_048_576 }),
+            "--prompt-file",
+          );
+        }
+        if (opts.promptStdin) {
+          const { readByteStreamWithLimit } =
+            await import("@openclaw/media-core/read-byte-stream-with-limit");
+          prompt = decodeUtf8Input(
+            await readByteStreamWithLimit(process.stdin, { maxBytes: 1_048_576 }),
+            "--prompt-stdin",
+          );
+        }
         if (normalizeOptionalString(prompt) === undefined) {
-          throw new Error("--prompt cannot be empty or whitespace-only.");
+          throwExpectedCliError("--prompt cannot be empty or whitespace-only.");
         }
         const thinking = normalizeThinkLevel(opts.thinking);
         if (opts.thinking !== undefined && !thinking) {
-          throw new Error(`Invalid thinking level. Use one of: ${THINKING_LEVELS_HELP}.`);
+          throwExpectedCliError(`Invalid thinking level. Use one of: ${THINKING_LEVELS_HELP}.`);
         }
         const transport = resolveTransport({
           local: Boolean(opts.local),
@@ -271,6 +302,7 @@ export function registerModelCapabilityCommands(capability: Command): void {
                             ? prepared.model.maxTokens
                             : undefined,
                         ...(thinking ? { reasoning: thinking } : {}),
+                        signal,
                       },
                     });
                     const text = collectTextContentBlocks(result.content).join("").trim();
@@ -405,6 +437,7 @@ export function registerModelCapabilityCommands(capability: Command): void {
               method: "agent",
               params,
               expectFinal: true,
+              signal,
               timeoutMs: 120_000,
               // Provider/model overrides require trusted-operator scope. Use the backend
               // shared-secret lane so local gateway smokes do not depend on paired CLI device scopes.
